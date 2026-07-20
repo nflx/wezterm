@@ -86,6 +86,9 @@ pub struct LineQuadCacheValue {
 pub struct LineToElementParams<'a> {
     pub line: &'a Line,
     pub config: &'a ConfigHandle,
+    pub fonts: &'a Rc<wezterm_font::FontConfiguration>,
+    pub font_scale: NotNan<f64>,
+    pub render_metrics: RenderMetrics,
     pub palette: &'a ColorPalette,
     pub window_is_transparent: bool,
     pub reverse_video: bool,
@@ -97,6 +100,7 @@ pub struct LineToEleShapeCacheKey {
     pub shape_hash: [u8; 16],
     pub composing: Option<(usize, String)>,
     pub shape_generation: usize,
+    pub font_scale: NotNan<f64>,
 }
 
 pub struct LineToElementShapeItem {
@@ -131,6 +135,10 @@ pub struct RenderScreenLineParams<'a> {
     /// needs to be rendered, measured in pixels
     pub left_pixel_x: f32,
     pub pixel_width: f32,
+    /// Top edge of the pane/tab content clip rect in window pixel coordinates.
+    pub pane_top_pixel_y: f32,
+    /// Height of the pane/tab content clip rect in pixels.
+    pub pane_pixel_height: f32,
     pub stable_line_idx: Option<StableRowIndex>,
     pub line: &'a Line,
     pub selection: Range<usize>,
@@ -166,6 +174,8 @@ pub struct RenderScreenLineParams<'a> {
     pub use_pixel_positioning: bool,
 
     pub render_metrics: RenderMetrics,
+    pub fonts: Rc<wezterm_font::FontConfiguration>,
+    pub font_scale: NotNan<f64>,
     pub shape_key: Option<LineToEleShapeCacheKey>,
     pub password_input: bool,
 }
@@ -405,7 +415,15 @@ impl crate::TermWindow {
         let fa_lock = "\u{f023}";
         let line = Line::from_text(fa_lock, attrs, 0, None);
         let cluster = line.cluster(None);
-        let shape_info = self.cached_cluster_shape(style, &cluster[0], gl_state, font, metrics)?;
+        let shape_info = self.cached_cluster_shape(
+            style,
+            &cluster[0],
+            gl_state,
+            &self.fonts,
+            NotNan::new(self.fonts.get_font_scale()).unwrap(),
+            font,
+            metrics,
+        )?;
         Ok(Rc::clone(&shape_info[0].glyph))
     }
 
@@ -782,6 +800,8 @@ impl crate::TermWindow {
         style: &TextStyle,
         cluster: &CellCluster,
         gl_state: &RenderState,
+        fonts: &Rc<wezterm_font::FontConfiguration>,
+        font_scale: NotNan<f64>,
         font: Option<&Rc<LoadedFont>>,
         metrics: &RenderMetrics,
     ) -> anyhow::Result<Rc<Vec<ShapedInfo>>> {
@@ -789,6 +809,7 @@ impl crate::TermWindow {
         let key = BorrowedShapeCacheKey {
             style,
             text: &cluster.text,
+            font_scale,
         };
         let glyph_info = match self.lookup_cached_shape(&key) {
             Some(Ok(info)) => info,
@@ -796,7 +817,7 @@ impl crate::TermWindow {
             None => {
                 let font = match font {
                     Some(f) => Rc::clone(f),
-                    None => self.fonts.resolve_font(style)?,
+                    None => fonts.resolve_font(style)?,
                 };
                 let window = self.window.as_ref().unwrap().clone();
 

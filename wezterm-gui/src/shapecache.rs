@@ -1,6 +1,7 @@
 use crate::customglyph::BlockKey;
 use crate::glyphcache::CachedGlyph;
 use config::TextStyle;
+use ordered_float::NotNan;
 use std::rc::Rc;
 use wezterm_font::shaper::GlyphInfo;
 use wezterm_font::units::*;
@@ -9,6 +10,7 @@ use wezterm_font::units::*;
 pub struct ShapeCacheKey {
     pub style: TextStyle,
     pub text: String,
+    pub font_scale: NotNan<f64>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -62,6 +64,7 @@ impl ShapedInfo {
 pub struct BorrowedShapeCacheKey<'a> {
     pub style: &'a TextStyle,
     pub text: &'a str,
+    pub font_scale: NotNan<f64>,
 }
 
 impl<'a> BorrowedShapeCacheKey<'a> {
@@ -69,6 +72,7 @@ impl<'a> BorrowedShapeCacheKey<'a> {
         ShapeCacheKey {
             style: self.style.clone(),
             text: self.text.to_owned(),
+            font_scale: self.font_scale,
         }
     }
 }
@@ -82,6 +86,7 @@ impl ShapeCacheKeyTrait for ShapeCacheKey {
         BorrowedShapeCacheKey {
             style: &self.style,
             text: &self.text,
+            font_scale: self.font_scale,
         }
     }
 }

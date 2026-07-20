@@ -14,6 +14,7 @@ use mux::pane::{PaneId, WithPaneLines};
 use mux::renderable::{RenderableDimensions, StableCursorPosition};
 use mux::tab::PositionedPane;
 use ordered_float::NotNan;
+use std::rc::Rc;
 use std::time::Instant;
 use wezterm_dynamic::Value;
 use wezterm_term::color::{ColorAttribute, ColorPalette};
@@ -83,6 +84,9 @@ impl crate::TermWindow {
         }
 
         let pane_id = pos.pane.pane_id();
+        let font_scale = NotNan::new(self.pane_font_scale(pane_id)).unwrap();
+        let pane_fonts = self.pane_font_configuration(font_scale.into_inner())?;
+        let pane_render_metrics = self.pane_render_metrics(font_scale.into_inner())?;
         let current_viewport = self.get_viewport(pane_id);
         let dims = pos.pane.get_dimensions();
 
@@ -320,6 +324,9 @@ impl crate::TermWindow {
                 left_pixel_x: f32,
                 pos: &'a PositionedPane,
                 pane_id: PaneId,
+                font_scale: NotNan<f64>,
+                pane_fonts: Rc<wezterm_font::FontConfiguration>,
+                pane_render_metrics: crate::utilsprites::RenderMetrics,
                 cursor: &'a StableCursorPosition,
                 palette: &'a ColorPalette,
                 default_bg: LinearRgba,
@@ -350,6 +357,9 @@ impl crate::TermWindow {
                 left_pixel_x,
                 pos,
                 pane_id,
+                font_scale,
+                pane_fonts,
+                pane_render_metrics,
                 cursor: &cursor,
                 palette: &palette,
                 cursor_border_color,
@@ -435,8 +445,9 @@ impl crate::TermWindow {
                         cursor,
                         shape_hash,
                         top_pixel_y: NotNan::new(self.top_pixel_y).unwrap()
-                            + (line_idx + self.pos.top) as f32
-                                * self.term_window.render_metrics.cell_size.height as f32,
+                            + self.pos.top as f32
+                                * self.term_window.render_metrics.cell_size.height as f32
+                            + line_idx as f32 * self.pane_render_metrics.cell_size.height as f32,
                         left_pixel_x: NotNan::new(self.left_pixel_x).unwrap(),
                         phys_line_idx: line_idx,
                         reverse_video: self.dims.reverse_video,
@@ -473,6 +484,7 @@ impl crate::TermWindow {
                     let shape_key = LineToEleShapeCacheKey {
                         shape_hash,
                         shape_generation: quad_key.shape_generation,
+                        font_scale: self.font_scale,
                         composing: if self.cursor.y == stable_row && self.pos.is_active {
                             if let DeadKeyStatus::Composing(composing) =
                                 &self.term_window.dead_key_status
@@ -492,8 +504,11 @@ impl crate::TermWindow {
                             RenderScreenLineParams {
                                 top_pixel_y: *quad_key.top_pixel_y,
                                 left_pixel_x: self.left_pixel_x,
-                                pixel_width: self.dims.cols as f32
-                                    * self.term_window.render_metrics.cell_size.width as f32,
+                                pixel_width: self.pos.pixel_width as f32,
+                                pane_top_pixel_y: self.top_pixel_y
+                                    + self.pos.top as f32
+                                        * self.term_window.render_metrics.cell_size.height as f32,
+                                pane_pixel_height: self.pos.pixel_height as f32,
                                 stable_line_idx: Some(stable_row),
                                 line: &line,
                                 selection: selrange.clone(),
@@ -520,7 +535,9 @@ impl crate::TermWindow {
                                     .term_window
                                     .config
                                     .experimental_pixel_positioning,
-                                render_metrics: self.term_window.render_metrics,
+                                render_metrics: self.pane_render_metrics,
+                                fonts: Rc::clone(&self.pane_fonts),
+                                font_scale: self.font_scale,
                                 shape_key: Some(shape_key),
                                 password_input,
                             },
