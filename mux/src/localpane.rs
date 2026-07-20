@@ -415,14 +415,14 @@ impl Pane for LocalPane {
     }
 
     fn resize(&self, size: TerminalSize) -> Result<(), Error> {
-        self.pty.lock().resize(PtySize {
+        let resize_result = self.pty.lock().resize(PtySize {
             rows: size.rows.try_into()?,
             cols: size.cols.try_into()?,
             pixel_width: size.pixel_width.try_into()?,
             pixel_height: size.pixel_height.try_into()?,
-        })?;
+        });
         self.terminal.lock().resize(size);
-        Ok(())
+        resize_result
     }
 
     fn writer(&self) -> MappedMutexGuard<'_, dyn std::io::Write> {

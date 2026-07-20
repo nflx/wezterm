@@ -121,7 +121,7 @@ impl crate::TermWindow {
             } else {
                 (
                     padding_left + border.left.get() as f32 - (cell_width / 2.0)
-                        + (pos.left as f32 * cell_width),
+                        + pos.pixel_left as f32,
                     cell_width,
                 )
             };
@@ -133,7 +133,7 @@ impl crate::TermWindow {
                 )
             } else {
                 (
-                    top_pixel_y + (pos.top as f32 * cell_height) - (cell_height / 2.0),
+                    top_pixel_y + pos.pixel_top as f32 - (cell_height / 2.0),
                     cell_height,
                 )
             };
@@ -141,16 +141,16 @@ impl crate::TermWindow {
                 x,
                 y,
                 // Go all the way to the right edge if we're right-most
-                if pos.left + pos.width >= self.terminal_size.cols as usize {
+                if pos.pixel_left + pos.pixel_width >= self.terminal_size.pixel_width {
                     self.dimensions.pixel_width as f32 - x
                 } else {
-                    (pos.width as f32 * cell_width) + width_delta
+                    pos.pixel_width as f32 + width_delta
                 },
                 // Go all the way to the bottom if we're bottom-most
-                if pos.top + pos.height >= self.terminal_size.rows as usize {
+                if pos.pixel_top + pos.pixel_height >= self.terminal_size.pixel_height {
                     self.dimensions.pixel_height as f32 - y
                 } else {
-                    (pos.height as f32 * cell_height) + height_delta as f32
+                    pos.pixel_height as f32 + height_delta as f32
                 },
             )
         };
@@ -344,9 +344,7 @@ impl crate::TermWindow {
                 error: Option<anyhow::Error>,
             }
 
-            let left_pixel_x = padding_left
-                + border.left.get() as f32
-                + (pos.left as f32 * self.render_metrics.cell_size.width as f32);
+            let left_pixel_x = padding_left + border.left.get() as f32 + pos.pixel_left as f32;
 
             let mut render = LineRender {
                 term_window: self,
@@ -444,11 +442,15 @@ impl crate::TermWindow {
                         selection: selrange.clone(),
                         cursor,
                         shape_hash,
+                        font_scale: self.font_scale,
                         top_pixel_y: NotNan::new(self.top_pixel_y).unwrap()
-                            + self.pos.top as f32
-                                * self.term_window.render_metrics.cell_size.height as f32
+                            + self.pos.pixel_top as f32
                             + line_idx as f32 * self.pane_render_metrics.cell_size.height as f32,
                         left_pixel_x: NotNan::new(self.left_pixel_x).unwrap(),
+                        pixel_width: NotNan::new(self.pos.pixel_width as f32).unwrap(),
+                        pane_top_pixel_y: NotNan::new(self.top_pixel_y + self.pos.pixel_top as f32)
+                            .unwrap(),
+                        pane_pixel_height: NotNan::new(self.pos.pixel_height as f32).unwrap(),
                         phys_line_idx: line_idx,
                         reverse_video: self.dims.reverse_video,
                     };
@@ -505,9 +507,7 @@ impl crate::TermWindow {
                                 top_pixel_y: *quad_key.top_pixel_y,
                                 left_pixel_x: self.left_pixel_x,
                                 pixel_width: self.pos.pixel_width as f32,
-                                pane_top_pixel_y: self.top_pixel_y
-                                    + self.pos.top as f32
-                                        * self.term_window.render_metrics.cell_size.height as f32,
+                                pane_top_pixel_y: self.top_pixel_y + self.pos.pixel_top as f32,
                                 pane_pixel_height: self.pos.pixel_height as f32,
                                 stable_line_idx: Some(stable_row),
                                 line: &line,
@@ -628,7 +628,7 @@ impl crate::TermWindow {
         } else {
             (
                 padding_left + border.left.get() as f32 - (cell_width / 2.0)
-                    + (pos.left as f32 * cell_width),
+                    + pos.pixel_left as f32,
                 cell_width,
             )
         };
@@ -640,7 +640,7 @@ impl crate::TermWindow {
             )
         } else {
             (
-                top_pixel_y + (pos.top as f32 * cell_height) - (cell_height / 2.0),
+                top_pixel_y + pos.pixel_top as f32 - (cell_height / 2.0),
                 cell_height,
             )
         };
@@ -649,26 +649,25 @@ impl crate::TermWindow {
             x,
             y,
             // Go all the way to the right edge if we're right-most
-            if pos.left + pos.width >= self.terminal_size.cols as usize {
+            if pos.pixel_left + pos.pixel_width >= self.terminal_size.pixel_width {
                 self.dimensions.pixel_width as f32 - x
             } else {
-                (pos.width as f32 * cell_width) + width_delta
+                pos.pixel_width as f32 + width_delta
             },
             // Go all the way to the bottom if we're bottom-most
-            if pos.top + pos.height >= self.terminal_size.rows as usize {
+            if pos.pixel_top + pos.pixel_height >= self.terminal_size.pixel_height {
                 self.dimensions.pixel_height as f32 - y
             } else {
-                (pos.height as f32 * cell_height) + height_delta as f32
+                pos.pixel_height as f32 + height_delta as f32
             },
         );
 
         // Bounds for the terminal cells
         let content_rect = euclid::rect(
-            padding_left + border.left.get() as f32 - (cell_width / 2.0)
-                + (pos.left as f32 * cell_width),
-            top_pixel_y + (pos.top as f32 * cell_height) - (cell_height / 2.0),
-            pos.width as f32 * cell_width,
-            pos.height as f32 * cell_height,
+            padding_left + border.left.get() as f32 - (cell_width / 2.0) + pos.pixel_left as f32,
+            top_pixel_y + pos.pixel_top as f32 - (cell_height / 2.0),
+            pos.pixel_width as f32,
+            pos.pixel_height as f32,
         );
 
         let palette = pos.pane.palette();

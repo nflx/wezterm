@@ -9,7 +9,7 @@ use ::window::{
 use config::keyassignment::{KeyAssignment, MouseEventTrigger, SpawnTabDomain};
 use config::MouseEventAltScreen;
 use mux::pane::{Pane, WithPaneLines};
-use mux::tab::SplitDirection;
+use mux::tab::{PositionedPane, SplitDirection};
 use mux::Mux;
 use mux_lua::MuxPane;
 use std::convert::TryInto;
@@ -24,6 +24,71 @@ use wezterm_term::input::{MouseButton, MouseEventKind as TMEK};
 use wezterm_term::{ClickPosition, LastMouseClick, StableRowIndex};
 
 impl super::TermWindow {
+    fn pane_content_origin_pixels(&self, pos: &PositionedPane) -> (f32, f32) {
+        let border = self.get_os_border();
+        let (padding_left, padding_top) = self.padding_left_top();
+        let tab_bar_height = if self.show_tab_bar {
+            self.tab_bar_pixel_height().unwrap_or(0.)
+        } else {
+            0.
+        };
+        let top_bar_height = if self.config.tab_bar_at_bottom {
+            0.0
+        } else {
+            tab_bar_height
+        };
+
+        (
+            padding_left + border.left.get() as f32 + pos.pixel_left as f32,
+            top_bar_height + padding_top + border.top.get() as f32 + pos.pixel_top as f32,
+        )
+    }
+
+    fn event_in_positioned_pane(&self, event: &MouseEvent, pos: &PositionedPane) -> bool {
+        let (left, top) = self.pane_content_origin_pixels(pos);
+        let right = left + pos.pixel_width as f32;
+        let bottom = top + pos.pixel_height as f32;
+        let x = event.coords.x as f32;
+        let y = event.coords.y as f32;
+
+        x >= left && x < right && y >= top && y < bottom
+    }
+
+    fn click_position_for_pane(
+        &self,
+        event: &MouseEvent,
+        pos: &PositionedPane,
+        pane: &dyn Pane,
+    ) -> ClickPosition {
+        let (left, top) = self.pane_content_origin_pixels(pos);
+        let font_scale = self.pane_font_scale(pos.pane.pane_id());
+        let pane_metrics = self
+            .pane_render_metrics(font_scale)
+            .unwrap_or(self.render_metrics);
+        let cell_width = pane_metrics.cell_size.width.max(1);
+        let cell_height = pane_metrics.cell_size.height.max(1);
+        let x_rel = event.coords.x as f32 - left;
+        let y_rel = event.coords.y as f32 - top;
+
+        let column_float = (x_rel.max(0.0) / cell_width as f32).max(0.0);
+        let column = if pane.is_mouse_grabbed() {
+            column_float
+        } else {
+            // Round the x coordinate so that we're a bit more forgiving of
+            // the horizontal position when selecting cells.
+            column_float.round()
+        }
+        .trunc() as usize;
+        let row = (y_rel.max(0.0) / cell_height as f32).trunc() as i64;
+
+        ClickPosition {
+            column,
+            row,
+            x_pixel_offset: x_rel.trunc() as isize - (column as isize * cell_width),
+            y_pixel_offset: y_rel.trunc() as isize - (row as isize * cell_height),
+        }
+    }
+
     fn resolve_ui_item(&self, event: &MouseEvent) -> Option<UIItem> {
         let x = event.coords.x;
         let y = event.coords.y;
@@ -648,19 +713,12 @@ impl super::TermWindow {
     fn mouse_event_terminal(
         &mut self,
         mut pane: Arc<dyn Pane>,
-        position: ClickPosition,
+        mut position: ClickPosition,
         event: MouseEvent,
         context: &dyn WindowOps,
         capture_mouse: bool,
     ) {
         let mut is_click_to_focus_pane = false;
-
-        let ClickPosition {
-            mut column,
-            mut row,
-            mut x_pixel_offset,
-            mut y_pixel_offset,
-        } = position;
 
         let is_already_captured = matches!(
             self.current_mouse_capture,
@@ -668,12 +726,7 @@ impl super::TermWindow {
         );
 
         for pos in self.get_panes_to_render() {
-            if !is_already_captured
-                && row >= pos.top as i64
-                && row <= (pos.top + pos.height) as i64
-                && column >= pos.left
-                && column <= pos.left + pos.width
-            {
+            if !is_already_captured && self.event_in_positioned_pane(&event, &pos) {
                 if pane.pane_id() != pos.pane.pane_id() {
                     // We're over a pane that isn't active
                     match &event.kind {
@@ -704,25 +757,20 @@ impl super::TermWindow {
                         }
                     }
                 }
-                column = column.saturating_sub(pos.left);
-                row = row.saturating_sub(pos.top as i64);
+                position = self.click_position_for_pane(&event, &pos, &*pane);
                 break;
             } else if is_already_captured && pane.pane_id() == pos.pane.pane_id() {
-                column = column.saturating_sub(pos.left);
-                row = row.saturating_sub(pos.top as i64).max(0);
-
-                if position.column < pos.left {
-                    x_pixel_offset -= self.render_metrics.cell_size.width
-                        * (pos.left as isize - position.column as isize);
-                }
-                if position.row < pos.top as i64 {
-                    y_pixel_offset -= self.render_metrics.cell_size.height
-                        * (pos.top as isize - position.row as isize);
-                }
-
+                position = self.click_position_for_pane(&event, &pos, &*pane);
                 break;
             }
         }
+
+        let ClickPosition {
+            column,
+            row,
+            x_pixel_offset,
+            y_pixel_offset,
+        } = position;
 
         if capture_mouse {
             self.current_mouse_capture = Some(MouseCapture::TerminalPane(pane.pane_id()));

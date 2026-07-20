@@ -903,6 +903,14 @@ impl Mux {
     }
 
     pub fn prune_dead_windows(&self) {
+        self.prune_dead_windows_impl(false);
+    }
+
+    pub fn prune_dead_windows_preserving_split(&self) {
+        self.prune_dead_windows_impl(true);
+    }
+
+    fn prune_dead_windows_impl(&self, preserve_split: bool) {
         if Activity::count() > 0 {
             log::trace!("prune_dead_windows: Activity::count={}", Activity::count());
             return;
@@ -921,7 +929,11 @@ impl Mux {
                 }
             };
             for (window_id, win) in windows.iter_mut() {
-                win.prune_dead_tabs(&live_tab_ids);
+                if preserve_split {
+                    win.prune_dead_tabs_preserving_split(&live_tab_ids);
+                } else {
+                    win.prune_dead_tabs(&live_tab_ids);
+                }
                 if win.is_empty() {
                     log::trace!("prune_dead_windows: window is now empty");
                     dead_windows.push(*window_id);

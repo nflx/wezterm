@@ -134,6 +134,10 @@ struct CliListResultItem {
     left_col: usize,
     /// Number of rows from the top of the tab area to the top of this pane
     top_row: usize,
+    /// Number of pixels from the left of the tab area to the left of this pane
+    left_px: usize,
+    /// Number of pixels from the top of the tab area to the top of this pane
+    top_px: usize,
     tab_title: String,
     window_title: String,
     is_active: bool,
@@ -154,6 +158,8 @@ impl CliListResultItem {
             physical_top,
             left_col,
             top_row,
+            left_px,
+            top_px,
             is_active_pane,
             is_zoomed_pane,
             tty_name,
@@ -192,6 +198,8 @@ impl CliListResultItem {
             cursor_visibility: cursor_pos.visibility,
             left_col,
             top_row,
+            left_px,
+            top_px,
             tab_title: tab_title.to_string(),
             window_title: window_title.to_string(),
             is_active: is_active_pane,

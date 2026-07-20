@@ -219,12 +219,25 @@ impl Window {
     }
 
     pub fn prune_dead_tabs(&mut self, live_tab_ids: &[TabId]) {
+        self.prune_dead_tabs_impl(live_tab_ids, false);
+    }
+
+    pub fn prune_dead_tabs_preserving_split(&mut self, live_tab_ids: &[TabId]) {
+        self.prune_dead_tabs_impl(live_tab_ids, true);
+    }
+
+    fn prune_dead_tabs_impl(&mut self, live_tab_ids: &[TabId], preserve_split: bool) {
         let mut invalidated = false;
         let dead: Vec<TabId> = self
             .tabs
             .iter()
             .filter_map(|tab| {
-                if tab.prune_dead_panes() {
+                let pruned = if preserve_split {
+                    tab.prune_dead_panes_preserving_split()
+                } else {
+                    tab.prune_dead_panes()
+                };
+                if pruned {
                     invalidated = true;
                 }
                 if tab.is_dead() {

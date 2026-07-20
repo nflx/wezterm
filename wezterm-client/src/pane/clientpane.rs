@@ -210,7 +210,7 @@ impl ClientPane {
                 log::trace!("remote pane {} has been removed", pane_id);
                 self.renderable.lock().inner.borrow_mut().dead = true;
                 let mux = Mux::get();
-                mux.prune_dead_windows();
+                mux.prune_dead_windows_preserving_split();
 
                 self.client.expire_stale_mappings();
             }
@@ -238,6 +238,50 @@ impl ClientPane {
 
     pub fn remote_pane_id(&self) -> TabId {
         self.remote_pane_id
+    }
+
+    pub fn resize_preserving_split(&self, size: TerminalSize) -> anyhow::Result<()> {
+        self.resize_impl(size, true)
+    }
+
+    fn resize_impl(&self, size: TerminalSize, preserve_split: bool) -> anyhow::Result<()> {
+        let render = self.renderable.lock();
+        let mut inner = render.inner.borrow_mut();
+
+        let cols = size.cols as usize;
+        let rows = size.rows as usize;
+
+        if inner.dimensions.cols != cols
+            || inner.dimensions.viewport_rows != rows
+            || inner.dimensions.pixel_width != size.pixel_width
+            || inner.dimensions.pixel_height != size.pixel_height
+        {
+            inner.dimensions.cols = cols;
+            inner.dimensions.viewport_rows = rows;
+            inner.dimensions.pixel_width = size.pixel_width;
+            inner.dimensions.pixel_height = size.pixel_height;
+
+            // Invalidate any cached rows on a resize
+            inner.make_all_stale();
+
+            let client = Arc::clone(&self.client);
+            let remote_pane_id = self.remote_pane_id;
+            let remote_tab_id = self.remote_tab_id;
+            promise::spawn::spawn(async move {
+                client
+                    .client
+                    .resize(Resize {
+                        containing_tab_id: remote_tab_id,
+                        pane_id: remote_pane_id,
+                        size,
+                        preserve_split,
+                    })
+                    .await
+            })
+            .detach();
+            inner.update_last_send();
+        }
+        Ok(())
     }
 
     /// Arrange to suppress the next Pane::kill call.
@@ -387,42 +431,11 @@ impl Pane for ClientPane {
     }
 
     fn resize(&self, size: TerminalSize) -> anyhow::Result<()> {
-        let render = self.renderable.lock();
-        let mut inner = render.inner.borrow_mut();
+        self.resize_impl(size, false)
+    }
 
-        let cols = size.cols as usize;
-        let rows = size.rows as usize;
-
-        if inner.dimensions.cols != cols
-            || inner.dimensions.viewport_rows != rows
-            || inner.dimensions.pixel_width != size.pixel_width
-            || inner.dimensions.pixel_height != size.pixel_height
-        {
-            inner.dimensions.cols = cols;
-            inner.dimensions.viewport_rows = rows;
-            inner.dimensions.pixel_width = size.pixel_width;
-            inner.dimensions.pixel_height = size.pixel_height;
-
-            // Invalidate any cached rows on a resize
-            inner.make_all_stale();
-
-            let client = Arc::clone(&self.client);
-            let remote_pane_id = self.remote_pane_id;
-            let remote_tab_id = self.remote_tab_id;
-            promise::spawn::spawn(async move {
-                client
-                    .client
-                    .resize(Resize {
-                        containing_tab_id: remote_tab_id,
-                        pane_id: remote_pane_id,
-                        size,
-                    })
-                    .await
-            })
-            .detach();
-            inner.update_last_send();
-        }
-        Ok(())
+    fn resize_preserving_split(&self, size: TerminalSize) -> anyhow::Result<()> {
+        self.resize_impl(size, true)
     }
 
     async fn search(

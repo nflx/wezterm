@@ -54,7 +54,7 @@ use mux_lua::MuxPane;
 use smol::channel::Sender;
 use smol::Timer;
 use std::cell::{RefCell, RefMut};
-use std::collections::{HashMap, LinkedList};
+use std::collections::{HashMap, HashSet, LinkedList};
 use std::ops::Add;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -205,6 +205,13 @@ pub struct PaneState {
     bell_start: Option<Instant>,
     pub mouse_terminal_coords: Option<(ClickPosition, StableRowIndex)>,
     font_scale: Option<f64>,
+}
+
+#[derive(Debug)]
+struct PendingSplitFontScale {
+    tab_id: TabId,
+    known_panes: HashSet<PaneId>,
+    font_scale: f64,
 }
 
 /// Data used when synchronously formatting pane and window titles
@@ -409,6 +416,7 @@ pub struct TermWindow {
 
     tab_state: RefCell<HashMap<TabId, TabState>>,
     pane_state: RefCell<HashMap<PaneId, PaneState>>,
+    pending_split_font_scales: RefCell<Vec<PendingSplitFontScale>>,
     semantic_zones: HashMap<PaneId, SemanticZoneCache>,
 
     window_background: Vec<LoadedBackgroundLayer>,
@@ -727,6 +735,7 @@ impl TermWindow {
             last_scroll_info: RenderableDimensions::default(),
             tab_state: RefCell::new(HashMap::new()),
             pane_state: RefCell::new(HashMap::new()),
+            pending_split_font_scales: RefCell::new(Vec::new()),
             current_mouse_buttons: vec![],
             current_mouse_capture: None,
             last_mouse_click: None,
@@ -1306,15 +1315,34 @@ impl TermWindow {
                     // Also handled by clientpane
                     self.update_title_post_status();
                 }
-                MuxNotification::TabResized(_) => {
+                MuxNotification::TabResized(tab_id) => {
                     // Also handled by wezterm-client
+                    self.apply_pending_split_font_scales(tab_id);
+                    self.resize_tab_id_panes_for_font_scale(tab_id);
+                    self.quad_generation += 1;
+                    self.line_quad_cache.borrow_mut().clear();
                     self.update_title_post_status();
+                    window.invalidate();
                 }
                 MuxNotification::TabTitleChanged { .. } => {
                     self.update_title_post_status();
                 }
-                MuxNotification::PaneAdded(_)
-                | MuxNotification::WorkspaceRenamed { .. }
+                MuxNotification::PaneAdded(_) => {
+                    let tab_ids = self
+                        .pending_split_font_scales
+                        .borrow()
+                        .iter()
+                        .map(|request| request.tab_id)
+                        .collect::<Vec<_>>();
+                    for tab_id in tab_ids {
+                        self.apply_pending_split_font_scales(tab_id);
+                        self.resize_tab_id_panes_for_font_scale(tab_id);
+                    }
+                    self.quad_generation += 1;
+                    self.line_quad_cache.borrow_mut().clear();
+                    window.invalidate();
+                }
+                MuxNotification::WorkspaceRenamed { .. }
                 | MuxNotification::PaneRemoved(_)
                 | MuxNotification::WindowWorkspaceChanged(_)
                 | MuxNotification::ActiveWorkspaceChanged(_)
@@ -2652,6 +2680,7 @@ impl TermWindow {
             }
             SplitHorizontal(spawn) => {
                 log::trace!("SplitHorizontal {:?}", spawn);
+                self.note_pending_split_font_scale(pane);
                 self.spawn_command(
                     spawn,
                     SpawnWhere::SplitPane(SplitRequest {
@@ -2664,6 +2693,7 @@ impl TermWindow {
             }
             SplitVertical(spawn) => {
                 log::trace!("SplitVertical {:?}", spawn);
+                self.note_pending_split_font_scale(pane);
                 self.spawn_command(
                     spawn,
                     SpawnWhere::SplitPane(SplitRequest {
@@ -3114,6 +3144,7 @@ impl TermWindow {
             }
             SplitPane(split) => {
                 log::trace!("SplitPane {:?}", split);
+                self.note_pending_split_font_scale(pane);
                 self.spawn_command(
                     &split.command,
                     SpawnWhere::SplitPane(SplitRequest {
@@ -3293,6 +3324,86 @@ impl TermWindow {
         RefMut::map(self.pane_state.borrow_mut(), |state| {
             state.entry(pane_id).or_insert_with(PaneState::default)
         })
+    }
+
+    fn note_pending_split_font_scale(&self, pane: &Arc<dyn Pane>) {
+        let pane_id = pane.pane_id();
+        let Some(font_scale) = self
+            .pane_state
+            .borrow()
+            .get(&pane_id)
+            .and_then(|state| state.font_scale)
+        else {
+            return;
+        };
+
+        let Some(tab) = Mux::get().get_active_tab_for_window(self.mux_window_id) else {
+            return;
+        };
+
+        let known_panes = tab
+            .iter_panes()
+            .iter()
+            .map(|pos| pos.pane.pane_id())
+            .collect();
+
+        self.pending_split_font_scales
+            .borrow_mut()
+            .push(PendingSplitFontScale {
+                tab_id: tab.tab_id(),
+                known_panes,
+                font_scale,
+            });
+    }
+
+    fn apply_pending_split_font_scales(&mut self, tab_id: TabId) {
+        let Some(tab) = Mux::get().get_tab(tab_id) else {
+            return;
+        };
+
+        let current_panes: HashSet<PaneId> = tab
+            .iter_panes()
+            .iter()
+            .map(|pos| pos.pane.pane_id())
+            .collect();
+        let mut inherited = vec![];
+
+        {
+            let mut pending = self.pending_split_font_scales.borrow_mut();
+            pending.retain(|request| {
+                if request.tab_id != tab_id {
+                    return true;
+                }
+
+                let new_panes = current_panes
+                    .difference(&request.known_panes)
+                    .copied()
+                    .collect::<Vec<_>>();
+
+                if new_panes.is_empty() {
+                    return true;
+                }
+
+                for pane_id in new_panes {
+                    inherited.push((pane_id, request.font_scale));
+                }
+
+                false
+            });
+        }
+
+        if inherited.is_empty() {
+            return;
+        }
+
+        for (pane_id, font_scale) in inherited {
+            self.pane_state(pane_id).font_scale = Some(font_scale);
+        }
+
+        self.shape_generation += 1;
+        self.shape_cache.borrow_mut().clear();
+        self.line_to_ele_shape_cache.borrow_mut().clear();
+        self.line_quad_cache.borrow_mut().clear();
     }
 
     pub fn tab_state(&self, tab_id: TabId) -> RefMut<'_, TabState> {
@@ -3513,7 +3624,9 @@ impl TermWindow {
                 is_active: true,
                 is_zoomed: false,
                 left: 0,
+                pixel_left: 0,
                 top: 0,
+                pixel_top: 0,
                 width: size.cols as _,
                 height: size.rows as _,
                 pixel_width: size.cols as usize * self.render_metrics.cell_size.width as usize,

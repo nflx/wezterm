@@ -66,8 +66,14 @@ pub struct PositionedPane {
     /// left corner of this pane, in cells.
     pub left: usize,
     /// The offset from the top left corner of the containing tab to the top
+    /// left corner of this pane, in pixels.
+    pub pixel_left: usize,
+    /// The offset from the top left corner of the containing tab to the top
     /// left corner of this pane, in cells.
     pub top: usize,
+    /// The offset from the top left corner of the containing tab to the top
+    /// left corner of this pane, in pixels.
+    pub pixel_top: usize,
     /// The width of this pane in cells
     pub width: usize,
     pub pixel_width: usize,
@@ -156,6 +162,20 @@ impl SplitDirectionAndSize {
         }
     }
 
+    fn pixel_top_of_second(&self, cell_dimensions: TerminalSize) -> usize {
+        match self.direction {
+            SplitDirection::Horizontal => 0,
+            SplitDirection::Vertical => self.first.pixel_height + cell_dimensions.pixel_height,
+        }
+    }
+
+    fn pixel_left_of_second(&self, cell_dimensions: TerminalSize) -> usize {
+        match self.direction {
+            SplitDirection::Horizontal => self.first.pixel_width + cell_dimensions.pixel_width,
+            SplitDirection::Vertical => 0,
+        }
+    }
+
     pub fn width(&self) -> usize {
         if self.direction == SplitDirection::Horizontal {
             self.first.cols + self.second.cols + 1
@@ -222,6 +242,9 @@ fn pane_tree(
     workspace: &str,
     left_col: usize,
     top_row: usize,
+    left_px: usize,
+    top_px: usize,
+    cell_dimensions: TerminalSize,
 ) -> PaneNode {
     match tree {
         Tree::Empty => PaneNode::Empty,
@@ -229,7 +252,17 @@ fn pane_tree(
             let data = data.unwrap();
             PaneNode::Split {
                 left: Box::new(pane_tree(
-                    &*left, tab_id, window_id, active, zoomed, workspace, left_col, top_row,
+                    &*left,
+                    tab_id,
+                    window_id,
+                    active,
+                    zoomed,
+                    workspace,
+                    left_col,
+                    top_row,
+                    left_px,
+                    top_px,
+                    cell_dimensions,
                 )),
                 right: Box::new(pane_tree(
                     &*right,
@@ -248,6 +281,9 @@ fn pane_tree(
                     } else {
                         top_row + data.top_of_second()
                     },
+                    left_px + data.pixel_left_of_second(cell_dimensions),
+                    top_px + data.pixel_top_of_second(cell_dimensions),
+                    cell_dimensions,
                 )),
                 node: data,
             }
@@ -277,6 +313,8 @@ fn pane_tree(
                 physical_top: dims.physical_top,
                 left_col,
                 top_row,
+                left_px,
+                top_px,
                 tty_name: pane.tty_name(),
             })
         }
@@ -478,7 +516,7 @@ fn adjust_y_size(tree: &mut Tree, mut y_adjust: isize, cell_dimensions: &Termina
     }
 }
 
-fn apply_sizes_from_splits(tree: &Tree, size: &TerminalSize) {
+fn apply_sizes_from_splits_impl(tree: &Tree, size: &TerminalSize, preserve_split: bool) {
     match tree {
         Tree::Empty => return,
         Tree::Node { data: None, .. } => return,
@@ -487,13 +525,25 @@ fn apply_sizes_from_splits(tree: &Tree, size: &TerminalSize) {
             right,
             data: Some(data),
         } => {
-            apply_sizes_from_splits(&*left, &data.first);
-            apply_sizes_from_splits(&*right, &data.second);
+            apply_sizes_from_splits_impl(&*left, &data.first, preserve_split);
+            apply_sizes_from_splits_impl(&*right, &data.second, preserve_split);
         }
         Tree::Leaf(pane) => {
-            pane.resize(*size).ok();
+            if preserve_split {
+                pane.resize_preserving_split(*size).ok();
+            } else {
+                pane.resize(*size).ok();
+            }
         }
     }
+}
+
+fn apply_sizes_from_splits(tree: &Tree, size: &TerminalSize) {
+    apply_sizes_from_splits_impl(tree, size, false);
+}
+
+fn apply_sizes_from_splits_preserving_split(tree: &Tree, size: &TerminalSize) {
+    apply_sizes_from_splits_impl(tree, size, true);
 }
 
 fn cell_dimensions(size: &TerminalSize) -> TerminalSize {
@@ -663,7 +713,11 @@ impl Tab {
     }
 
     pub fn prune_dead_panes(&self) -> bool {
-        self.inner.lock().prune_dead_panes()
+        self.inner.lock().prune_dead_panes(false)
+    }
+
+    pub fn prune_dead_panes_preserving_split(&self) -> bool {
+        self.inner.lock().prune_dead_panes(true)
     }
 
     pub fn kill_pane(&self, pane_id: PaneId) -> bool {
@@ -745,7 +799,18 @@ impl Tab {
     ) -> anyhow::Result<usize> {
         self.inner
             .lock()
-            .split_and_insert(pane_index, request, pane)
+            .split_and_insert(pane_index, request, pane, false)
+    }
+
+    pub fn split_and_insert_preserving_split(
+        &self,
+        pane_index: usize,
+        request: SplitRequest,
+        pane: Arc<dyn Pane>,
+    ) -> anyhow::Result<usize> {
+        self.inner
+            .lock()
+            .split_and_insert(pane_index, request, pane, true)
     }
 
     pub fn get_zoomed_pane(&self) -> Option<Arc<dyn Pane>> {
@@ -807,7 +872,12 @@ impl TabInner {
         self.zoomed = zoomed;
         self.size = size;
 
-        self.resize(size);
+        if let Some(zoomed) = &self.zoomed {
+            zoomed.resize_preserving_split(size).ok();
+        } else if let Some(root) = self.pane.as_mut() {
+            apply_sizes_from_splits_preserving_split(root, &size);
+            Mux::try_get().map(|mux| mux.notify(MuxNotification::TabResized(self.id)));
+        }
 
         log::debug!(
             "sync tab: {:#?} zoomed: {} {:#?}",
@@ -842,6 +912,7 @@ impl TabInner {
 
         let active = self.get_active_pane();
         let zoomed = self.zoomed.as_ref();
+        let cell_dimensions = self.cell_dimensions();
         if let Some(root) = self.pane.as_ref() {
             pane_tree(
                 root,
@@ -852,6 +923,9 @@ impl TabInner {
                 &workspace,
                 0,
                 0,
+                0,
+                0,
+                cell_dimensions,
             )
         } else {
             PaneNode::Empty
@@ -1011,7 +1085,9 @@ impl TabInner {
                     is_active: true,
                     is_zoomed: true,
                     left: 0,
+                    pixel_left: 0,
                     top: 0,
+                    pixel_top: 0,
                     width: size.cols.into(),
                     pixel_width: size.pixel_width.into(),
                     height: size.rows.into(),
@@ -1025,13 +1101,16 @@ impl TabInner {
         let active_idx = self.active;
         let zoomed_id = self.zoomed.as_ref().map(|p| p.pane_id());
         let root_size = self.size;
+        let cell_dimensions = self.cell_dimensions();
         let mut cursor = self.pane.take().unwrap().cursor();
 
         loop {
             if cursor.is_leaf() {
                 let index = panes.len();
                 let mut left = 0usize;
+                let mut pixel_left = 0usize;
                 let mut top = 0usize;
+                let mut pixel_top = 0usize;
                 let mut parent_size = None;
                 for (branch, node) in cursor.path_to_root() {
                     if let Some(node) = node {
@@ -1045,6 +1124,8 @@ impl TabInner {
                         if branch == PathBranch::IsRight {
                             top += node.top_of_second();
                             left += node.left_of_second();
+                            pixel_top += node.pixel_top_of_second(cell_dimensions);
+                            pixel_left += node.pixel_left_of_second(cell_dimensions);
                         }
                     }
                 }
@@ -1057,7 +1138,9 @@ impl TabInner {
                     is_active: index == active_idx,
                     is_zoomed: zoomed_id == Some(pane.pane_id()),
                     left,
+                    pixel_left,
                     top,
+                    pixel_top,
                     width: dims.cols as _,
                     height: dims.rows as _,
                     pixel_width: dims.pixel_width as _,
@@ -1137,6 +1220,10 @@ impl TabInner {
     }
 
     fn resize(&mut self, size: TerminalSize) {
+        self.resize_impl(size, false);
+    }
+
+    fn resize_impl(&mut self, size: TerminalSize, preserve_split: bool) {
         if size.rows == 0 || size.cols == 0 {
             // Ignore "impossible" resize requests
             return;
@@ -1176,7 +1263,7 @@ impl TabInner {
             self.size = size;
 
             // And then resize the individual panes to match
-            apply_sizes_from_splits(self.pane.as_mut().unwrap(), &size);
+            apply_sizes_from_splits_impl(self.pane.as_mut().unwrap(), &size, preserve_split);
         }
 
         Mux::try_get().map(|mux| mux.notify(MuxNotification::TabResized(self.id)));
@@ -1557,7 +1644,7 @@ impl TabInner {
         None
     }
 
-    fn prune_dead_panes(&mut self) -> bool {
+    fn prune_dead_panes(&mut self, preserve_split: bool) -> bool {
         let mux = Mux::get();
         !self
             .remove_pane_if(
@@ -1577,34 +1664,43 @@ impl TabInner {
                     dead || !in_mux
                 },
                 true,
+                preserve_split,
             )
             .is_empty()
     }
 
     fn kill_pane(&mut self, pane_id: PaneId) -> bool {
         !self
-            .remove_pane_if(|_, pane| pane.pane_id() == pane_id, true)
+            .remove_pane_if(|_, pane| pane.pane_id() == pane_id, true, false)
             .is_empty()
     }
 
     fn kill_panes_in_domain(&mut self, domain: DomainId) -> bool {
         !self
-            .remove_pane_if(|_, pane| pane.domain_id() == domain, true)
+            .remove_pane_if(|_, pane| pane.domain_id() == domain, true, false)
             .is_empty()
     }
 
     fn remove_pane(&mut self, pane_id: PaneId) -> Option<Arc<dyn Pane>> {
-        let panes = self.remove_pane_if(|_, pane| pane.pane_id() == pane_id, false);
+        let panes = self.remove_pane_if(|_, pane| pane.pane_id() == pane_id, false, false);
         for pane in panes {
             return Some(pane);
         }
         None
     }
 
-    fn remove_pane_if<F>(&mut self, f: F, kill: bool) -> Vec<Arc<dyn Pane>>
+    fn remove_pane_if<F>(&mut self, f: F, kill: bool, preserve_split: bool) -> Vec<Arc<dyn Pane>>
     where
         F: Fn(usize, &Arc<dyn Pane>) -> bool,
     {
+        fn resize_pane(pane: &Arc<dyn Pane>, size: TerminalSize, preserve_split: bool) {
+            if preserve_split {
+                pane.resize_preserving_split(size).ok();
+            } else {
+                pane.resize(size).ok();
+            }
+        }
+
         let mut dead_panes = vec![];
         let zoomed_pane = self.zoomed.as_ref().map(|p| p.pane_id());
 
@@ -1666,13 +1762,13 @@ impl TabInner {
                         };
 
                         if let Some(unsplit) = cursor.leaf_mut() {
-                            unsplit.resize(size).ok();
+                            resize_pane(unsplit, size, preserve_split);
                         } else {
                             self.apply_pane_size(size, &mut cursor);
                         }
                     } else if !dead_panes.is_empty() {
                         // Apply our revised size to the tty
-                        pane.resize(pane_size).ok();
+                        resize_pane(&pane, pane_size, preserve_split);
                     }
 
                     pane_index += 1;
@@ -1694,6 +1790,10 @@ impl TabInner {
             let active_idx = self.active;
             removed_indices.retain(|&idx| idx <= active_idx);
             self.active = active_idx.saturating_sub(removed_indices.len());
+        }
+
+        if !dead_panes.is_empty() {
+            Mux::try_get().map(|mux| mux.notify(MuxNotification::TabResized(self.id)));
         }
 
         if !dead_panes.is_empty() && kill {
@@ -1927,13 +2027,18 @@ impl TabInner {
         self.set_zoomed(false);
 
         self.iter_panes().iter().nth(pane_index).map(|pos| {
+            let layout_width = (pos.pixel_width / cell_dims.pixel_width.max(1)).max(1);
+            let layout_height = (pos.pixel_height / cell_dims.pixel_height.max(1)).max(1);
             let ((width1, width2), (height1, height2)) = match request.direction {
                 SplitDirection::Horizontal => (
-                    split_dimension(pos.width, request),
-                    (pos.height, pos.height),
+                    split_dimension(layout_width, request),
+                    (layout_height, layout_height),
                 ),
                 SplitDirection::Vertical => {
-                    ((pos.width, pos.width), split_dimension(pos.height, request))
+                    (
+                        (layout_width, layout_width),
+                        split_dimension(layout_height, request),
+                    )
                 }
             };
 
@@ -1962,6 +2067,7 @@ impl TabInner {
         pane_index: usize,
         request: SplitRequest,
         pane: Arc<dyn Pane>,
+        preserve_split: bool,
     ) -> anyhow::Result<usize> {
         if self.zoomed.is_some() {
             anyhow::bail!("cannot split while zoomed");
@@ -2005,9 +2111,9 @@ impl TabInner {
                 // match the target size; it's easier to reuse
                 // existing resize logic that way
                 if request.target_is_second {
-                    self.resize(split_info.first.clone());
+                    self.resize_impl(split_info.first.clone(), preserve_split);
                 } else {
-                    self.resize(split_info.second.clone());
+                    self.resize_impl(split_info.second.clone(), preserve_split);
                 }
             }
 
@@ -2057,8 +2163,13 @@ impl TabInner {
                 (pane, existing_pane)
             };
 
-            pane1.resize(split_info.first)?;
-            pane2.resize(split_info.second.clone())?;
+            if preserve_split {
+                pane1.resize_preserving_split(split_info.first)?;
+                pane2.resize_preserving_split(split_info.second.clone())?;
+            } else {
+                pane1.resize(split_info.first)?;
+                pane2.resize(split_info.second.clone())?;
+            }
 
             *cursor.leaf_mut().unwrap() = pane1;
 
@@ -2084,6 +2195,7 @@ impl TabInner {
 
         log::debug!("split info after split: {:#?}", self.iter_splits());
         log::debug!("pane info after split: {:#?}", self.iter_panes());
+        Mux::try_get().map(|mux| mux.notify(MuxNotification::TabResized(self.id)));
 
         Ok(if request.target_is_second {
             pane_index + 1
@@ -2160,6 +2272,8 @@ pub struct PaneEntry {
     pub physical_top: StableRowIndex,
     pub top_row: usize,
     pub left_col: usize,
+    pub top_px: usize,
+    pub left_px: usize,
     pub tty_name: Option<String>,
 }
 
