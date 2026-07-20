@@ -143,6 +143,9 @@ impl crate::TermWindow {
         } else {
             let params = LineToElementParams {
                 config: params.config,
+                fonts: &params.fonts,
+                font_scale: params.font_scale,
+                render_metrics: params.render_metrics,
                 line: params.line,
                 palette: params.palette,
                 window_is_transparent: params.window_is_transparent,
@@ -585,6 +588,15 @@ impl crate::TermWindow {
                         let adjust = (glyph.x_offset + glyph.bearing_x).get() as f32;
                         let texture_range = pos_x + adjust
                             ..pos_x + adjust + (texture.coords.size.width as f32 * width_scale);
+                        let pane_pixel_range =
+                            params.left_pixel_x..params.left_pixel_x + params.pixel_width;
+                        let texture_range = intersection(&texture_range, &pane_pixel_range);
+
+                        if texture_range.is_empty() {
+                            continue;
+                        }
+                        let pane_y_range =
+                            params.pane_top_pixel_y..params.pane_top_pixel_y + params.pane_pixel_height;
 
                         // First bucket the ranges according to cursor position
                         let (left, mid, right) = range3(&texture_range, &cursor_range_pixels);
@@ -630,21 +642,37 @@ impl crate::TermWindow {
                                 continue;
                             }
 
-                            let pixel_rect = euclid::rect(
-                                texture.coords.origin.x + (range.start - (pos_x + adjust)) as isize,
-                                texture.coords.origin.y,
-                                ((range.end - range.start) / width_scale) as isize,
-                                texture.coords.size.height,
-                            );
+                            let quad_top = params.top_pixel_y + top;
+                            let quad_bottom =
+                                quad_top + texture.coords.size.height as f32 * height_scale;
+                            let clipped_y = intersection(&(quad_top..quad_bottom), &pane_y_range);
+                            if clipped_y.is_empty() {
+                                continue;
+                            }
+
+                            let pixel_x =
+                                texture.coords.origin.x + (range.start - (pos_x + adjust)) as isize;
+                            let pixel_y = texture.coords.origin.y
+                                + ((clipped_y.start - quad_top) / height_scale) as isize;
+                            let pixel_width = ((range.end - range.start) / width_scale) as isize;
+                            let pixel_height =
+                                ((clipped_y.end - clipped_y.start) / height_scale) as isize;
+
+                            if pixel_width <= 0 || pixel_height <= 0 {
+                                continue;
+                            }
+
+                            let pixel_rect =
+                                euclid::rect(pixel_x, pixel_y, pixel_width, pixel_height);
 
                             let texture_rect = texture.texture.to_texture_coords(pixel_rect);
 
                             let mut quad = layers.allocate(1).context("layers.allocate(1)")?;
                             quad.set_position(
                                 gl_x + range.start,
-                                pos_y + top,
+                                (self.dimensions.pixel_height as f32 / -2.) + clipped_y.start,
                                 gl_x + range.end,
-                                pos_y + top + texture.coords.size.height as f32 * height_scale,
+                                (self.dimensions.pixel_height as f32 / -2.) + clipped_y.end,
                             );
                             quad.set_fg_color(glyph_color);
                             quad.set_alt_color_and_mix_value(fg_color_alt, fg_color_mix);
@@ -753,7 +781,7 @@ impl crate::TermWindow {
             if !matches!(last_style.as_ref(), Some(ClusterStyleCache{attrs,..}) if *attrs == &cluster.attrs)
             {
                 let attrs = &cluster.attrs;
-                let style = self.fonts.match_style(params.config, attrs);
+                let style = params.fonts.match_style(params.config, attrs);
                 let hyperlink = attrs.hyperlink();
                 let is_highlited_hyperlink =
                     same_hyperlink(hyperlink, self.current_highlight.as_ref());
@@ -769,7 +797,7 @@ impl crate::TermWindow {
                         attrs.strikethrough(),
                         attrs.underline(),
                         attrs.overline(),
-                        &self.render_metrics,
+                        &params.render_metrics,
                     )?
                     .texture_coords();
                 let bg_is_default = attrs.background() == ColorAttribute::Default;
@@ -862,8 +890,10 @@ impl crate::TermWindow {
                 style_params.style,
                 &cluster,
                 &gl_state,
+                params.fonts,
+                params.font_scale,
                 None,
-                &self.render_metrics,
+                &params.render_metrics,
             )?;
             let pixel_width = glyph_info
                 .iter()

@@ -2,8 +2,12 @@ use crate::resize_increment_calculator::ResizeIncrementCalculator;
 use crate::utilsprites::RenderMetrics;
 use ::window::{Dimensions, ResizeIncrement, Window, WindowOps, WindowState};
 use config::{ConfigHandle, DimensionContext};
-use mux::Mux;
+use mux::{
+    pane::{Pane, PaneId},
+    Mux,
+};
 use std::rc::Rc;
+use std::sync::Arc;
 use wezterm_font::FontConfiguration;
 use wezterm_term::TerminalSize;
 
@@ -470,6 +474,78 @@ impl super::TermWindow {
         self.pending_scale_changes
             .push_back(ScaleChange::Absolute(1.0));
         self.apply_pending_scale_changes();
+    }
+
+    pub fn pane_font_scale(&self, pane_id: PaneId) -> f64 {
+        self.pane_state
+            .borrow()
+            .get(&pane_id)
+            .and_then(|state| state.font_scale)
+            .unwrap_or(1.0)
+    }
+
+    pub fn pane_font_configuration(
+        &self,
+        font_scale: f64,
+    ) -> anyhow::Result<Rc<FontConfiguration>> {
+        if font_scale == self.fonts.get_font_scale() {
+            return Ok(Rc::clone(&self.fonts));
+        }
+
+        let fonts = Rc::new(FontConfiguration::new(
+            Some(self.config.clone()),
+            self.dimensions.dpi,
+        )?);
+        fonts.change_scaling(font_scale, self.dimensions.dpi);
+        Ok(fonts)
+    }
+
+    pub fn pane_render_metrics(&self, font_scale: f64) -> anyhow::Result<RenderMetrics> {
+        if font_scale == self.fonts.get_font_scale() {
+            return Ok(self.render_metrics);
+        }
+        RenderMetrics::new(&self.pane_font_configuration(font_scale)?)
+    }
+
+    fn set_pane_font_scale(&mut self, pane: &Arc<dyn Pane>, font_scale: Option<f64>) {
+        let pane_id = pane.pane_id();
+        let new_scale = font_scale.unwrap_or(1.0);
+        let font_size = self.config.font_size * new_scale;
+        let theoretical_height = font_size * self.dimensions.dpi as f64 / 72.0;
+
+        if theoretical_height < 2.0 {
+            log::warn!(
+                "refusing to set pane {} to unreasonably small font scale {}; font_height={}",
+                pane_id,
+                new_scale,
+                theoretical_height
+            );
+            return;
+        }
+
+        self.pane_state(pane_id).font_scale = font_scale.filter(|scale| *scale != 1.0);
+
+        self.shape_generation += 1;
+        self.shape_cache.borrow_mut().clear();
+        self.line_to_ele_shape_cache.borrow_mut().clear();
+        self.line_quad_cache.borrow_mut().clear();
+        self.quad_generation += 1;
+
+        if let Some(window) = self.window.as_ref() {
+            window.invalidate();
+        }
+    }
+
+    pub fn decrease_pane_font_size(&mut self, pane: &Arc<dyn Pane>) {
+        self.set_pane_font_scale(pane, Some(self.pane_font_scale(pane.pane_id()) / 1.1));
+    }
+
+    pub fn increase_pane_font_size(&mut self, pane: &Arc<dyn Pane>) {
+        self.set_pane_font_scale(pane, Some(self.pane_font_scale(pane.pane_id()) * 1.1));
+    }
+
+    pub fn reset_pane_font_size(&mut self, pane: &Arc<dyn Pane>) {
+        self.set_pane_font_scale(pane, None);
     }
 
     pub fn set_window_size(&mut self, size: TerminalSize, window: &Window) -> anyhow::Result<()> {

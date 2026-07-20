@@ -204,6 +204,7 @@ pub struct PaneState {
 
     bell_start: Option<Instant>,
     pub mouse_terminal_coords: Option<(ClickPosition, StableRowIndex)>,
+    font_scale: Option<f64>,
 }
 
 /// Data used when synchronously formatting pane and window titles
@@ -2726,6 +2727,9 @@ impl TermWindow {
             DecreaseFontSize => self.decrease_font_size(),
             IncreaseFontSize => self.increase_font_size(),
             ResetFontSize => self.reset_font_size(),
+            DecreasePaneFontSize => self.decrease_pane_font_size(pane),
+            IncreasePaneFontSize => self.increase_pane_font_size(pane),
+            ResetPaneFontSize => self.reset_pane_font_size(pane),
             ResetFontAndWindowSize => {
                 if let Some(w) = window.as_ref() {
                     self.reset_font_and_window_size(&w)?

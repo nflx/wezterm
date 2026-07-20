@@ -48,7 +48,7 @@ impl Texture2d for SrgbTexture2d {
         let (im_width, im_height) = im.image_dimensions();
 
         let source = glium::texture::RawImage2d {
-            data: std::borrow::Cow::Borrowed(im.pixels()),
+            data: std::borrow::Cow::Borrowed(im.pixel_data_slice()),
             width: im_width as u32,
             height: im_height as u32,
             format: glium::texture::ClientFormat::U8U8U8U8,
@@ -397,8 +397,8 @@ impl Image {
     }
 
     pub fn scale_by(&self, scale: f64) -> Image {
-        let width = (self.width as f64 * scale) as usize;
-        let height = (self.height as f64 * scale) as usize;
+        let width = ((self.width as f64 * scale) as usize).max(1);
+        let height = ((self.height as f64 * scale) as usize).max(1);
         self.resize(width, height)
     }
 
