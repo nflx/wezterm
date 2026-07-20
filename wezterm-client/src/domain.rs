@@ -920,7 +920,7 @@ impl Domain for ClientDomain {
             None => anyhow::bail!("invalid pane id {}", pane_id),
         };
 
-        tab.split_and_insert(pane_index, split_request, Arc::clone(&pane))
+        tab.split_and_insert_preserving_split(pane_index, split_request, Arc::clone(&pane))
             .ok();
 
         mux.add_pane(&pane)?;

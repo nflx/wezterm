@@ -4,6 +4,7 @@ use ::window::{Dimensions, ResizeIncrement, Window, WindowOps, WindowState};
 use config::{ConfigHandle, DimensionContext};
 use mux::{
     pane::{Pane, PaneId},
+    tab::{PositionedPane, Tab},
     Mux,
 };
 use std::rc::Rc;
@@ -300,6 +301,7 @@ impl super::TermWindow {
         if let Some(window) = mux.get_window(self.mux_window_id) {
             for tab in window.iter() {
                 tab.resize(size);
+                self.resize_tab_panes_for_font_scale(&tab);
             }
         };
         self.resize_overlays();
@@ -507,6 +509,101 @@ impl super::TermWindow {
         RenderMetrics::new(&self.pane_font_configuration(font_scale)?)
     }
 
+    fn pane_size_for_font_scale(
+        &self,
+        pixel_width: usize,
+        pixel_height: usize,
+        font_scale: f64,
+    ) -> anyhow::Result<TerminalSize> {
+        let metrics = self.pane_render_metrics(font_scale)?;
+        let cell_width = (metrics.cell_size.width as usize).max(1);
+        let cell_height = (metrics.cell_size.height as usize).max(1);
+        let cols = (pixel_width / cell_width).max(1);
+        let rows = (pixel_height / cell_height).max(1);
+
+        Ok(TerminalSize {
+            rows,
+            cols,
+            pixel_width,
+            pixel_height,
+            dpi: self.dimensions.dpi as u32,
+        })
+    }
+
+    fn resize_positioned_pane_for_font_scale(&self, pos: &PositionedPane) -> anyhow::Result<bool> {
+        let font_scale = self.pane_font_scale(pos.pane.pane_id());
+        let size = self.pane_size_for_font_scale(pos.pixel_width, pos.pixel_height, font_scale)?;
+        let dims = pos.pane.get_dimensions();
+
+        if dims.cols == size.cols
+            && dims.viewport_rows == size.rows
+            && dims.pixel_width == size.pixel_width
+            && dims.pixel_height == size.pixel_height
+            && dims.dpi == size.dpi
+        {
+            return Ok(false);
+        }
+
+        if let Some(client_pane) = pos.pane.downcast_ref::<wezterm_client::pane::ClientPane>() {
+            client_pane.resize_preserving_split(size)?;
+        } else {
+            pos.pane.resize(size)?;
+        }
+        Ok(true)
+    }
+
+    fn resize_tab_panes_for_font_scale(&self, tab: &Arc<Tab>) {
+        let visible = tab.iter_panes();
+        let all = tab.iter_panes_ignoring_zoom();
+        let zoomed_pane_id = visible
+            .iter()
+            .find(|pos| pos.is_zoomed)
+            .map(|pos| pos.pane.pane_id());
+
+        for pos in &visible {
+            if let Err(err) = self.resize_positioned_pane_for_font_scale(pos) {
+                log::error!(
+                    "failed to resize visible pane {} for font scale: {:#}",
+                    pos.pane.pane_id(),
+                    err
+                );
+            }
+        }
+
+        for pos in &all {
+            if Some(pos.pane.pane_id()) == zoomed_pane_id {
+                continue;
+            }
+            if visible
+                .iter()
+                .any(|visible| visible.pane.pane_id() == pos.pane.pane_id())
+            {
+                continue;
+            }
+            if let Err(err) = self.resize_positioned_pane_for_font_scale(pos) {
+                log::error!(
+                    "failed to resize hidden pane {} for font scale: {:#}",
+                    pos.pane.pane_id(),
+                    err
+                );
+            }
+        }
+    }
+
+    fn resize_active_tab_panes_for_font_scale(&self) {
+        let Some(tab) = Mux::get().get_active_tab_for_window(self.mux_window_id) else {
+            return;
+        };
+        self.resize_tab_panes_for_font_scale(&tab);
+    }
+
+    pub fn resize_tab_id_panes_for_font_scale(&self, tab_id: mux::tab::TabId) {
+        let Some(tab) = Mux::get().get_tab(tab_id) else {
+            return;
+        };
+        self.resize_tab_panes_for_font_scale(&tab);
+    }
+
     fn set_pane_font_scale(&mut self, pane: &Arc<dyn Pane>, font_scale: Option<f64>) {
         let pane_id = pane.pane_id();
         let new_scale = font_scale.unwrap_or(1.0);
@@ -524,6 +621,7 @@ impl super::TermWindow {
         }
 
         self.pane_state(pane_id).font_scale = font_scale.filter(|scale| *scale != 1.0);
+        self.resize_active_tab_panes_for_font_scale();
 
         self.shape_generation += 1;
         self.shape_cache.borrow_mut().clear();

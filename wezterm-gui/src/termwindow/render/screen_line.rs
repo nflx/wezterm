@@ -158,12 +158,23 @@ impl crate::TermWindow {
             shaped
         };
 
-        let bounding_rect = euclid::rect(
+        let line_rect = euclid::rect(
             params.left_pixel_x,
             params.top_pixel_y,
             params.pixel_width,
             cell_height,
         );
+        let pane_rect = euclid::rect(
+            params.left_pixel_x,
+            params.pane_top_pixel_y,
+            params.pixel_width,
+            params.pane_pixel_height,
+        );
+        let Some(bounding_rect) = line_rect.intersection(&pane_rect) else {
+            return Ok(RenderScreenLineResult {
+                invalidate_on_hover_change,
+            });
+        };
 
         fn phys(x: usize, num_cols: usize, direction: Direction) -> usize {
             match direction {
@@ -174,17 +185,7 @@ impl crate::TermWindow {
 
         if params.dims.reverse_video {
             let mut quad = self
-                .filled_rectangle(
-                    layers,
-                    0,
-                    euclid::rect(
-                        params.left_pixel_x,
-                        params.top_pixel_y,
-                        params.pixel_width,
-                        cell_height,
-                    ),
-                    params.foreground,
-                )
+                .filled_rectangle(layers, 0, bounding_rect, params.foreground)
                 .context("filled_rectangle")?;
             quad.set_hsv(hsv);
         }
@@ -275,7 +276,20 @@ impl crate::TermWindow {
                                 * cell_width
                         };
 
-                    quad.set_position(x, pos_y, x + cell_width, pos_y + cell_height);
+                    let left = x.max(gl_x + params.left_pixel_x);
+                    let right = (x + cell_width).min(gl_x + params.left_pixel_x + params.pixel_width);
+                    let top = pos_y.max(
+                        (self.dimensions.pixel_height as f32 / -2.) + params.pane_top_pixel_y,
+                    );
+                    let bottom = (pos_y + cell_height).min(
+                        (self.dimensions.pixel_height as f32 / -2.)
+                            + params.pane_top_pixel_y
+                            + params.pane_pixel_height,
+                    );
+                    if right <= left || bottom <= top {
+                        continue;
+                    }
+                    quad.set_position(left, top, right, bottom);
                     quad.set_hsv(hsv);
                     quad.set_has_color(false);
                     quad.set_texture(item.underline_tex_rect);
@@ -290,16 +304,14 @@ impl crate::TermWindow {
         let selection_pixel_range = if !params.selection.is_empty() {
             let start = params.left_pixel_x + (params.selection.start as f32 * cell_width);
             let width = (params.selection.end - params.selection.start) as f32 * cell_width;
-            let mut quad = self
-                .filled_rectangle(
-                    layers,
-                    0,
-                    euclid::rect(start, params.top_pixel_y, width, cell_height),
-                    params.selection_bg,
-                )
-                .context("filled_rectangle")?;
-
-            quad.set_hsv(hsv);
+            if let Some(rect) =
+                euclid::rect(start, params.top_pixel_y, width, cell_height).intersection(&pane_rect)
+            {
+                let mut quad = self
+                    .filled_rectangle(layers, 0, rect, params.selection_bg)
+                    .context("filled_rectangle")?;
+                quad.set_hsv(hsv);
+            }
 
             start..start + width
         } else {
@@ -399,23 +411,32 @@ impl crate::TermWindow {
                 }
 
                 if draw_basic {
-                    quad.set_position(
-                        pos_x,
-                        pos_y,
-                        pos_x + (cursor_range.end - cursor_range.start) as f32 * cell_width,
-                        pos_y + cell_height,
+                    let cursor_width = (cursor_range.end - cursor_range.start) as f32 * cell_width;
+                    let left = pos_x.max(gl_x + params.left_pixel_x);
+                    let right = (pos_x + cursor_width)
+                        .min(gl_x + params.left_pixel_x + params.pixel_width);
+                    let top = pos_y.max(
+                        (self.dimensions.pixel_height as f32 / -2.) + params.pane_top_pixel_y,
                     );
-                    quad.set_texture(
-                        gl_state
-                            .glyph_cache
-                            .borrow_mut()
-                            .cursor_sprite(
-                                Some(shape),
-                                &params.render_metrics,
-                                (cursor_range.end - cursor_range.start) as u8,
-                            )?
-                            .texture_coords(),
+                    let bottom = (pos_y + cell_height).min(
+                        (self.dimensions.pixel_height as f32 / -2.)
+                            + params.pane_top_pixel_y
+                            + params.pane_pixel_height,
                     );
+                    if right > left && bottom > top {
+                        quad.set_position(left, top, right, bottom);
+                        quad.set_texture(
+                            gl_state
+                                .glyph_cache
+                                .borrow_mut()
+                                .cursor_sprite(
+                                    Some(shape),
+                                    &params.render_metrics,
+                                    (cursor_range.end - cursor_range.start) as u8,
+                                )?
+                                .texture_coords(),
+                        );
+                    }
                 }
 
                 quad.set_fg_color(cursor_border_color);
@@ -595,8 +616,8 @@ impl crate::TermWindow {
                         if texture_range.is_empty() {
                             continue;
                         }
-                        let pane_y_range =
-                            params.pane_top_pixel_y..params.pane_top_pixel_y + params.pane_pixel_height;
+                        let pane_y_range = params.pane_top_pixel_y
+                            ..params.pane_top_pixel_y + params.pane_pixel_height;
 
                         // First bucket the ranges according to cursor position
                         let (left, mid, right) = range3(&texture_range, &cursor_range_pixels);
@@ -650,8 +671,8 @@ impl crate::TermWindow {
                                 continue;
                             }
 
-                            let pixel_x =
-                                texture.coords.origin.x + (range.start - (pos_x + adjust)) as isize;
+                            let pixel_x = texture.coords.origin.x
+                                + ((range.start - (pos_x + adjust)) / width_scale) as isize;
                             let pixel_y = texture.coords.origin.y
                                 + ((clipped_y.start - quad_top) / height_scale) as isize;
                             let pixel_width = ((range.end - range.start) / width_scale) as isize;

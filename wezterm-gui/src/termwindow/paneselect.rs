@@ -120,7 +120,6 @@ impl PaneSelector {
                 }));
 
             let dimensions = term_window.dimensions;
-            let pane_dims = pos.pane.get_dimensions();
 
             let computed = term_window.compute_element(
                 &LayoutContext {
@@ -135,15 +134,10 @@ impl PaneSelector {
                         pixel_cell: metrics.cell_size.width as f32,
                     },
                     bounds: euclid::rect(
-                        padding_left
-                            + ((pos.left as f32 + pane_dims.cols as f32 / 2.)
-                                * term_window.render_metrics.cell_size.width as f32),
-                        top_pixel_y
-                            + ((pos.top as f32 + pane_dims.viewport_rows as f32 / 2.)
-                                * term_window.render_metrics.cell_size.height as f32),
-                        pane_dims.cols as f32 * term_window.render_metrics.cell_size.width as f32,
-                        pane_dims.viewport_rows as f32
-                            * term_window.render_metrics.cell_size.height as f32,
+                        padding_left + pos.pixel_left as f32 + (pos.pixel_width as f32 / 2.0),
+                        top_pixel_y + pos.pixel_top as f32 + (pos.pixel_height as f32 / 2.0),
+                        pos.pixel_width as f32,
+                        pos.pixel_height as f32,
                     ),
                     metrics: &metrics,
                     gl_state: term_window.render_state.as_ref().unwrap(),
