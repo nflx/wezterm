@@ -315,6 +315,7 @@ fn pane_tree(
                 top_row,
                 left_px,
                 top_px,
+                font_scale: pane.font_scale(),
                 tty_name: pane.tty_name(),
             })
         }
@@ -2274,6 +2275,7 @@ pub struct PaneEntry {
     pub left_col: usize,
     pub top_px: usize,
     pub left_px: usize,
+    pub font_scale: Option<f64>,
     pub tty_name: Option<String>,
 }
 

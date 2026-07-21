@@ -1317,6 +1317,7 @@ impl TermWindow {
                 }
                 MuxNotification::TabResized(tab_id) => {
                     // Also handled by wezterm-client
+                    self.sync_tab_pane_font_scales_from_mux(tab_id);
                     self.apply_pending_split_font_scales(tab_id);
                     self.resize_tab_id_panes_for_font_scale(tab_id);
                     self.quad_generation += 1;
@@ -1335,6 +1336,7 @@ impl TermWindow {
                         .map(|request| request.tab_id)
                         .collect::<Vec<_>>();
                     for tab_id in tab_ids {
+                        self.sync_tab_pane_font_scales_from_mux(tab_id);
                         self.apply_pending_split_font_scales(tab_id);
                         self.resize_tab_id_panes_for_font_scale(tab_id);
                     }
@@ -3398,6 +3400,15 @@ impl TermWindow {
 
         for (pane_id, font_scale) in inherited {
             self.pane_state(pane_id).font_scale = Some(font_scale);
+            if let Some(pane) = Mux::get().get_pane(pane_id) {
+                if let Err(err) = pane.set_font_scale(Some(font_scale)) {
+                    log::error!(
+                        "failed to inherit pane {} font scale in mux: {:#}",
+                        pane_id,
+                        err
+                    );
+                }
+            }
         }
 
         self.shape_generation += 1;

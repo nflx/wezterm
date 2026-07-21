@@ -247,6 +247,12 @@ pub trait Pane: Downcast + Send + Sync {
     fn resize_preserving_split(&self, size: TerminalSize) -> anyhow::Result<()> {
         self.resize(size)
     }
+    fn font_scale(&self) -> Option<f64> {
+        None
+    }
+    fn set_font_scale(&self, _font_scale: Option<f64>) -> anyhow::Result<()> {
+        Ok(())
+    }
     /// Called as a hint that the pane is being resized as part of
     /// a zoom-to-fill-all-the-tab-space operation.
     fn set_zoomed(&self, _zoomed: bool) {}

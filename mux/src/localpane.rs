@@ -130,6 +130,7 @@ pub struct LocalPane {
     domain_id: DomainId,
     tmux_domain: Mutex<Option<Arc<TmuxDomainState>>>,
     proc_list: Mutex<Option<CachedProcInfo>>,
+    font_scale: Mutex<Option<f64>>,
     #[cfg(unix)]
     leader: Arc<Mutex<Option<CachedLeaderInfo>>>,
     command_description: String,
@@ -217,6 +218,15 @@ impl Pane for LocalPane {
 
     fn get_dimensions(&self) -> RenderableDimensions {
         terminal_get_dimensions(&mut self.terminal.lock())
+    }
+
+    fn font_scale(&self) -> Option<f64> {
+        *self.font_scale.lock()
+    }
+
+    fn set_font_scale(&self, font_scale: Option<f64>) -> anyhow::Result<()> {
+        *self.font_scale.lock() = font_scale;
+        Ok(())
     }
 
     fn copy_user_vars(&self) -> HashMap<String, String> {
@@ -1034,6 +1044,7 @@ impl LocalPane {
             domain_id,
             tmux_domain: Mutex::new(None),
             proc_list: Mutex::new(None),
+            font_scale: Mutex::new(None),
             #[cfg(unix)]
             leader: Arc::new(Mutex::new(None)),
             command_description,

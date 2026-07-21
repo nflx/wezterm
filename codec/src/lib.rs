@@ -441,7 +441,7 @@ macro_rules! pdu {
 /// The overall version of the codec.
 /// This must be bumped when backwards incompatible changes
 /// are made to the types and protocol.
-pub const CODEC_VERSION: usize = 47;
+pub const CODEC_VERSION: usize = 48;
 
 // Defines the Pdu enum.
 // Each struct has an explicit identifying number.
@@ -502,6 +502,7 @@ pdu! {
     GetPaneDirection: 60,
     GetPaneDirectionResponse: 61,
     AdjustPaneSize: 62,
+    SetPaneFontScale: 63,
 }
 
 impl Pdu {
@@ -515,6 +516,7 @@ impl Pdu {
             | Self::SendMouseEvent(_)
             | Self::SendPaste(_)
             | Self::Resize(_)
+            | Self::SetPaneFontScale(_)
             | Self::SetClipboard(_)
             | Self::SetPaneZoomed(_)
             | Self::SpawnV2(_) => true,
@@ -855,6 +857,12 @@ pub struct Resize {
     pub pane_id: PaneId,
     pub size: TerminalSize,
     pub preserve_split: bool,
+}
+
+#[derive(Deserialize, Serialize, PartialEq, Debug)]
+pub struct SetPaneFontScale {
+    pub pane_id: PaneId,
+    pub font_scale: Option<f64>,
 }
 
 #[derive(Deserialize, Serialize, PartialEq, Debug)]
