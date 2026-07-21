@@ -204,6 +204,8 @@ pub struct PaneState {
 
     bell_start: Option<Instant>,
     pub mouse_terminal_coords: Option<(ClickPosition, StableRowIndex)>,
+    /// Cached from mux pane state for render/layout decisions. The mux pane is
+    /// the semantic source of truth for per-pane font scale.
     font_scale: Option<f64>,
 }
 
