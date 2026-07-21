@@ -138,8 +138,6 @@ struct CliListResultItem {
     left_px: usize,
     /// Number of pixels from the top of the tab area to the top of this pane
     top_px: usize,
-    /// Per-pane font scale override, if set
-    font_scale: Option<f64>,
     tab_title: String,
     window_title: String,
     is_active: bool,
@@ -164,7 +162,6 @@ impl CliListResultItem {
             top_px,
             is_active_pane,
             is_zoomed_pane,
-            font_scale,
             tty_name,
             size:
                 TerminalSize {
@@ -203,7 +200,6 @@ impl CliListResultItem {
             top_row,
             left_px,
             top_px,
-            font_scale,
             tab_title: tab_title.to_string(),
             window_title: window_title.to_string(),
             is_active: is_active_pane,
