@@ -225,7 +225,7 @@ impl Pane for LocalPane {
     }
 
     fn set_font_scale(&self, font_scale: Option<f64>) -> anyhow::Result<()> {
-        *self.font_scale.lock() = font_scale;
+        *self.font_scale.lock() = crate::pane::normalize_font_scale(font_scale)?;
         Ok(())
     }
 

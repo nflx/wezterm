@@ -28,6 +28,27 @@ pub fn alloc_pane_id() -> PaneId {
     PANE_ID.fetch_add(1, ::std::sync::atomic::Ordering::Relaxed)
 }
 
+pub const MIN_FONT_SCALE: f64 = 0.05;
+pub const MAX_FONT_SCALE: f64 = 20.0;
+
+pub fn normalize_font_scale(font_scale: Option<f64>) -> anyhow::Result<Option<f64>> {
+    let Some(font_scale) = font_scale else {
+        return Ok(None);
+    };
+
+    if !font_scale.is_finite() {
+        anyhow::bail!("font scale must be finite, got {font_scale}");
+    }
+
+    if !(MIN_FONT_SCALE..=MAX_FONT_SCALE).contains(&font_scale) {
+        anyhow::bail!(
+            "font scale must be between {MIN_FONT_SCALE} and {MAX_FONT_SCALE}, got {font_scale}"
+        );
+    }
+
+    Ok((font_scale != 1.0).then_some(font_scale))
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PerformAssignmentResult {
     /// Continue search for handler
@@ -250,7 +271,8 @@ pub trait Pane: Downcast + Send + Sync {
     fn font_scale(&self) -> Option<f64> {
         None
     }
-    fn set_font_scale(&self, _font_scale: Option<f64>) -> anyhow::Result<()> {
+    fn set_font_scale(&self, font_scale: Option<f64>) -> anyhow::Result<()> {
+        normalize_font_scale(font_scale)?;
         Ok(())
     }
     /// Called as a hint that the pane is being resized as part of
