@@ -450,17 +450,26 @@ impl Pane for ClientPane {
     }
 
     fn set_font_scale(&self, font_scale: Option<f64>) -> anyhow::Result<()> {
+        let font_scale = mux::pane::normalize_font_scale(font_scale)?;
         *self.font_scale.lock() = font_scale;
         let client = Arc::clone(&self.client);
         let remote_pane_id = self.remote_pane_id;
         promise::spawn::spawn(async move {
-            client
+            if let Err(err) = client
                 .client
                 .set_pane_font_scale(SetPaneFontScale {
                     pane_id: remote_pane_id,
                     font_scale,
                 })
                 .await
+            {
+                log::error!(
+                    "failed to persist pane {} font scale {:?}: {:#}",
+                    remote_pane_id,
+                    font_scale,
+                    err
+                );
+            }
         })
         .detach();
         Ok(())

@@ -3,7 +3,7 @@ use crate::utilsprites::RenderMetrics;
 use ::window::{Dimensions, ResizeIncrement, Window, WindowOps, WindowState};
 use config::{ConfigHandle, DimensionContext};
 use mux::{
-    pane::{Pane, PaneId},
+    pane::{normalize_font_scale, Pane, PaneId},
     tab::{PositionedPane, Tab},
     Mux,
 };
@@ -25,10 +25,6 @@ pub enum ScaleChange {
 }
 
 impl super::TermWindow {
-    fn normalize_pane_font_scale(font_scale: Option<f64>) -> Option<f64> {
-        font_scale.filter(|scale| *scale != 1.0)
-    }
-
     pub fn resize(
         &mut self,
         dimensions: Dimensions,
@@ -490,7 +486,7 @@ impl super::TermWindow {
             .or_else(|| {
                 Mux::get()
                     .get_pane(pane_id)
-                    .and_then(|pane| Self::normalize_pane_font_scale(pane.font_scale()))
+                    .and_then(|pane| normalize_font_scale(pane.font_scale()).ok().flatten())
             })
             .unwrap_or(1.0)
     }
@@ -621,7 +617,13 @@ impl super::TermWindow {
         let mut changed = false;
         for pos in tab.iter_panes_ignoring_zoom() {
             let pane_id = pos.pane.pane_id();
-            let font_scale = Self::normalize_pane_font_scale(pos.pane.font_scale());
+            let font_scale = match normalize_font_scale(pos.pane.font_scale()) {
+                Ok(font_scale) => font_scale,
+                Err(err) => {
+                    log::error!("invalid mux font scale for pane {}: {:#}", pane_id, err);
+                    None
+                }
+            };
             let prior = self
                 .pane_state
                 .borrow()
@@ -659,7 +661,13 @@ impl super::TermWindow {
             return;
         }
 
-        let font_scale = Self::normalize_pane_font_scale(font_scale);
+        let font_scale = match normalize_font_scale(font_scale) {
+            Ok(font_scale) => font_scale,
+            Err(err) => {
+                log::warn!("refusing to set pane {} font scale: {:#}", pane_id, err);
+                return;
+            }
+        };
         self.pane_state(pane_id).font_scale = font_scale;
         if let Err(err) = pane.set_font_scale(font_scale) {
             log::error!("failed to update pane {} font scale in mux: {:#}", pane_id, err);
