@@ -1090,6 +1090,39 @@ mod test {
     }
 
     #[test]
+    fn normalize_font_scale_defaults() {
+        assert_eq!(normalize_font_scale(None).unwrap(), None);
+        assert_eq!(normalize_font_scale(Some(1.0)).unwrap(), None);
+    }
+
+    #[test]
+    fn normalize_font_scale_accepts_bounds() {
+        assert_eq!(
+            normalize_font_scale(Some(MIN_FONT_SCALE)).unwrap(),
+            Some(MIN_FONT_SCALE)
+        );
+        assert_eq!(
+            normalize_font_scale(Some(MAX_FONT_SCALE)).unwrap(),
+            Some(MAX_FONT_SCALE)
+        );
+    }
+
+    #[test]
+    fn normalize_font_scale_rejects_invalid_values() {
+        for scale in [
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            0.0,
+            -1.0,
+            MIN_FONT_SCALE / 2.0,
+            MAX_FONT_SCALE * 2.0,
+        ] {
+            assert!(normalize_font_scale(Some(scale)).is_err());
+        }
+    }
+
+    #[test]
     fn double_click() {
         let attr = Default::default();
         let logical = LogicalLine {
