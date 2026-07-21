@@ -25,6 +25,10 @@ pub enum ScaleChange {
 }
 
 impl super::TermWindow {
+    fn normalize_pane_font_scale(font_scale: Option<f64>) -> Option<f64> {
+        font_scale.filter(|scale| *scale != 1.0)
+    }
+
     pub fn resize(
         &mut self,
         dimensions: Dimensions,
@@ -483,6 +487,11 @@ impl super::TermWindow {
             .borrow()
             .get(&pane_id)
             .and_then(|state| state.font_scale)
+            .or_else(|| {
+                Mux::get()
+                    .get_pane(pane_id)
+                    .and_then(|pane| Self::normalize_pane_font_scale(pane.font_scale()))
+            })
             .unwrap_or(1.0)
     }
 
@@ -604,6 +613,36 @@ impl super::TermWindow {
         self.resize_tab_panes_for_font_scale(&tab);
     }
 
+    pub fn sync_tab_pane_font_scales_from_mux(&mut self, tab_id: mux::tab::TabId) {
+        let Some(tab) = Mux::get().get_tab(tab_id) else {
+            return;
+        };
+
+        let mut changed = false;
+        for pos in tab.iter_panes_ignoring_zoom() {
+            let pane_id = pos.pane.pane_id();
+            let font_scale = Self::normalize_pane_font_scale(pos.pane.font_scale());
+            let prior = self
+                .pane_state
+                .borrow()
+                .get(&pane_id)
+                .and_then(|state| state.font_scale);
+
+            if prior != font_scale {
+                self.pane_state(pane_id).font_scale = font_scale;
+                changed = true;
+            }
+        }
+
+        if changed {
+            self.shape_generation += 1;
+            self.shape_cache.borrow_mut().clear();
+            self.line_to_ele_shape_cache.borrow_mut().clear();
+            self.line_quad_cache.borrow_mut().clear();
+            self.quad_generation += 1;
+        }
+    }
+
     fn set_pane_font_scale(&mut self, pane: &Arc<dyn Pane>, font_scale: Option<f64>) {
         let pane_id = pane.pane_id();
         let new_scale = font_scale.unwrap_or(1.0);
@@ -620,7 +659,11 @@ impl super::TermWindow {
             return;
         }
 
-        self.pane_state(pane_id).font_scale = font_scale.filter(|scale| *scale != 1.0);
+        let font_scale = Self::normalize_pane_font_scale(font_scale);
+        self.pane_state(pane_id).font_scale = font_scale;
+        if let Err(err) = pane.set_font_scale(font_scale) {
+            log::error!("failed to update pane {} font scale in mux: {:#}", pane_id, err);
+        }
         self.resize_active_tab_panes_for_font_scale();
 
         self.shape_generation += 1;

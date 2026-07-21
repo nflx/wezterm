@@ -658,6 +658,30 @@ impl SessionHandler {
                 .detach();
             }
 
+            Pdu::SetPaneFontScale(SetPaneFontScale {
+                pane_id,
+                font_scale,
+            }) => {
+                spawn_into_main_thread(async move {
+                    catch(
+                        move || {
+                            let mux = Mux::get();
+                            let (_domain_id, _window_id, tab_id) = mux
+                                .resolve_pane_id(pane_id)
+                                .ok_or_else(|| anyhow!("no such pane {}", pane_id))?;
+                            let pane = mux
+                                .get_pane(pane_id)
+                                .ok_or_else(|| anyhow!("no such pane {}", pane_id))?;
+                            pane.set_font_scale(font_scale)?;
+                            mux.notify(MuxNotification::TabResized(tab_id));
+                            Ok(Pdu::UnitResponse(UnitResponse {}))
+                        },
+                        send_response,
+                    )
+                })
+                .detach();
+            }
+
             Pdu::SendKeyDown(SendKeyDown {
                 pane_id,
                 event,

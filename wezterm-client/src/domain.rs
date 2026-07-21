@@ -582,7 +582,12 @@ impl ClientDomain {
                     remote_panes_to_forget.remove(&entry.pane_id);
                     if let Some(pane_id) = inner.remote_to_local_pane_id(entry.pane_id) {
                         match mux.get_pane(pane_id) {
-                            Some(pane) => pane,
+                            Some(pane) => {
+                                if let Some(pane) = pane.downcast_ref::<ClientPane>() {
+                                    pane.set_local_font_scale_from_mux(entry.font_scale);
+                                }
+                                pane
+                            }
                             None => {
                                 // We likely decided that we hit EOF on the tab and
                                 // removed it from the mux.  Let's add it back, but
@@ -594,6 +599,7 @@ impl ClientDomain {
                                     entry.pane_id,
                                     entry.size,
                                     &entry.title,
+                                    entry.font_scale,
                                 ));
                                 mux.add_pane(&pane).expect("failed to add pane to mux");
                                 pane
@@ -606,6 +612,7 @@ impl ClientDomain {
                             entry.pane_id,
                             entry.size,
                             &entry.title,
+                            entry.font_scale,
                         ));
                         log::debug!(
                             "domain: {} attaching to remote pane {:?} -> local pane_id {}",
@@ -847,6 +854,7 @@ impl Domain for ClientDomain {
             result.pane_id,
             size,
             "wezterm",
+            None,
         ));
         let tab = Arc::new(Tab::new(&size));
         tab.assign_pane(&pane);
@@ -909,6 +917,7 @@ impl Domain for ClientDomain {
             result.pane_id,
             result.size,
             "wezterm",
+            None,
         ));
 
         let pane_index = match tab

@@ -49,6 +49,7 @@ pub struct ClientPane {
     config: Mutex<Option<Arc<dyn TerminalConfiguration>>>,
     unseen_output: Mutex<bool>,
     progress: Mutex<Progress>,
+    font_scale: Mutex<Option<f64>>,
 }
 
 impl ClientPane {
@@ -58,6 +59,7 @@ impl ClientPane {
         remote_pane_id: PaneId,
         size: TerminalSize,
         title: &str,
+        font_scale: Option<f64>,
     ) -> Self {
         let local_pane_id = alloc_pane_id();
         let writer = PaneWriter {
@@ -131,7 +133,12 @@ impl ClientPane {
             user_vars: Mutex::new(HashMap::new()),
             config: Mutex::new(None),
             progress: Mutex::new(Progress::default()),
+            font_scale: Mutex::new(font_scale),
         }
+    }
+
+    pub fn set_local_font_scale_from_mux(&self, font_scale: Option<f64>) {
+        *self.font_scale.lock() = font_scale;
     }
 
     pub async fn process_unilateral(&self, pdu: Pdu) -> anyhow::Result<()> {
@@ -436,6 +443,27 @@ impl Pane for ClientPane {
 
     fn resize_preserving_split(&self, size: TerminalSize) -> anyhow::Result<()> {
         self.resize_impl(size, true)
+    }
+
+    fn font_scale(&self) -> Option<f64> {
+        *self.font_scale.lock()
+    }
+
+    fn set_font_scale(&self, font_scale: Option<f64>) -> anyhow::Result<()> {
+        *self.font_scale.lock() = font_scale;
+        let client = Arc::clone(&self.client);
+        let remote_pane_id = self.remote_pane_id;
+        promise::spawn::spawn(async move {
+            client
+                .client
+                .set_pane_font_scale(SetPaneFontScale {
+                    pane_id: remote_pane_id,
+                    font_scale,
+                })
+                .await
+        })
+        .detach();
+        Ok(())
     }
 
     async fn search(
