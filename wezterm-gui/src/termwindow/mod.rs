@@ -51,6 +51,7 @@ use mux::tab::{
 use mux::window::WindowId as MuxWindowId;
 use mux::{Mux, MuxNotification};
 use mux_lua::MuxPane;
+use ordered_float::NotNan;
 use smol::channel::Sender;
 use smol::Timer;
 use std::cell::{RefCell, RefMut};
@@ -214,6 +215,12 @@ struct PendingSplitFontScale {
     tab_id: TabId,
     known_panes: HashSet<PaneId>,
     font_scale: f64,
+}
+
+#[derive(Clone)]
+struct PaneFontMetrics {
+    fonts: Rc<FontConfiguration>,
+    render_metrics: RenderMetrics,
 }
 
 /// Data used when synchronously formatting pane and window titles
@@ -419,6 +426,7 @@ pub struct TermWindow {
     tab_state: RefCell<HashMap<TabId, TabState>>,
     pane_state: RefCell<HashMap<PaneId, PaneState>>,
     pending_split_font_scales: RefCell<Vec<PendingSplitFontScale>>,
+    pane_font_metrics: RefCell<HashMap<NotNan<f64>, PaneFontMetrics>>,
     semantic_zones: HashMap<PaneId, SemanticZoneCache>,
 
     window_background: Vec<LoadedBackgroundLayer>,
@@ -738,6 +746,7 @@ impl TermWindow {
             tab_state: RefCell::new(HashMap::new()),
             pane_state: RefCell::new(HashMap::new()),
             pending_split_font_scales: RefCell::new(Vec::new()),
+            pane_font_metrics: RefCell::new(HashMap::new()),
             current_mouse_buttons: vec![],
             current_mouse_capture: None,
             last_mouse_click: None,
@@ -1776,6 +1785,7 @@ impl TermWindow {
         };
         self.config = config.clone();
         self.palette.take();
+        self.clear_pane_font_metrics_cache();
 
         let mux = Mux::get();
         let window = match mux.get_window(self.mux_window_id) {
