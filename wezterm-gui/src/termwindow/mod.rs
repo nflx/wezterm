@@ -2145,7 +2145,12 @@ impl TermWindow {
     fn update_text_cursor(&mut self, pos: &PositionedPane) {
         if let Some(win) = self.window.as_ref() {
             let cursor = pos.pane.get_cursor_position();
-            let top = pos.pane.get_dimensions().physical_top;
+            let pane_dims = pos.pane.get_dimensions();
+            let top = pane_dims.physical_top;
+            let font_scale = self.pane_font_scale(pos.pane.pane_id());
+            let pane_metrics = self
+                .pane_render_metrics(font_scale)
+                .unwrap_or(self.render_metrics);
             let tab_bar_height = if self.show_tab_bar && !self.config.tab_bar_at_bottom {
                 self.tab_bar_pixel_height().unwrap()
             } else {
@@ -2155,14 +2160,17 @@ impl TermWindow {
 
             let r = Rect::new(
                 Point::new(
-                    (((cursor.x + pos.left) as isize).max(0) * self.render_metrics.cell_size.width)
+                    (pos.pixel_left as isize)
+                        .add(
+                            (cursor.x.max(0) as isize).saturating_mul(pane_metrics.cell_size.width),
+                        )
                         .add(padding_left as isize),
-                    ((cursor.y + pos.top as isize - top).max(0)
-                        * self.render_metrics.cell_size.height)
+                    (pos.pixel_top as isize)
+                        .add(((cursor.y - top).max(0) * pane_metrics.cell_size.height) as isize)
                         .add(tab_bar_height as isize)
                         .add(padding_top as isize),
                 ),
-                self.render_metrics.cell_size,
+                pane_metrics.cell_size,
             );
             win.set_text_cursor_position(r);
         }
