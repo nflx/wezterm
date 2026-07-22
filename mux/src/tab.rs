@@ -1081,6 +1081,7 @@ impl TabInner {
         if respect_zoom_state {
             if let Some(zoomed) = self.zoomed.as_ref() {
                 let size = self.size;
+                let dims = zoomed.get_dimensions();
                 panes.push(PositionedPane {
                     index: 0,
                     is_active: true,
@@ -1089,9 +1090,9 @@ impl TabInner {
                     pixel_left: 0,
                     top: 0,
                     pixel_top: 0,
-                    width: size.cols.into(),
+                    width: dims.cols,
                     pixel_width: size.pixel_width.into(),
-                    height: size.rows.into(),
+                    height: dims.viewport_rows,
                     pixel_height: size.pixel_height.into(),
                     pane: Arc::clone(zoomed),
                 });
@@ -1133,6 +1134,7 @@ impl TabInner {
 
                 let pane = Arc::clone(cursor.leaf_mut().unwrap());
                 let dims = parent_size.unwrap_or_else(|| root_size);
+                let pane_dims = pane.get_dimensions();
 
                 panes.push(PositionedPane {
                     index,
@@ -1142,8 +1144,8 @@ impl TabInner {
                     pixel_left,
                     top,
                     pixel_top,
-                    width: dims.cols as _,
-                    height: dims.rows as _,
+                    width: pane_dims.cols,
+                    height: pane_dims.viewport_rows,
                     pixel_width: dims.pixel_width as _,
                     pixel_height: dims.pixel_height as _,
                     pane,
@@ -1576,6 +1578,7 @@ impl TabInner {
         let mut best = None;
 
         let recency = &self.recency;
+        let cell_dims = self.cell_dimensions();
 
         fn edge_intersects(
             active_start: usize,
@@ -1592,8 +1595,14 @@ impl TabInner {
         for pane in &panes {
             let score = match direction {
                 PaneDirection::Right => {
-                    if pane.left == active.left + active.width + 1
-                        && edge_intersects(active.top, active.height, pane.top, pane.height)
+                    if pane.pixel_left
+                        == active.pixel_left + active.pixel_width + cell_dims.pixel_width
+                        && edge_intersects(
+                            active.pixel_top,
+                            active.pixel_height,
+                            pane.pixel_top,
+                            pane.pixel_height,
+                        )
                     {
                         1 + recency.score(pane.index)
                     } else {
@@ -1601,8 +1610,14 @@ impl TabInner {
                     }
                 }
                 PaneDirection::Left => {
-                    if pane.left + pane.width + 1 == active.left
-                        && edge_intersects(active.top, active.height, pane.top, pane.height)
+                    if pane.pixel_left + pane.pixel_width + cell_dims.pixel_width
+                        == active.pixel_left
+                        && edge_intersects(
+                            active.pixel_top,
+                            active.pixel_height,
+                            pane.pixel_top,
+                            pane.pixel_height,
+                        )
                     {
                         1 + recency.score(pane.index)
                     } else {
@@ -1610,8 +1625,14 @@ impl TabInner {
                     }
                 }
                 PaneDirection::Up => {
-                    if pane.top + pane.height + 1 == active.top
-                        && edge_intersects(active.left, active.width, pane.left, pane.width)
+                    if pane.pixel_top + pane.pixel_height + cell_dims.pixel_height
+                        == active.pixel_top
+                        && edge_intersects(
+                            active.pixel_left,
+                            active.pixel_width,
+                            pane.pixel_left,
+                            pane.pixel_width,
+                        )
                     {
                         1 + recency.score(pane.index)
                     } else {
@@ -1619,8 +1640,14 @@ impl TabInner {
                     }
                 }
                 PaneDirection::Down => {
-                    if active.top + active.height + 1 == pane.top
-                        && edge_intersects(active.left, active.width, pane.left, pane.width)
+                    if active.pixel_top + active.pixel_height + cell_dims.pixel_height
+                        == pane.pixel_top
+                        && edge_intersects(
+                            active.pixel_left,
+                            active.pixel_width,
+                            pane.pixel_left,
+                            pane.pixel_width,
+                        )
                     {
                         1 + recency.score(pane.index)
                     } else {
@@ -2035,12 +2062,10 @@ impl TabInner {
                     split_dimension(layout_width, request),
                     (layout_height, layout_height),
                 ),
-                SplitDirection::Vertical => {
-                    (
-                        (layout_width, layout_width),
-                        split_dimension(layout_height, request),
-                    )
-                }
+                SplitDirection::Vertical => (
+                    (layout_width, layout_width),
+                    split_dimension(layout_height, request),
+                ),
             };
 
             SplitDirectionAndSize {

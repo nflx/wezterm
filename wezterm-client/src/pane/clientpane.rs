@@ -141,6 +141,11 @@ impl ClientPane {
         *self.font_scale.lock() = font_scale;
     }
 
+    pub fn set_local_font_scale(&self, font_scale: Option<f64>) -> anyhow::Result<()> {
+        *self.font_scale.lock() = mux::pane::normalize_font_scale(font_scale)?;
+        Ok(())
+    }
+
     pub async fn process_unilateral(&self, pdu: Pdu) -> anyhow::Result<()> {
         match pdu {
             Pdu::GetPaneRenderChangesResponse(mut delta) => {
@@ -258,11 +263,12 @@ impl ClientPane {
         let cols = size.cols as usize;
         let rows = size.rows as usize;
 
-        if inner.dimensions.cols != cols
+        let dimensions_changed = inner.dimensions.cols != cols
             || inner.dimensions.viewport_rows != rows
             || inner.dimensions.pixel_width != size.pixel_width
-            || inner.dimensions.pixel_height != size.pixel_height
-        {
+            || inner.dimensions.pixel_height != size.pixel_height;
+
+        if dimensions_changed {
             inner.dimensions.cols = cols;
             inner.dimensions.viewport_rows = rows;
             inner.dimensions.pixel_width = size.pixel_width;
@@ -270,7 +276,9 @@ impl ClientPane {
 
             // Invalidate any cached rows on a resize
             inner.make_all_stale();
+        }
 
+        if dimensions_changed || preserve_split {
             let client = Arc::clone(&self.client);
             let remote_pane_id = self.remote_pane_id;
             let remote_tab_id = self.remote_tab_id;
@@ -289,17 +297,22 @@ impl ClientPane {
                         })
                         .await?;
                 }
-                client
-                    .client
-                    .resize(Resize {
-                        containing_tab_id: remote_tab_id,
-                        pane_id: remote_pane_id,
-                        size,
-                        preserve_split,
-                    })
-                    .await
+                if dimensions_changed {
+                    client
+                        .client
+                        .resize(Resize {
+                            containing_tab_id: remote_tab_id,
+                            pane_id: remote_pane_id,
+                            size,
+                            preserve_split,
+                        })
+                        .await?;
+                }
+                Ok::<(), anyhow::Error>(())
             })
             .detach();
+        }
+        if dimensions_changed {
             inner.update_last_send();
         }
         Ok(())
