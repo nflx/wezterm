@@ -7,6 +7,7 @@ use mux::{
     tab::{PositionedPane, Tab},
     Mux,
 };
+use ordered_float::NotNan;
 use std::rc::Rc;
 use std::sync::Arc;
 use wezterm_font::FontConfiguration;
@@ -113,6 +114,7 @@ impl super::TermWindow {
         match RenderMetrics::new(&self.fonts) {
             Ok(metrics) => {
                 self.render_metrics = metrics;
+                self.clear_pane_font_metrics_cache();
             }
             Err(err) => {
                 log::error!(
@@ -495,8 +497,32 @@ impl super::TermWindow {
         &self,
         font_scale: f64,
     ) -> anyhow::Result<Rc<FontConfiguration>> {
+        Ok(self.cached_pane_font_metrics(font_scale)?.fonts)
+    }
+
+    pub fn pane_render_metrics(&self, font_scale: f64) -> anyhow::Result<RenderMetrics> {
+        Ok(self.cached_pane_font_metrics(font_scale)?.render_metrics)
+    }
+
+    pub fn clear_pane_font_metrics_cache(&self) {
+        self.pane_font_metrics.borrow_mut().clear();
+    }
+
+    fn pane_font_cache_key(&self, font_scale: f64) -> anyhow::Result<NotNan<f64>> {
+        NotNan::new(font_scale).map_err(|_| anyhow::anyhow!("invalid pane font scale {font_scale}"))
+    }
+
+    fn cached_pane_font_metrics(&self, font_scale: f64) -> anyhow::Result<super::PaneFontMetrics> {
         if font_scale == self.fonts.get_font_scale() {
-            return Ok(Rc::clone(&self.fonts));
+            return Ok(super::PaneFontMetrics {
+                fonts: Rc::clone(&self.fonts),
+                render_metrics: self.render_metrics,
+            });
+        }
+
+        let key = self.pane_font_cache_key(font_scale)?;
+        if let Some(metrics) = self.pane_font_metrics.borrow().get(&key) {
+            return Ok(metrics.clone());
         }
 
         let fonts = Rc::new(FontConfiguration::new(
@@ -504,14 +530,16 @@ impl super::TermWindow {
             self.dimensions.dpi,
         )?);
         fonts.change_scaling(font_scale, self.dimensions.dpi);
-        Ok(fonts)
-    }
+        let render_metrics = RenderMetrics::new(&fonts)?;
 
-    pub fn pane_render_metrics(&self, font_scale: f64) -> anyhow::Result<RenderMetrics> {
-        if font_scale == self.fonts.get_font_scale() {
-            return Ok(self.render_metrics);
-        }
-        RenderMetrics::new(&self.pane_font_configuration(font_scale)?)
+        let metrics = super::PaneFontMetrics {
+            fonts,
+            render_metrics,
+        };
+        self.pane_font_metrics
+            .borrow_mut()
+            .insert(key, metrics.clone());
+        Ok(metrics)
     }
 
     fn pane_size_for_font_scale(
