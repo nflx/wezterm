@@ -944,6 +944,8 @@ impl SessionHandler {
                 .detach();
             }
             Pdu::SetPalette(SetPalette { pane_id, palette }) => {
+                let sender = self.to_write_tx.clone();
+                let per_pane = self.per_pane(pane_id);
                 spawn_into_main_thread(async move {
                     catch(
                         move || {
@@ -974,6 +976,7 @@ impl SessionHandler {
                                 pane_id,
                                 alert: Alert::PaletteChanged,
                             });
+                            maybe_push_pane_changes(&pane, sender, per_pane)?;
 
                             Ok(Pdu::UnitResponse(UnitResponse {}))
                         },

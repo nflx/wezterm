@@ -274,7 +274,21 @@ impl ClientPane {
             let client = Arc::clone(&self.client);
             let remote_pane_id = self.remote_pane_id;
             let remote_tab_id = self.remote_tab_id;
+            let font_scale = if preserve_split {
+                self.font_scale()
+            } else {
+                None
+            };
             promise::spawn::spawn(async move {
+                if preserve_split {
+                    client
+                        .client
+                        .set_pane_font_scale(SetPaneFontScale {
+                            pane_id: remote_pane_id,
+                            font_scale,
+                        })
+                        .await?;
+                }
                 client
                     .client
                     .resize(Resize {
