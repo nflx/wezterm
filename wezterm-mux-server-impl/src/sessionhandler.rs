@@ -674,6 +674,10 @@ impl SessionHandler {
                                 .ok_or_else(|| anyhow!("no such pane {}", pane_id))?;
                             let font_scale = mux::pane::normalize_font_scale(font_scale)?;
                             pane.set_font_scale(font_scale)?;
+                            mux.notify(MuxNotification::PaneFontScaleChanged {
+                                pane_id,
+                                font_scale,
+                            });
                             mux.notify(MuxNotification::TabResized(tab_id));
                             Ok(Pdu::UnitResponse(UnitResponse {}))
                         },

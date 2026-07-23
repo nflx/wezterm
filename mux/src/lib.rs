@@ -58,6 +58,10 @@ pub enum MuxNotification {
     PaneOutput(PaneId),
     PaneAdded(PaneId),
     PaneRemoved(PaneId),
+    PaneFontScaleChanged {
+        pane_id: PaneId,
+        font_scale: Option<f64>,
+    },
     WindowCreated(WindowId),
     WindowRemoved(WindowId),
     WindowInvalidated(WindowId),

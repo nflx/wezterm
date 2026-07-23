@@ -118,6 +118,18 @@ where
                     .await?;
                 stream.flush().await.context("flushing PDU to client")?;
             }
+            Ok(Item::Notif(MuxNotification::PaneFontScaleChanged {
+                pane_id,
+                font_scale,
+            })) => {
+                Pdu::SetPaneFontScale(codec::SetPaneFontScale {
+                    pane_id,
+                    font_scale,
+                })
+                .encode_async(&mut stream, 0)
+                .await?;
+                stream.flush().await.context("flushing PDU to client")?;
+            }
             Ok(Item::Notif(MuxNotification::Alert { pane_id, alert })) => {
                 {
                     let per_pane = handler.per_pane(pane_id);
