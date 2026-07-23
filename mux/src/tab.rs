@@ -9,7 +9,6 @@ use parking_lot::Mutex;
 use rangeset::intersects_range;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::convert::TryInto;
 use std::sync::Arc;
 use url::Url;
 use wezterm_term::{StableRowIndex, TerminalSize};
@@ -374,182 +373,91 @@ fn compute_min_size(tree: &mut Tree) -> (usize, usize) {
     }
 }
 
-fn tree_size(tree: &Tree) -> Option<TerminalSize> {
-    match tree {
-        Tree::Empty => None,
-        Tree::Node { data: None, .. } => None,
-        Tree::Node {
-            data: Some(data), ..
-        } => Some(data.size()),
-        Tree::Leaf(pane) => {
-            let dims = pane.get_dimensions();
-            Some(TerminalSize {
-                cols: dims.cols,
-                rows: dims.viewport_rows,
-                pixel_height: dims.pixel_height,
-                pixel_width: dims.pixel_width,
-                dpi: dims.dpi,
-            })
-        }
+fn split_child_lengths(
+    total: usize,
+    first_current: usize,
+    second_current: usize,
+    first_min: usize,
+    second_min: usize,
+) -> (usize, usize) {
+    let available = total.saturating_sub(1);
+    let min_sum = first_min.saturating_add(second_min);
+
+    if available <= min_sum {
+        let first = first_min.min(available);
+        return (first, available.saturating_sub(first));
+    }
+
+    let current_sum = first_current.saturating_add(second_current);
+    let first = if current_sum == 0 {
+        available / 2
+    } else {
+        available
+            .saturating_mul(first_current)
+            .saturating_add(current_sum / 2)
+            / current_sum
+    };
+    let first = first
+        .max(first_min)
+        .min(available.saturating_sub(second_min));
+
+    (first, available.saturating_sub(first))
+}
+
+fn terminal_size(rows: usize, cols: usize, cell_dimensions: &TerminalSize) -> TerminalSize {
+    TerminalSize {
+        rows,
+        cols,
+        pixel_height: rows.saturating_mul(cell_dimensions.pixel_height),
+        pixel_width: cols.saturating_mul(cell_dimensions.pixel_width),
+        dpi: cell_dimensions.dpi,
     }
 }
 
 fn resize_tree_to_size(tree: &mut Tree, size: &TerminalSize, cell_dimensions: &TerminalSize) {
-    let Some(current_size) = tree_size(tree) else {
-        return;
-    };
-    adjust_x_size(
-        tree,
-        size.cols as isize - current_size.cols as isize,
-        cell_dimensions,
-    );
-    adjust_y_size(
-        tree,
-        size.rows as isize - current_size.rows as isize,
-        cell_dimensions,
-    );
-}
+    match tree {
+        Tree::Empty | Tree::Leaf(_) => {}
+        Tree::Node { data: None, .. } => {}
+        Tree::Node {
+            left,
+            right,
+            data: Some(data),
+        } => match data.direction {
+            SplitDirection::Horizontal => {
+                let (first_min, _) = compute_min_size(&mut *left);
+                let (second_min, _) = compute_min_size(&mut *right);
+                let (first_cols, second_cols) = split_child_lengths(
+                    size.cols,
+                    data.first.cols,
+                    data.second.cols,
+                    first_min,
+                    second_min,
+                );
 
-fn adjust_x_size(tree: &mut Tree, mut x_adjust: isize, cell_dimensions: &TerminalSize) {
-    let (min_x, _) = compute_min_size(tree);
-    while x_adjust != 0 {
-        match tree {
-            Tree::Empty | Tree::Leaf(_) => return,
-            Tree::Node { data: None, .. } => return,
-            Tree::Node {
-                left,
-                right,
-                data: Some(data),
-            } => {
-                data.first.dpi = cell_dimensions.dpi;
-                data.second.dpi = cell_dimensions.dpi;
-                match data.direction {
-                    SplitDirection::Vertical => {
-                        let new_cols = (data.first.cols as isize)
-                            .saturating_add(x_adjust)
-                            .max(min_x as isize);
-                        x_adjust = new_cols.saturating_sub(data.first.cols as isize);
+                data.first = terminal_size(size.rows, first_cols, cell_dimensions);
+                data.second = terminal_size(size.rows, second_cols, cell_dimensions);
 
-                        if x_adjust != 0 {
-                            adjust_x_size(&mut *left, x_adjust, cell_dimensions);
-                            data.first.cols = new_cols.try_into().unwrap();
-                            data.first.pixel_width =
-                                data.first.cols.saturating_mul(cell_dimensions.pixel_width);
-
-                            adjust_x_size(&mut *right, x_adjust, cell_dimensions);
-                            data.second.cols = data.first.cols;
-                            data.second.pixel_width = data.first.pixel_width;
-                        }
-                        return;
-                    }
-                    SplitDirection::Horizontal if x_adjust > 0 => {
-                        adjust_x_size(&mut *left, 1, cell_dimensions);
-                        data.first.cols += 1;
-                        data.first.pixel_width =
-                            data.first.cols.saturating_mul(cell_dimensions.pixel_width);
-                        x_adjust -= 1;
-
-                        if x_adjust > 0 {
-                            adjust_x_size(&mut *right, 1, cell_dimensions);
-                            data.second.cols += 1;
-                            data.second.pixel_width =
-                                data.second.cols.saturating_mul(cell_dimensions.pixel_width);
-                            x_adjust -= 1;
-                        }
-                    }
-                    SplitDirection::Horizontal => {
-                        // x_adjust is negative
-                        if data.first.cols > 1 {
-                            adjust_x_size(&mut *left, -1, cell_dimensions);
-                            data.first.cols -= 1;
-                            data.first.pixel_width =
-                                data.first.cols.saturating_mul(cell_dimensions.pixel_width);
-                            x_adjust += 1;
-                        }
-                        if x_adjust < 0 && data.second.cols > 1 {
-                            adjust_x_size(&mut *right, -1, cell_dimensions);
-                            data.second.cols -= 1;
-                            data.second.pixel_width =
-                                data.second.cols.saturating_mul(cell_dimensions.pixel_width);
-                            x_adjust += 1;
-                        }
-                    }
-                }
+                resize_tree_to_size(&mut *left, &data.first, cell_dimensions);
+                resize_tree_to_size(&mut *right, &data.second, cell_dimensions);
             }
-        }
-    }
-}
+            SplitDirection::Vertical => {
+                let (_, first_min) = compute_min_size(&mut *left);
+                let (_, second_min) = compute_min_size(&mut *right);
+                let (first_rows, second_rows) = split_child_lengths(
+                    size.rows,
+                    data.first.rows,
+                    data.second.rows,
+                    first_min,
+                    second_min,
+                );
 
-fn adjust_y_size(tree: &mut Tree, mut y_adjust: isize, cell_dimensions: &TerminalSize) {
-    let (_, min_y) = compute_min_size(tree);
-    while y_adjust != 0 {
-        match tree {
-            Tree::Empty | Tree::Leaf(_) => return,
-            Tree::Node { data: None, .. } => return,
-            Tree::Node {
-                left,
-                right,
-                data: Some(data),
-            } => {
-                data.first.dpi = cell_dimensions.dpi;
-                data.second.dpi = cell_dimensions.dpi;
-                match data.direction {
-                    SplitDirection::Horizontal => {
-                        let new_rows = (data.first.rows as isize)
-                            .saturating_add(y_adjust)
-                            .max(min_y as isize);
-                        y_adjust = new_rows.saturating_sub(data.first.rows as isize);
+                data.first = terminal_size(first_rows, size.cols, cell_dimensions);
+                data.second = terminal_size(second_rows, size.cols, cell_dimensions);
 
-                        if y_adjust != 0 {
-                            adjust_y_size(&mut *left, y_adjust, cell_dimensions);
-                            data.first.rows = new_rows.try_into().unwrap();
-                            data.first.pixel_height =
-                                data.first.rows.saturating_mul(cell_dimensions.pixel_height);
-
-                            adjust_y_size(&mut *right, y_adjust, cell_dimensions);
-                            data.second.rows = data.first.rows;
-                            data.second.pixel_height = data.first.pixel_height;
-                        }
-                        return;
-                    }
-                    SplitDirection::Vertical if y_adjust > 0 => {
-                        adjust_y_size(&mut *left, 1, cell_dimensions);
-                        data.first.rows += 1;
-                        data.first.pixel_height =
-                            data.first.rows.saturating_mul(cell_dimensions.pixel_height);
-                        y_adjust -= 1;
-                        if y_adjust > 0 {
-                            adjust_y_size(&mut *right, 1, cell_dimensions);
-                            data.second.rows += 1;
-                            data.second.pixel_height = data
-                                .second
-                                .rows
-                                .saturating_mul(cell_dimensions.pixel_height);
-                            y_adjust -= 1;
-                        }
-                    }
-                    SplitDirection::Vertical => {
-                        // y_adjust is negative
-                        if data.first.rows > 1 {
-                            adjust_y_size(&mut *left, -1, cell_dimensions);
-                            data.first.rows -= 1;
-                            data.first.pixel_height =
-                                data.first.rows.saturating_mul(cell_dimensions.pixel_height);
-                            y_adjust += 1;
-                        }
-                        if y_adjust < 0 && data.second.rows > 1 {
-                            adjust_y_size(&mut *right, -1, cell_dimensions);
-                            data.second.rows -= 1;
-                            data.second.pixel_height = data
-                                .second
-                                .rows
-                                .saturating_mul(cell_dimensions.pixel_height);
-                            y_adjust += 1;
-                        }
-                    }
-                }
+                resize_tree_to_size(&mut *left, &data.first, cell_dimensions);
+                resize_tree_to_size(&mut *right, &data.second, cell_dimensions);
             }
-        }
+        },
     }
 }
 
@@ -1274,8 +1182,6 @@ impl TabInner {
         } else {
             let dims = cell_dimensions(&size);
             let (min_x, min_y) = compute_min_size(self.pane.as_mut().unwrap());
-            let current_size = self.size;
-
             // Constrain the new size to the minimum possible dimensions
             let cols = size.cols.max(min_x);
             let rows = size.rows.max(min_y);
@@ -1288,16 +1194,7 @@ impl TabInner {
             };
 
             // Update the split nodes with adjusted sizes
-            adjust_x_size(
-                self.pane.as_mut().unwrap(),
-                cols as isize - current_size.cols as isize,
-                &dims,
-            );
-            adjust_y_size(
-                self.pane.as_mut().unwrap(),
-                rows as isize - current_size.rows as isize,
-                &dims,
-            );
+            resize_tree_to_size(self.pane.as_mut().unwrap(), &size, &dims);
 
             self.size = size;
 
@@ -2783,6 +2680,71 @@ mod test {
         assert_eq!(1, panes[1].width);
         assert_eq!(4, panes[2].left);
         assert_eq!(76, panes[2].width);
+    }
+
+    #[test]
+    fn split_resize_restores_nested_size_when_parent_grows() {
+        let size = TerminalSize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 800,
+            pixel_height: 600,
+            dpi: 96,
+        };
+
+        let tab = Tab::new(&size);
+        tab.assign_pane(&FakePane::new(1, size));
+
+        let horz_size = tab
+            .compute_split_size(
+                0,
+                SplitRequest {
+                    direction: SplitDirection::Horizontal,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        tab.split_and_insert(
+            0,
+            SplitRequest {
+                direction: SplitDirection::Horizontal,
+                ..Default::default()
+            },
+            FakePane::new(2, horz_size.second),
+        )
+        .unwrap();
+
+        let nested_size = tab
+            .compute_split_size(
+                0,
+                SplitRequest {
+                    direction: SplitDirection::Horizontal,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        tab.split_and_insert(
+            0,
+            SplitRequest {
+                direction: SplitDirection::Horizontal,
+                ..Default::default()
+            },
+            FakePane::new(3, nested_size.second),
+        )
+        .unwrap();
+
+        tab.resize_split_by(0, -1000);
+        tab.resize_split_by(0, 36);
+
+        let panes = tab.iter_panes();
+        assert_eq!(3, panes.len());
+
+        assert_eq!(0, panes[0].left);
+        assert_eq!(19, panes[0].width);
+        assert_eq!(20, panes[1].left);
+        assert_eq!(19, panes[1].width);
+        assert_eq!(40, panes[2].left);
+        assert_eq!(40, panes[2].width);
     }
 
     fn is_send_and_sync<T: Send + Sync>() -> bool {
