@@ -1336,6 +1336,8 @@ impl TabInner {
                         let width = node.width();
                         let (first_min, _) = compute_min_size(&mut *left);
                         let (second_min, _) = compute_min_size(&mut *right);
+                        let old_first = node.first;
+                        let old_second = node.second;
 
                         let mut cols = node.first.cols as isize;
                         cols = cols.saturating_add(delta).max(first_min as isize).min(
@@ -1351,6 +1353,10 @@ impl TabInner {
                         node.second.pixel_width =
                             node.second.cols.saturating_mul(cell_dimensions.pixel_width);
 
+                        if node.first == old_first && node.second == old_second {
+                            return false;
+                        }
+
                         resize_tree_to_size(&mut *left, &node.first, cell_dimensions);
                         resize_tree_to_size(&mut *right, &node.second, cell_dimensions);
                     }
@@ -1358,6 +1364,8 @@ impl TabInner {
                         let height = node.height();
                         let (_, first_min) = compute_min_size(&mut *left);
                         let (_, second_min) = compute_min_size(&mut *right);
+                        let old_first = node.first;
+                        let old_second = node.second;
 
                         let mut rows = node.first.rows as isize;
                         rows = rows.saturating_add(delta).max(first_min as isize).min(
@@ -1374,6 +1382,10 @@ impl TabInner {
                             .second
                             .rows
                             .saturating_mul(cell_dimensions.pixel_height);
+
+                        if node.first == old_first && node.second == old_second {
+                            return false;
+                        }
 
                         resize_tree_to_size(&mut *left, &node.first, cell_dimensions);
                         resize_tree_to_size(&mut *right, &node.second, cell_dimensions);
