@@ -374,6 +374,42 @@ fn compute_min_size(tree: &mut Tree) -> (usize, usize) {
     }
 }
 
+fn tree_size(tree: &Tree) -> Option<TerminalSize> {
+    match tree {
+        Tree::Empty => None,
+        Tree::Node { data: None, .. } => None,
+        Tree::Node {
+            data: Some(data), ..
+        } => Some(data.size()),
+        Tree::Leaf(pane) => {
+            let dims = pane.get_dimensions();
+            Some(TerminalSize {
+                cols: dims.cols,
+                rows: dims.viewport_rows,
+                pixel_height: dims.pixel_height,
+                pixel_width: dims.pixel_width,
+                dpi: dims.dpi,
+            })
+        }
+    }
+}
+
+fn resize_tree_to_size(tree: &mut Tree, size: &TerminalSize, cell_dimensions: &TerminalSize) {
+    let Some(current_size) = tree_size(tree) else {
+        return;
+    };
+    adjust_x_size(
+        tree,
+        size.cols as isize - current_size.cols as isize,
+        cell_dimensions,
+    );
+    adjust_y_size(
+        tree,
+        size.rows as isize - current_size.rows as isize,
+        cell_dimensions,
+    );
+}
+
 fn adjust_x_size(tree: &mut Tree, mut x_adjust: isize, cell_dimensions: &TerminalSize) {
     let (min_x, _) = compute_min_size(tree);
     while x_adjust != 0 {
@@ -1353,142 +1389,107 @@ impl TabInner {
             return;
         }
 
-        let mut cursor = self.pane.take().unwrap().cursor();
-        let mut index = 0;
-
-        // Position cursor on the specified split
-        loop {
-            if !cursor.is_leaf() {
-                if index == split_index {
-                    // Found it
-                    break;
-                }
-                index += 1;
-            }
-            match cursor.preorder_next() {
-                Ok(c) => cursor = c,
-                Err(c) => {
-                    // Didn't find it
-                    self.pane.replace(c.tree());
-                    return;
-                }
-            }
-        }
-
-        // Now cursor is looking at the split
-        self.adjust_node_at_cursor(&mut cursor, delta);
-        self.cascade_size_from_cursor(cursor);
-        Mux::try_get().map(|mux| mux.notify(MuxNotification::TabResized(self.id)));
-    }
-
-    fn adjust_node_at_cursor(&mut self, cursor: &mut Cursor, delta: isize) {
         let cell_dimensions = self.cell_dimensions();
-        if let Ok(Some(node)) = cursor.node_mut() {
-            match node.direction {
-                SplitDirection::Horizontal => {
-                    let width = node.width();
-
-                    let mut cols = node.first.cols as isize;
-                    cols = cols
-                        .saturating_add(delta)
-                        .max(1)
-                        .min((width as isize).saturating_sub(2));
-                    node.first.cols = cols as usize;
-                    node.first.pixel_width =
-                        node.first.cols.saturating_mul(cell_dimensions.pixel_width);
-
-                    node.second.cols = width.saturating_sub(node.first.cols.saturating_add(1));
-                    node.second.pixel_width =
-                        node.second.cols.saturating_mul(cell_dimensions.pixel_width);
-                }
-                SplitDirection::Vertical => {
-                    let height = node.height();
-
-                    let mut rows = node.first.rows as isize;
-                    rows = rows
-                        .saturating_add(delta)
-                        .max(1)
-                        .min((height as isize).saturating_sub(2));
-                    node.first.rows = rows as usize;
-                    node.first.pixel_height =
-                        node.first.rows.saturating_mul(cell_dimensions.pixel_height);
-
-                    node.second.rows = height.saturating_sub(node.first.rows.saturating_add(1));
-                    node.second.pixel_height = node
-                        .second
-                        .rows
-                        .saturating_mul(cell_dimensions.pixel_height);
-                }
-            }
-        }
-    }
-
-    fn cascade_size_from_cursor(&mut self, mut cursor: Cursor) {
-        // Now we need to cascade this down to children
-        match cursor.preorder_next() {
-            Ok(c) => cursor = c,
-            Err(c) => {
-                self.pane.replace(c.tree());
+        let mut index = 0;
+        if let Some(root) = self.pane.as_mut() {
+            if !Self::adjust_split_by_index(root, split_index, &mut index, delta, &cell_dimensions)
+            {
                 return;
             }
+            apply_sizes_from_splits(root, &self.size);
+            Mux::try_get().map(|mux| mux.notify(MuxNotification::TabResized(self.id)));
         }
-        let root_size = self.size;
+    }
 
-        loop {
-            // Figure out the available size by looking at our immediate parent node.
-            // If we are the root, look at the provided new size
-            let pane_size = if let Some((branch, Some(parent))) = cursor.path_to_root().next() {
-                if branch == PathBranch::IsRight {
-                    parent.second
-                } else {
-                    parent.first
+    fn adjust_split_by_index(
+        tree: &mut Tree,
+        split_index: usize,
+        index: &mut usize,
+        delta: isize,
+        cell_dimensions: &TerminalSize,
+    ) -> bool {
+        match tree {
+            Tree::Empty | Tree::Leaf(_) => false,
+            Tree::Node { data: None, .. } => false,
+            Tree::Node {
+                left,
+                right,
+                data: Some(node),
+            } => {
+                let is_target = *index == split_index;
+                *index += 1;
+                if !is_target {
+                    return Self::adjust_split_by_index(
+                        &mut *left,
+                        split_index,
+                        index,
+                        delta,
+                        cell_dimensions,
+                    ) || Self::adjust_split_by_index(
+                        &mut *right,
+                        split_index,
+                        index,
+                        delta,
+                        cell_dimensions,
+                    );
                 }
-            } else {
-                root_size
-            };
 
-            if cursor.is_leaf() {
-                // Apply our size to the tty
-                cursor.leaf_mut().map(|pane| pane.resize(pane_size));
-            } else {
-                self.apply_pane_size(pane_size, &mut cursor);
-            }
-            match cursor.preorder_next() {
-                Ok(c) => cursor = c,
-                Err(c) => {
-                    self.pane.replace(c.tree());
-                    break;
+                match node.direction {
+                    SplitDirection::Horizontal => {
+                        let width = node.width();
+                        let (first_min, _) = compute_min_size(&mut *left);
+                        let (second_min, _) = compute_min_size(&mut *right);
+
+                        let mut cols = node.first.cols as isize;
+                        cols = cols.saturating_add(delta).max(first_min as isize).min(
+                            (width as isize)
+                                .saturating_sub(second_min as isize)
+                                .saturating_sub(1),
+                        );
+                        node.first.cols = cols as usize;
+                        node.first.pixel_width =
+                            node.first.cols.saturating_mul(cell_dimensions.pixel_width);
+
+                        node.second.cols = width.saturating_sub(node.first.cols.saturating_add(1));
+                        node.second.pixel_width =
+                            node.second.cols.saturating_mul(cell_dimensions.pixel_width);
+
+                        resize_tree_to_size(&mut *left, &node.first, cell_dimensions);
+                        resize_tree_to_size(&mut *right, &node.second, cell_dimensions);
+                    }
+                    SplitDirection::Vertical => {
+                        let height = node.height();
+                        let (_, first_min) = compute_min_size(&mut *left);
+                        let (_, second_min) = compute_min_size(&mut *right);
+
+                        let mut rows = node.first.rows as isize;
+                        rows = rows.saturating_add(delta).max(first_min as isize).min(
+                            (height as isize)
+                                .saturating_sub(second_min as isize)
+                                .saturating_sub(1),
+                        );
+                        node.first.rows = rows as usize;
+                        node.first.pixel_height =
+                            node.first.rows.saturating_mul(cell_dimensions.pixel_height);
+
+                        node.second.rows = height.saturating_sub(node.first.rows.saturating_add(1));
+                        node.second.pixel_height = node
+                            .second
+                            .rows
+                            .saturating_mul(cell_dimensions.pixel_height);
+
+                        resize_tree_to_size(&mut *left, &node.first, cell_dimensions);
+                        resize_tree_to_size(&mut *right, &node.second, cell_dimensions);
+                    }
                 }
+                true
             }
         }
-        Mux::try_get().map(|mux| mux.notify(MuxNotification::TabResized(self.id)));
     }
 
     fn adjust_pane_size(&mut self, direction: PaneDirection, amount: usize) {
         if self.zoomed.is_some() {
             return;
-        }
-        let active_index = self.active;
-        let mut cursor = self.pane.take().unwrap().cursor();
-        let mut index = 0;
-
-        // Position cursor on the active leaf
-        loop {
-            if cursor.is_leaf() {
-                if index == active_index {
-                    // Found it
-                    break;
-                }
-                index += 1;
-            }
-            match cursor.preorder_next() {
-                Ok(c) => cursor = c,
-                Err(c) => {
-                    // Didn't find it
-                    self.pane.replace(c.tree());
-                    return;
-                }
-            }
         }
 
         // We are on the active leaf.
@@ -1504,26 +1505,80 @@ impl TabInner {
             PaneDirection::Up | PaneDirection::Left => -(amount as isize),
             PaneDirection::Next | PaneDirection::Prev => unreachable!(),
         };
-        loop {
-            match cursor.go_up() {
-                Ok(mut c) => {
-                    if let Ok(Some(node)) = c.node_mut() {
-                        if node.direction == split_direction {
-                            self.adjust_node_at_cursor(&mut c, delta);
-                            self.cascade_size_from_cursor(c);
-                            return;
-                        }
-                    }
 
-                    cursor = c;
+        if let Some(split_index) = self.resize_split_index_for_active_pane(split_direction) {
+            self.resize_split_by(split_index, delta);
+        }
+    }
+
+    fn resize_split_index_for_active_pane(
+        &mut self,
+        split_direction: SplitDirection,
+    ) -> Option<usize> {
+        fn walk(
+            tree: &Tree,
+            active_index: usize,
+            split_direction: SplitDirection,
+            leaf_index: &mut usize,
+            split_index: &mut usize,
+        ) -> (bool, Option<usize>) {
+            match tree {
+                Tree::Empty => (false, None),
+                Tree::Leaf(_) => {
+                    let contains_active = *leaf_index == active_index;
+                    *leaf_index += 1;
+                    (contains_active, None)
                 }
+                Tree::Node { left, right, data } => {
+                    let current_split_index = *split_index;
+                    *split_index += 1;
 
-                Err(c) => {
-                    self.pane.replace(c.tree());
-                    return;
+                    let (left_contains, left_match) = walk(
+                        &*left,
+                        active_index,
+                        split_direction,
+                        leaf_index,
+                        split_index,
+                    );
+                    let (right_contains, right_match) = walk(
+                        &*right,
+                        active_index,
+                        split_direction,
+                        leaf_index,
+                        split_index,
+                    );
+
+                    let contains_active = left_contains || right_contains;
+                    if !contains_active {
+                        return (false, None);
+                    }
+                    if let Some(split_index) = left_match.or(right_match) {
+                        return (true, Some(split_index));
+                    }
+                    if data
+                        .as_ref()
+                        .map(|data| data.direction == split_direction)
+                        .unwrap_or(false)
+                    {
+                        return (true, Some(current_split_index));
+                    }
+                    (true, None)
                 }
             }
         }
+
+        let mut leaf_index = 0;
+        let mut split_index = 0;
+        self.pane.as_ref().and_then(|pane| {
+            walk(
+                pane,
+                self.active,
+                split_direction,
+                &mut leaf_index,
+                &mut split_index,
+            )
+            .1
+        })
     }
 
     fn activate_pane_direction(&mut self, direction: PaneDirection) {
@@ -2408,7 +2463,15 @@ mod test {
         }
 
         fn get_dimensions(&self) -> RenderableDimensions {
-            unimplemented!();
+            let size = *self.size.lock();
+            RenderableDimensions {
+                cols: size.cols,
+                viewport_rows: size.rows,
+                dpi: size.dpi,
+                pixel_width: size.pixel_width,
+                pixel_height: size.pixel_height,
+                ..Default::default()
+            }
         }
 
         fn get_title(&self) -> String {
@@ -2420,7 +2483,7 @@ mod test {
         fn reader(&self) -> anyhow::Result<Option<Box<dyn std::io::Read + Send>>> {
             Ok(None)
         }
-        fn writer(&self) -> MappedMutexGuard<dyn std::io::Write> {
+        fn writer(&self) -> MappedMutexGuard<'_, dyn std::io::Write> {
             unimplemented!()
         }
         fn resize(&self, size: TerminalSize) -> anyhow::Result<()> {
@@ -2656,6 +2719,70 @@ mod test {
         assert_eq!(24, panes[2].height);
         assert_eq!(400, panes[2].pixel_width);
         assert_eq!(600, panes[2].pixel_height);
+    }
+
+    #[test]
+    fn split_resize_preserves_nested_minimum_size() {
+        let size = TerminalSize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 800,
+            pixel_height: 600,
+            dpi: 96,
+        };
+
+        let tab = Tab::new(&size);
+        tab.assign_pane(&FakePane::new(1, size));
+
+        let horz_size = tab
+            .compute_split_size(
+                0,
+                SplitRequest {
+                    direction: SplitDirection::Horizontal,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        tab.split_and_insert(
+            0,
+            SplitRequest {
+                direction: SplitDirection::Horizontal,
+                ..Default::default()
+            },
+            FakePane::new(2, horz_size.second),
+        )
+        .unwrap();
+
+        let nested_size = tab
+            .compute_split_size(
+                0,
+                SplitRequest {
+                    direction: SplitDirection::Horizontal,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        tab.split_and_insert(
+            0,
+            SplitRequest {
+                direction: SplitDirection::Horizontal,
+                ..Default::default()
+            },
+            FakePane::new(3, nested_size.second),
+        )
+        .unwrap();
+
+        tab.resize_split_by(0, -1000);
+
+        let panes = tab.iter_panes();
+        assert_eq!(3, panes.len());
+
+        assert_eq!(0, panes[0].left);
+        assert_eq!(1, panes[0].width);
+        assert_eq!(2, panes[1].left);
+        assert_eq!(1, panes[1].width);
+        assert_eq!(4, panes[2].left);
+        assert_eq!(76, panes[2].width);
     }
 
     fn is_send_and_sync<T: Send + Sync>() -> bool {
