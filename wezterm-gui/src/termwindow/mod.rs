@@ -1326,6 +1326,21 @@ impl TermWindow {
                     // Also handled by clientpane
                     self.update_title_post_status();
                 }
+                MuxNotification::PaneFontScaleChanged { pane_id, .. } => {
+                    if let Some((_domain_id, _window_id, tab_id)) =
+                        Mux::get().resolve_pane_id(pane_id)
+                    {
+                        self.sync_tab_pane_font_scales_from_mux(tab_id);
+                        self.resize_tab_id_panes_for_font_scale(tab_id);
+                    }
+                    self.shape_generation += 1;
+                    self.shape_cache.borrow_mut().clear();
+                    self.line_to_ele_shape_cache.borrow_mut().clear();
+                    self.line_quad_cache.borrow_mut().clear();
+                    self.quad_generation += 1;
+                    self.update_title_post_status();
+                    window.invalidate();
+                }
                 MuxNotification::TabResized(tab_id) => {
                     // Also handled by wezterm-client
                     self.sync_tab_pane_font_scales_from_mux(tab_id);
@@ -1512,6 +1527,7 @@ impl TermWindow {
             }
             | MuxNotification::PaneFocused(pane_id)
             | MuxNotification::PaneRemoved(pane_id)
+            | MuxNotification::PaneFontScaleChanged { pane_id, .. }
             | MuxNotification::PaneOutput(pane_id) => {
                 // Check window validity and propagate to the window event handler
                 // that will do the full pane visibility check.

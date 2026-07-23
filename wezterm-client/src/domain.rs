@@ -501,6 +501,37 @@ impl ClientDomain {
         }
     }
 
+    pub fn process_remote_pane_font_scale_change(
+        &self,
+        remote_pane_id: PaneId,
+        font_scale: Option<f64>,
+    ) {
+        let Some(inner) = self.inner() else {
+            return;
+        };
+        let Some(local_pane_id) = inner.remote_to_local_pane_id(remote_pane_id) else {
+            return;
+        };
+
+        let mux = Mux::get();
+        let Some(pane) = mux.get_pane(local_pane_id) else {
+            return;
+        };
+        let Some(pane) = pane.downcast_ref::<ClientPane>() else {
+            return;
+        };
+
+        if pane.font_scale() == font_scale {
+            return;
+        }
+
+        pane.set_local_font_scale_from_mux(font_scale);
+        mux.notify(MuxNotification::PaneFontScaleChanged {
+            pane_id: local_pane_id,
+            font_scale,
+        });
+    }
+
     fn process_pane_list(
         inner: Arc<ClientInner>,
         panes: ListPanesResponse,
@@ -577,6 +608,7 @@ impl ClientDomain {
 
                 log::debug!("domain: {} tree: {:#?}", inner.local_domain_id, tabroot);
                 let mut workspace = None;
+                let mut font_scale_changed = false;
                 tab.sync_with_pane_tree(root_size, tabroot, |entry| {
                     workspace.replace(entry.workspace.clone());
                     remote_panes_to_forget.remove(&entry.pane_id);
@@ -584,6 +616,7 @@ impl ClientDomain {
                         match mux.get_pane(pane_id) {
                             Some(pane) => {
                                 if let Some(pane) = pane.downcast_ref::<ClientPane>() {
+                                    font_scale_changed |= pane.font_scale() != entry.font_scale;
                                     pane.set_local_font_scale_from_mux(entry.font_scale);
                                 }
                                 pane
@@ -624,6 +657,9 @@ impl ClientDomain {
                         pane
                     }
                 });
+                if font_scale_changed {
+                    mux.notify(MuxNotification::TabResized(tab.tab_id()));
+                }
 
                 if let Some(local_window_id) = inner.remote_to_local_window(remote_window_id) {
                     let mut window = mux

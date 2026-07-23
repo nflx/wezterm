@@ -317,6 +317,31 @@ fn process_unilateral(
 
             return Ok(());
         }
+        Pdu::SetPaneFontScale(SetPaneFontScale {
+            pane_id,
+            font_scale,
+        }) => {
+            let pane_id = *pane_id;
+            let font_scale = *font_scale;
+            promise::spawn::spawn_into_main_thread(async move {
+                let mux = Mux::try_get().ok_or_else(|| anyhow!("no more mux"))?;
+                let client_domain = mux
+                    .get_domain(local_domain_id)
+                    .ok_or_else(|| anyhow!("no such domain {}", local_domain_id))?;
+                let client_domain =
+                    client_domain
+                        .downcast_ref::<ClientDomain>()
+                        .ok_or_else(|| {
+                            anyhow!("domain {} is not a ClientDomain instance", local_domain_id)
+                        })?;
+
+                client_domain.process_remote_pane_font_scale_change(pane_id, font_scale);
+                anyhow::Result::<()>::Ok(())
+            })
+            .detach();
+
+            return Ok(());
+        }
         _ => {}
     }
 

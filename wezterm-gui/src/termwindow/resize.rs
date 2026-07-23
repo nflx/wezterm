@@ -697,15 +697,7 @@ impl super::TermWindow {
             }
         };
         self.pane_state(pane_id).font_scale = font_scale;
-        if let Some(client_pane) = pane.downcast_ref::<wezterm_client::pane::ClientPane>() {
-            if let Err(err) = client_pane.set_local_font_scale(font_scale) {
-                log::error!(
-                    "failed to update pane {} local font scale: {:#}",
-                    pane_id,
-                    err
-                );
-            }
-        } else if let Err(err) = pane.set_font_scale(font_scale) {
+        if let Err(err) = pane.set_font_scale(font_scale) {
             log::error!(
                 "failed to update pane {} font scale in mux: {:#}",
                 pane_id,
