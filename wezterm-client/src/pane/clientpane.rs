@@ -50,6 +50,19 @@ pub struct ClientPane {
     unseen_output: Mutex<bool>,
     progress: Mutex<Progress>,
     font_scale: Mutex<Option<f64>>,
+    resize_queue: Arc<Mutex<ResizeQueue>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PendingResize {
+    size: TerminalSize,
+    preserve_split: bool,
+}
+
+#[derive(Debug, Default)]
+struct ResizeQueue {
+    pending: Option<PendingResize>,
+    worker_running: bool,
 }
 
 impl ClientPane {
@@ -134,6 +147,7 @@ impl ClientPane {
             config: Mutex::new(None),
             progress: Mutex::new(Progress::default()),
             font_scale: Mutex::new(font_scale),
+            resize_queue: Arc::new(Mutex::new(ResizeQueue::default())),
         }
     }
 
@@ -256,6 +270,74 @@ impl ClientPane {
         self.resize_impl(size, true)
     }
 
+    fn enqueue_resize(&self, size: TerminalSize, preserve_split: bool) {
+        let pending = PendingResize {
+            size,
+            preserve_split,
+        };
+
+        {
+            let mut queue = self.resize_queue.lock();
+            queue.pending = Some(pending);
+            if queue.worker_running {
+                return;
+            }
+            queue.worker_running = true;
+        }
+
+        let queue = Arc::clone(&self.resize_queue);
+        let client = Arc::clone(&self.client);
+        let remote_pane_id = self.remote_pane_id;
+        let remote_tab_id = self.remote_tab_id;
+
+        promise::spawn::spawn(async move {
+            loop {
+                let pending = {
+                    let mut queue = queue.lock();
+                    queue.pending.take()
+                };
+
+                if let Some(pending) = pending {
+                    if let Err(err) = client
+                        .client
+                        .resize(Resize {
+                            containing_tab_id: remote_tab_id,
+                            pane_id: remote_pane_id,
+                            size: pending.size,
+                            preserve_split: pending.preserve_split,
+                        })
+                        .await
+                    {
+                        log::error!(
+                            "failed to resize remote pane {} to {:?}: {:#}",
+                            remote_pane_id,
+                            pending.size,
+                            err
+                        );
+                    }
+                    continue;
+                }
+
+                let should_stop = {
+                    let mut queue = queue.lock();
+                    if queue.pending.is_none() {
+                        queue.worker_running = false;
+                        true
+                    } else {
+                        false
+                    }
+                };
+
+                if should_stop {
+                    break;
+                }
+            }
+
+            Ok::<(), anyhow::Error>(())
+        })
+        .detach();
+    }
+
     fn resize_impl(&self, size: TerminalSize, preserve_split: bool) -> anyhow::Result<()> {
         let render = self.renderable.lock();
         let mut inner = render.inner.borrow_mut();
@@ -278,25 +360,8 @@ impl ClientPane {
             inner.make_all_stale();
         }
 
-        if dimensions_changed || preserve_split {
-            let client = Arc::clone(&self.client);
-            let remote_pane_id = self.remote_pane_id;
-            let remote_tab_id = self.remote_tab_id;
-            promise::spawn::spawn(async move {
-                if dimensions_changed {
-                    client
-                        .client
-                        .resize(Resize {
-                            containing_tab_id: remote_tab_id,
-                            pane_id: remote_pane_id,
-                            size,
-                            preserve_split,
-                        })
-                        .await?;
-                }
-                Ok::<(), anyhow::Error>(())
-            })
-            .detach();
+        if dimensions_changed {
+            self.enqueue_resize(size, preserve_split);
         }
         if dimensions_changed {
             inner.update_last_send();
