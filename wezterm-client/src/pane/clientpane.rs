@@ -21,6 +21,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::ops::Range;
 use std::sync::Arc;
+use std::time::Duration;
 use termwiz::input::KeyEvent;
 use termwiz::surface::SequenceNo;
 use url::Url;
@@ -297,7 +298,15 @@ impl ClientPane {
                     queue.pending.take()
                 };
 
-                if let Some(pending) = pending {
+                if let Some(mut pending) = pending {
+                    smol::Timer::after(Duration::from_millis(20)).await;
+                    if let Some(latest) = {
+                        let mut queue = queue.lock();
+                        queue.pending.take()
+                    } {
+                        pending = latest;
+                    }
+
                     if let Err(err) = client
                         .client
                         .resize(Resize {
