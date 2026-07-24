@@ -1243,11 +1243,15 @@ impl TermWindow {
                     alert: Alert::PaletteChanged,
                     pane_id,
                 } => {
+                    self.palette.take();
+                    self.invalidate_fancy_tab_bar();
+                    self.invalidate_modal();
                     // Shape cache includes color information, so
                     // ensure that we invalidate that as part of
                     // this overall invalidation for the palette
                     self.dispatch_notif(TermWindowNotif::InvalidateShapeCache, window)?;
                     self.mux_pane_output_event(pane_id);
+                    window.invalidate();
                 }
                 MuxNotification::Alert {
                     alert: Alert::Bell,

@@ -109,6 +109,10 @@ pub struct SplitDirectionAndSize {
     pub direction: SplitDirection,
     pub first: TerminalSize,
     pub second: TerminalSize,
+    #[serde(default)]
+    preferred_first: usize,
+    #[serde(default)]
+    preferred_second: usize,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
@@ -147,16 +151,51 @@ impl Default for SplitRequest {
 }
 
 impl SplitDirectionAndSize {
+    fn first_axis_size(&self) -> usize {
+        match self.direction {
+            SplitDirection::Horizontal => self.first.cols,
+            SplitDirection::Vertical => self.first.rows,
+        }
+    }
+
+    fn second_axis_size(&self) -> usize {
+        match self.direction {
+            SplitDirection::Horizontal => self.second.cols,
+            SplitDirection::Vertical => self.second.rows,
+        }
+    }
+
+    fn preferred_first_axis_size(&self) -> usize {
+        if self.preferred_first == 0 {
+            self.first_axis_size()
+        } else {
+            self.preferred_first
+        }
+    }
+
+    fn preferred_second_axis_size(&self) -> usize {
+        if self.preferred_second == 0 {
+            self.second_axis_size()
+        } else {
+            self.preferred_second
+        }
+    }
+
+    fn set_preferred_from_current(&mut self) {
+        self.preferred_first = self.first_axis_size();
+        self.preferred_second = self.second_axis_size();
+    }
+
     fn top_of_second(&self) -> usize {
         match self.direction {
             SplitDirection::Horizontal => 0,
-            SplitDirection::Vertical => self.first.rows as usize + 1,
+            SplitDirection::Vertical => self.first.rows.saturating_add(1),
         }
     }
 
     fn left_of_second(&self) -> usize {
         match self.direction {
-            SplitDirection::Horizontal => self.first.cols as usize + 1,
+            SplitDirection::Horizontal => self.first.cols.saturating_add(1),
             SplitDirection::Vertical => 0,
         }
     }
@@ -164,20 +203,29 @@ impl SplitDirectionAndSize {
     fn pixel_top_of_second(&self, cell_dimensions: TerminalSize) -> usize {
         match self.direction {
             SplitDirection::Horizontal => 0,
-            SplitDirection::Vertical => self.first.pixel_height + cell_dimensions.pixel_height,
+            SplitDirection::Vertical => self
+                .first
+                .pixel_height
+                .saturating_add(cell_dimensions.pixel_height),
         }
     }
 
     fn pixel_left_of_second(&self, cell_dimensions: TerminalSize) -> usize {
         match self.direction {
-            SplitDirection::Horizontal => self.first.pixel_width + cell_dimensions.pixel_width,
+            SplitDirection::Horizontal => self
+                .first
+                .pixel_width
+                .saturating_add(cell_dimensions.pixel_width),
             SplitDirection::Vertical => 0,
         }
     }
 
     pub fn width(&self) -> usize {
         if self.direction == SplitDirection::Horizontal {
-            self.first.cols + self.second.cols + 1
+            self.first
+                .cols
+                .saturating_add(self.second.cols)
+                .saturating_add(1)
         } else {
             self.first.cols
         }
@@ -185,7 +233,10 @@ impl SplitDirectionAndSize {
 
     pub fn height(&self) -> usize {
         if self.direction == SplitDirection::Vertical {
-            self.first.rows + self.second.rows + 1
+            self.first
+                .rows
+                .saturating_add(self.second.rows)
+                .saturating_add(1)
         } else {
             self.first.rows
         }
@@ -230,11 +281,20 @@ pub struct PositionedSplit {
     /// left corner of this split, in cells.
     pub left: usize,
     /// The offset from the top left corner of the containing tab to the top
+    /// left corner of this split, in pixels.
+    pub pixel_left: usize,
+    /// The offset from the top left corner of the containing tab to the top
     /// left corner of this split, in cells.
     pub top: usize,
+    /// The offset from the top left corner of the containing tab to the top
+    /// left corner of this split, in pixels.
+    pub pixel_top: usize,
     /// For Horizontal splits, how tall the split should be, for Vertical
     /// splits how wide it should be
     pub size: usize,
+    /// For Horizontal splits, how tall the split should be, for Vertical
+    /// splits how wide it should be, in pixels.
+    pub pixel_size: usize,
 }
 
 fn is_pane(pane: &Arc<dyn Pane>, other: &Option<&Arc<dyn Pane>>) -> bool {
@@ -397,7 +457,15 @@ fn split_child_lengths(
     let min_sum = first_min.saturating_add(second_min);
 
     if available <= min_sum {
-        let first = first_min.min(available);
+        let first = if min_sum == 0 {
+            available / 2
+        } else {
+            available
+                .saturating_mul(first_min)
+                .saturating_add(min_sum / 2)
+                / min_sum
+        }
+        .min(available);
         return (first, available.saturating_sub(first));
     }
 
@@ -447,6 +515,85 @@ fn split_child_pixels(
     (first_pixels, available_pixels.saturating_sub(first_pixels))
 }
 
+fn split_dimensions(dim: usize, request: SplitRequest) -> Option<(usize, usize)> {
+    let available = dim.checked_sub(1)?;
+    if available < 2 {
+        return None;
+    }
+
+    let target_size = match request.size {
+        SplitSize::Cells(n) => n,
+        SplitSize::Percent(n) => dim.saturating_mul(n as usize) / 100,
+    }
+    .max(1)
+    .min(available.saturating_sub(1));
+
+    let remain = available.saturating_sub(target_size);
+
+    Some(if request.target_is_second {
+        (remain, target_size)
+    } else {
+        (target_size, remain)
+    })
+}
+
+fn split_size_from_parent(
+    parent: TerminalSize,
+    direction: SplitDirection,
+    first_rows: usize,
+    second_rows: usize,
+    first_cols: usize,
+    second_cols: usize,
+    cell_dimensions: &TerminalSize,
+) -> SplitDirectionAndSize {
+    let (first_pixel_height, second_pixel_height) = if direction == SplitDirection::Vertical {
+        split_child_pixels(
+            parent.pixel_height,
+            first_rows,
+            cell_dimensions.pixel_height,
+            cell_dimensions.pixel_height,
+        )
+    } else {
+        (parent.pixel_height, parent.pixel_height)
+    };
+    let (first_pixel_width, second_pixel_width) = if direction == SplitDirection::Horizontal {
+        split_child_pixels(
+            parent.pixel_width,
+            first_cols,
+            cell_dimensions.pixel_width,
+            cell_dimensions.pixel_width,
+        )
+    } else {
+        (parent.pixel_width, parent.pixel_width)
+    };
+
+    SplitDirectionAndSize {
+        direction,
+        first: TerminalSize {
+            rows: first_rows,
+            cols: first_cols,
+            pixel_height: first_pixel_height,
+            pixel_width: first_pixel_width,
+            dpi: cell_dimensions.dpi,
+        },
+        second: TerminalSize {
+            rows: second_rows,
+            cols: second_cols,
+            pixel_height: second_pixel_height,
+            pixel_width: second_pixel_width,
+            dpi: cell_dimensions.dpi,
+        },
+        preferred_first: match direction {
+            SplitDirection::Horizontal => first_cols,
+            SplitDirection::Vertical => first_rows,
+        },
+        preferred_second: match direction {
+            SplitDirection::Horizontal => second_cols,
+            SplitDirection::Vertical => second_rows,
+        },
+    }
+}
+
 fn resize_tree_to_size(tree: &mut Tree, size: &TerminalSize, cell_dimensions: &TerminalSize) {
     match tree {
         Tree::Empty | Tree::Leaf(_) => {}
@@ -461,8 +608,8 @@ fn resize_tree_to_size(tree: &mut Tree, size: &TerminalSize, cell_dimensions: &T
                 let (second_min, _) = compute_min_size(&mut *right);
                 let (first_cols, second_cols) = split_child_lengths(
                     size.cols,
-                    data.first.cols,
-                    data.second.cols,
+                    data.preferred_first_axis_size(),
+                    data.preferred_second_axis_size(),
                     first_min,
                     second_min,
                 );
@@ -496,8 +643,8 @@ fn resize_tree_to_size(tree: &mut Tree, size: &TerminalSize, cell_dimensions: &T
                 let (_, second_min) = compute_min_size(&mut *right);
                 let (first_rows, second_rows) = split_child_lengths(
                     size.rows,
-                    data.first.rows,
-                    data.second.rows,
+                    data.preferred_first_axis_size(),
+                    data.preferred_second_axis_size(),
                     first_min,
                     second_min,
                 );
@@ -1183,6 +1330,7 @@ impl TabInner {
             return dividers;
         }
 
+        let cell_dimensions = self.cell_dimensions();
         let mut cursor = self.pane.take().unwrap().cursor();
         let mut index = 0;
 
@@ -1190,29 +1338,46 @@ impl TabInner {
             if !cursor.is_leaf() {
                 let mut left = 0usize;
                 let mut top = 0usize;
+                let mut pixel_left = 0usize;
+                let mut pixel_top = 0usize;
                 for (branch, p) in cursor.path_to_root() {
                     if let Some(p) = p {
                         if branch == PathBranch::IsRight {
                             left += p.left_of_second();
                             top += p.top_of_second();
+                            pixel_left += p.pixel_left_of_second(cell_dimensions);
+                            pixel_top += p.pixel_top_of_second(cell_dimensions);
                         }
                     }
                 }
                 if let Ok(Some(node)) = cursor.node_mut() {
                     match node.direction {
-                        SplitDirection::Horizontal => left += node.first.cols as usize,
-                        SplitDirection::Vertical => top += node.first.rows as usize,
+                        SplitDirection::Horizontal => {
+                            left += node.first.cols as usize;
+                            pixel_left += node.first.pixel_width;
+                        }
+                        SplitDirection::Vertical => {
+                            top += node.first.rows as usize;
+                            pixel_top += node.first.pixel_height;
+                        }
                     }
 
                     dividers.push(PositionedSplit {
                         index,
                         direction: node.direction,
                         left,
+                        pixel_left,
                         top,
+                        pixel_top,
                         size: if node.direction == SplitDirection::Horizontal {
                             node.height() as usize
                         } else {
                             node.width() as usize
+                        },
+                        pixel_size: if node.direction == SplitDirection::Horizontal {
+                            node.size().pixel_height
+                        } else {
+                            node.size().pixel_width
                         },
                     })
                 }
@@ -1299,6 +1464,7 @@ impl TabInner {
 
                 node.second.rows = pane_size.rows.saturating_sub(1 + node.first.rows);
             }
+            node.set_preferred_from_current();
             node.first.pixel_width = node.first.cols * cell_width;
             node.first.pixel_height = node.first.rows * cell_height;
 
@@ -1334,6 +1500,7 @@ impl TabInner {
                         if let Some(second) = compute_size(right) {
                             data.second = second;
                         }
+                        data.set_preferred_from_current();
                         Some(data.size())
                     } else {
                         None
@@ -1418,6 +1585,7 @@ impl TabInner {
                         node.first.cols = cols as usize;
 
                         node.second.cols = width.saturating_sub(node.first.cols.saturating_add(1));
+                        node.set_preferred_from_current();
 
                         let (first_pixel_width, second_pixel_width) = split_child_pixels(
                             pixel_width,
@@ -1452,6 +1620,7 @@ impl TabInner {
                         node.first.rows = rows as usize;
 
                         node.second.rows = height.saturating_sub(node.first.rows.saturating_add(1));
+                        node.set_preferred_from_current();
 
                         let (first_pixel_height, second_pixel_height) = split_child_pixels(
                             pixel_height,
@@ -2044,90 +2213,64 @@ impl TabInner {
     ) -> Option<SplitDirectionAndSize> {
         let cell_dims = self.cell_dimensions();
 
-        fn split_dimension(dim: usize, request: SplitRequest) -> (usize, usize) {
-            let target_size = match request.size {
-                SplitSize::Cells(n) => n,
-                SplitSize::Percent(n) => (dim * (n as usize)) / 100,
-            }
-            .max(1);
-
-            let remain = dim.saturating_sub(target_size + 1);
-
-            if request.target_is_second {
-                (remain, target_size)
-            } else {
-                (target_size, remain)
-            }
-        }
-
         if request.top_level {
             let size = self.size;
 
             let ((width1, width2), (height1, height2)) = match request.direction {
                 SplitDirection::Horizontal => (
-                    split_dimension(size.cols as usize, request),
-                    (size.rows as usize, size.rows as usize),
+                    split_dimensions(size.cols, request)?,
+                    (size.rows, size.rows),
                 ),
                 SplitDirection::Vertical => (
-                    (size.cols as usize, size.cols as usize),
-                    split_dimension(size.rows as usize, request),
+                    (size.cols, size.cols),
+                    split_dimensions(size.rows, request)?,
                 ),
             };
 
-            return Some(SplitDirectionAndSize {
-                direction: request.direction,
-                first: TerminalSize {
-                    rows: height1 as _,
-                    cols: width1 as _,
-                    pixel_height: cell_dims.pixel_height * height1,
-                    pixel_width: cell_dims.pixel_width * width1,
-                    dpi: cell_dims.dpi,
-                },
-                second: TerminalSize {
-                    rows: height2 as _,
-                    cols: width2 as _,
-                    pixel_height: cell_dims.pixel_height * height2,
-                    pixel_width: cell_dims.pixel_width * width2,
-                    dpi: cell_dims.dpi,
-                },
-            });
+            return Some(split_size_from_parent(
+                size,
+                request.direction,
+                height1,
+                height2,
+                width1,
+                width2,
+                &cell_dims,
+            ));
         }
 
         // Ensure that we're not zoomed, otherwise we'll end up in
         // a bogus split state (https://github.com/wezterm/wezterm/issues/723)
         self.set_zoomed(false);
 
-        self.iter_panes().iter().nth(pane_index).map(|pos| {
+        self.iter_panes().iter().nth(pane_index).and_then(|pos| {
             let layout_width = (pos.pixel_width / cell_dims.pixel_width.max(1)).max(1);
             let layout_height = (pos.pixel_height / cell_dims.pixel_height.max(1)).max(1);
             let ((width1, width2), (height1, height2)) = match request.direction {
                 SplitDirection::Horizontal => (
-                    split_dimension(layout_width, request),
+                    split_dimensions(layout_width, request)?,
                     (layout_height, layout_height),
                 ),
                 SplitDirection::Vertical => (
                     (layout_width, layout_width),
-                    split_dimension(layout_height, request),
+                    split_dimensions(layout_height, request)?,
                 ),
             };
 
-            SplitDirectionAndSize {
-                direction: request.direction,
-                first: TerminalSize {
-                    rows: height1 as _,
-                    cols: width1 as _,
-                    pixel_height: cell_dims.pixel_height * height1,
-                    pixel_width: cell_dims.pixel_width * width1,
+            Some(split_size_from_parent(
+                TerminalSize {
+                    rows: layout_height,
+                    cols: layout_width,
+                    pixel_height: pos.pixel_height,
+                    pixel_width: pos.pixel_width,
                     dpi: cell_dims.dpi,
                 },
-                second: TerminalSize {
-                    rows: height2 as _,
-                    cols: width2 as _,
-                    pixel_height: cell_dims.pixel_height * height2,
-                    pixel_width: cell_dims.pixel_width * width2,
-                    dpi: cell_dims.dpi,
-                },
-            }
+                request.direction,
+                height1,
+                height2,
+                width1,
+                width2,
+                &cell_dims,
+            ))
         })
     }
 
@@ -2154,8 +2297,14 @@ impl TabInner {
                 || split_info.first.cols == 0
                 || split_info.second.rows == 0
                 || split_info.second.cols == 0
-                || split_info.top_of_second() + split_info.second.rows > tab_size.rows
-                || split_info.left_of_second() + split_info.second.cols > tab_size.cols
+                || split_info
+                    .top_of_second()
+                    .saturating_add(split_info.second.rows)
+                    > tab_size.rows
+                || split_info
+                    .left_of_second()
+                    .saturating_add(split_info.second.cols)
+                    > tab_size.cols
             {
                 log::error!(
                     "No space for split!!! {:#?} height={} width={} top_of_second={} left_of_second={} tab_size={:?}",
@@ -2567,6 +2716,8 @@ mod test {
                     pixel_height: 600,
                     dpi: 96,
                 },
+                preferred_first: 39,
+                preferred_second: 40,
             }
         );
 
@@ -2596,7 +2747,9 @@ mod test {
                     pixel_width: 800,
                     pixel_height: 275,
                     dpi: 96,
-                }
+                },
+                preferred_first: 11,
+                preferred_second: 12,
             }
         );
 
@@ -2838,6 +2991,46 @@ mod test {
         assert_eq!(40, panes[2].width);
     }
 
+    #[test]
+    fn slow_parent_growth_restores_squeezed_nested_splits() {
+        let size = TerminalSize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 800,
+            pixel_height: 600,
+            dpi: 96,
+        };
+
+        let tab = Tab::new(&size);
+        tab.assign_pane(&FakePane::new(1, size));
+
+        split_pane(&tab, 0, 2, SplitDirection::Horizontal).unwrap();
+        split_pane(&tab, 1, 3, SplitDirection::Horizontal).unwrap();
+        split_pane(&tab, 2, 4, SplitDirection::Horizontal).unwrap();
+
+        tab.resize_split_by(0, 1000);
+        for _ in 0..30 {
+            tab.resize_split_by(0, -1);
+        }
+
+        let panes = tab.iter_panes();
+        assert_eq!(4, panes.len());
+
+        let nested_widths: Vec<usize> = panes[1..].iter().map(|pane| pane.width).collect();
+        assert!(
+            nested_widths.iter().all(|width| *width > 4),
+            "nested pane widths should recover from minimum sizing: {:?}",
+            nested_widths,
+        );
+
+        assert_eq!(
+            33,
+            nested_widths.iter().sum::<usize>(),
+            "nested pane widths should retain the restored parent space: {:?}",
+            nested_widths,
+        );
+    }
+
     fn split_pane(
         tab: &Tab,
         pane_index: usize,
@@ -2914,6 +3107,32 @@ mod test {
         }
 
         assert_no_pixel_overlap(&tab.iter_panes());
+    }
+
+    #[test]
+    fn invalid_split_offsets_do_not_panic() {
+        let split = SplitDirectionAndSize {
+            direction: SplitDirection::Vertical,
+            first: TerminalSize {
+                rows: usize::MAX,
+                cols: 1,
+                pixel_width: 10,
+                pixel_height: 10,
+                dpi: 96,
+            },
+            second: TerminalSize {
+                rows: 1,
+                cols: 1,
+                pixel_width: 10,
+                pixel_height: 10,
+                dpi: 96,
+            },
+            preferred_first: usize::MAX,
+            preferred_second: 1,
+        };
+
+        assert_eq!(usize::MAX, split.top_of_second());
+        assert_eq!(usize::MAX, split.height());
     }
 
     fn is_send_and_sync<T: Send + Sync>() -> bool {
