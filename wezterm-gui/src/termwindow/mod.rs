@@ -1346,6 +1346,9 @@ impl TermWindow {
                     self.sync_tab_pane_font_scales_from_mux(tab_id);
                     self.apply_pending_split_font_scales(tab_id);
                     self.resize_tab_id_panes_for_font_scale(tab_id);
+                    self.shape_generation += 1;
+                    self.shape_cache.borrow_mut().clear();
+                    self.line_to_ele_shape_cache.borrow_mut().clear();
                     self.quad_generation += 1;
                     self.line_quad_cache.borrow_mut().clear();
                     self.update_title_post_status();
