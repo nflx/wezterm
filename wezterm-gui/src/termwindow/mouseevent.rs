@@ -194,8 +194,12 @@ impl super::TermWindow {
                     // Completed a window drag
                     return;
                 }
-                if press == &MousePress::Left && self.dragging.take().is_some() {
+                if let Some((item, _)) = self.dragging.take() {
                     // Completed a drag
+                    if press == &MousePress::Left && matches!(item.item_type, UIItemType::Split(_))
+                    {
+                        self.flush_connected_split_resize();
+                    }
                     return;
                 }
             }
@@ -245,7 +249,7 @@ impl super::TermWindow {
                 }
 
                 if let Some((item, start_event)) = self.dragging.take() {
-                    self.drag_ui_item(item, start_event, x, y, event, context);
+                    self.drag_ui_item(item, start_event, event, context);
                     return;
                 }
             }
@@ -318,11 +322,10 @@ impl super::TermWindow {
 
     fn drag_split(
         &mut self,
-        mut item: UIItem,
+        item: UIItem,
         split: PositionedSplit,
         start_event: MouseEvent,
-        x: usize,
-        y: i64,
+        event: MouseEvent,
         context: &dyn WindowOps,
     ) {
         let mux = Mux::get();
@@ -330,19 +333,44 @@ impl super::TermWindow {
             Some(tab) => tab,
             None => return,
         };
-        let delta = match split.direction {
-            SplitDirection::Horizontal => (x as isize).saturating_sub(split.left as isize),
-            SplitDirection::Vertical => (y as isize).saturating_sub(split.top as isize),
+        let cell_width = self.render_metrics.cell_size.width.max(1);
+        let cell_height = self.render_metrics.cell_size.height.max(1);
+        let current_split = tab.iter_splits().into_iter().nth(split.index);
+        let delta = match (split.direction, current_split.as_ref()) {
+            (SplitDirection::Horizontal, Some(current)) => {
+                let mouse_delta_cells =
+                    event.coords.x.saturating_sub(start_event.coords.x) / cell_width;
+                let target_left = (split.left as isize).saturating_add(mouse_delta_cells);
+                target_left.saturating_sub(current.left as isize)
+            }
+            (SplitDirection::Vertical, Some(current)) => {
+                let mouse_delta_cells =
+                    event.coords.y.saturating_sub(start_event.coords.y) / cell_height;
+                let target_top = (split.top as isize).saturating_add(mouse_delta_cells);
+                target_top.saturating_sub(current.top as isize)
+            }
+            _ => 0,
         };
 
         if delta != 0 {
             tab.resize_split_by(split.index, delta);
-            if let Some(split) = tab.iter_splits().into_iter().nth(split.index) {
-                item.item_type = UIItemType::Split(split);
-                context.invalidate();
-            }
+            context.invalidate();
         }
         self.dragging.replace((item, start_event));
+    }
+
+    fn flush_connected_split_resize(&mut self) {
+        let mux = Mux::get();
+        let tab = match mux.get_active_tab_for_window(self.mux_window_id) {
+            Some(tab) => tab,
+            None => return,
+        };
+
+        for pos in tab.iter_panes_ignoring_zoom() {
+            if let Some(client_pane) = pos.pane.downcast_ref::<wezterm_client::pane::ClientPane>() {
+                client_pane.flush_pending_resize(false);
+            }
+        }
     }
 
     fn drag_scroll_thumb(
@@ -401,14 +429,12 @@ impl super::TermWindow {
         &mut self,
         item: UIItem,
         start_event: MouseEvent,
-        x: usize,
-        y: i64,
         event: MouseEvent,
         context: &dyn WindowOps,
     ) {
         match item.item_type {
             UIItemType::Split(split) => {
-                self.drag_split(item, split, start_event, x, y, context);
+                self.drag_split(item, split, start_event, event, context);
             }
             UIItemType::ScrollThumb => {
                 self.drag_scroll_thumb(item, start_event, event, context);

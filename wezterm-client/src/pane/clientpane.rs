@@ -41,6 +41,7 @@ pub struct ClientPane {
     configured_palette: Mutex<ColorPalette>,
     palette: Mutex<ColorPalette>,
     application_palette: Mutex<bool>,
+    initial_palette_sync_pending: Mutex<bool>,
     writer: Mutex<PaneWriter>,
     mouse: Arc<Mutex<MouseState>>,
     clipboard: Mutex<Option<Arc<dyn Clipboard>>>,
@@ -58,12 +59,15 @@ pub struct ClientPane {
 struct PendingResize {
     size: TerminalSize,
     preserve_split: bool,
+    generation: u64,
 }
 
 #[derive(Debug, Default)]
 struct ResizeQueue {
     pending: Option<PendingResize>,
     worker_running: bool,
+    generation: u64,
+    discard_before_generation: u64,
 }
 
 impl ClientPane {
@@ -140,6 +144,7 @@ impl ClientPane {
             writer: Mutex::new(writer),
             configured_palette: Mutex::new(palette.clone()),
             palette: Mutex::new(palette),
+            initial_palette_sync_pending: Mutex::new(true),
             clipboard: Mutex::new(None),
             mouse_grabbed: Mutex::new(false),
             ignore_next_kill: Mutex::new(false),
@@ -196,7 +201,20 @@ impl ClientPane {
                 }
             },
             Pdu::SetPalette(SetPalette { palette, .. }) => {
-                *self.application_palette.lock() = palette != *self.configured_palette.lock();
+                let configured_palette = self.configured_palette.lock().clone();
+                let palette_is_configured = palette == configured_palette;
+                let mut initial_palette_sync_pending = self.initial_palette_sync_pending.lock();
+
+                if *initial_palette_sync_pending && !palette_is_configured {
+                    log::debug!(
+                        "ignoring stale initial remote palette for pane {}; waiting for configured palette sync",
+                        self.local_pane_id
+                    );
+                    return Ok(());
+                }
+
+                *initial_palette_sync_pending = false;
+                *self.application_palette.lock() = !palette_is_configured;
 
                 *self.palette.lock() = palette;
                 let mux = Mux::get();
@@ -272,13 +290,14 @@ impl ClientPane {
     }
 
     fn enqueue_resize(&self, size: TerminalSize, preserve_split: bool) {
-        let pending = PendingResize {
-            size,
-            preserve_split,
-        };
-
         {
             let mut queue = self.resize_queue.lock();
+            queue.generation = queue.generation.saturating_add(1);
+            let pending = PendingResize {
+                size,
+                preserve_split,
+                generation: queue.generation,
+            };
             queue.pending = Some(pending);
             if queue.worker_running {
                 return;
@@ -305,6 +324,13 @@ impl ClientPane {
                         queue.pending.take()
                     } {
                         pending = latest;
+                    }
+
+                    if {
+                        let queue = queue.lock();
+                        pending.generation < queue.discard_before_generation
+                    } {
+                        continue;
                     }
 
                     if let Err(err) = client
@@ -342,6 +368,52 @@ impl ClientPane {
                 }
             }
 
+            Ok::<(), anyhow::Error>(())
+        })
+        .detach();
+    }
+
+    pub fn flush_pending_resize(&self, preserve_split: bool) {
+        let size = {
+            let render = self.renderable.lock();
+            let inner = render.inner.borrow();
+            TerminalSize {
+                rows: inner.dimensions.viewport_rows,
+                cols: inner.dimensions.cols,
+                pixel_width: inner.dimensions.pixel_width,
+                pixel_height: inner.dimensions.pixel_height,
+                dpi: inner.dimensions.dpi,
+            }
+        };
+
+        {
+            let mut queue = self.resize_queue.lock();
+            queue.generation = queue.generation.saturating_add(1);
+            queue.discard_before_generation = queue.generation;
+            queue.pending.take();
+        }
+
+        let client = Arc::clone(&self.client);
+        let remote_pane_id = self.remote_pane_id;
+        let remote_tab_id = self.remote_tab_id;
+        promise::spawn::spawn(async move {
+            if let Err(err) = client
+                .client
+                .resize(Resize {
+                    containing_tab_id: remote_tab_id,
+                    pane_id: remote_pane_id,
+                    size,
+                    preserve_split,
+                })
+                .await
+            {
+                log::error!(
+                    "failed to flush resize for remote pane {} to {:?}: {:#}",
+                    remote_pane_id,
+                    size,
+                    err
+                );
+            }
             Ok::<(), anyhow::Error>(())
         })
         .detach();
@@ -754,6 +826,11 @@ impl Pane for ClientPane {
         // new palette so that it updates with the lowest latency.
         if !*self.application_palette.lock() {
             *self.palette.lock() = palette.clone();
+            self.renderable.lock().inner.borrow_mut().make_all_stale();
+            Mux::get().notify(MuxNotification::Alert {
+                pane_id: self.local_pane_id,
+                alert: Alert::PaletteChanged,
+            });
         }
         *self.configured_palette.lock() = palette.clone();
 

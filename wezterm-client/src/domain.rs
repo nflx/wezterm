@@ -608,7 +608,6 @@ impl ClientDomain {
 
                 log::debug!("domain: {} tree: {:#?}", inner.local_domain_id, tabroot);
                 let mut workspace = None;
-                let mut font_scale_changed = false;
                 tab.sync_with_pane_tree(root_size, tabroot, |entry| {
                     workspace.replace(entry.workspace.clone());
                     remote_panes_to_forget.remove(&entry.pane_id);
@@ -616,7 +615,6 @@ impl ClientDomain {
                         match mux.get_pane(pane_id) {
                             Some(pane) => {
                                 if let Some(pane) = pane.downcast_ref::<ClientPane>() {
-                                    font_scale_changed |= pane.font_scale() != entry.font_scale;
                                     pane.set_local_font_scale_from_mux(entry.font_scale);
                                 }
                                 pane
@@ -657,9 +655,7 @@ impl ClientDomain {
                         pane
                     }
                 });
-                if font_scale_changed {
-                    mux.notify(MuxNotification::TabResized(tab.tab_id()));
-                }
+                mux.notify(MuxNotification::TabResized(tab.tab_id()));
 
                 if let Some(local_window_id) = inner.remote_to_local_window(remote_window_id) {
                     let mut window = mux
