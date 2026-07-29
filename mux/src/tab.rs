@@ -110,6 +110,10 @@ pub struct SplitDirectionAndSize {
     pub first: TerminalSize,
     pub second: TerminalSize,
     #[serde(default)]
+    divider_pixel_width: usize,
+    #[serde(default)]
+    divider_pixel_height: usize,
+    #[serde(default)]
     preferred_first: usize,
     #[serde(default)]
     preferred_second: usize,
@@ -186,6 +190,22 @@ impl SplitDirectionAndSize {
         self.preferred_second = self.second_axis_size();
     }
 
+    fn divider_pixel_width(&self) -> usize {
+        if self.divider_pixel_width == 0 {
+            self.first.pixel_width / self.first.cols.max(1)
+        } else {
+            self.divider_pixel_width
+        }
+    }
+
+    fn divider_pixel_height(&self) -> usize {
+        if self.divider_pixel_height == 0 {
+            self.first.pixel_height / self.first.rows.max(1)
+        } else {
+            self.divider_pixel_height
+        }
+    }
+
     fn top_of_second(&self) -> usize {
         match self.direction {
             SplitDirection::Horizontal => 0,
@@ -203,10 +223,10 @@ impl SplitDirectionAndSize {
     fn pixel_top_of_second(&self, cell_dimensions: TerminalSize) -> usize {
         match self.direction {
             SplitDirection::Horizontal => 0,
-            SplitDirection::Vertical => self
-                .first
-                .pixel_height
-                .saturating_add(cell_dimensions.pixel_height),
+            SplitDirection::Vertical => self.first.pixel_height.saturating_add(
+                self.divider_pixel_height()
+                    .max(cell_dimensions.pixel_height),
+            ),
         }
     }
 
@@ -215,7 +235,7 @@ impl SplitDirectionAndSize {
             SplitDirection::Horizontal => self
                 .first
                 .pixel_width
-                .saturating_add(cell_dimensions.pixel_width),
+                .saturating_add(self.divider_pixel_width().max(cell_dimensions.pixel_width)),
             SplitDirection::Vertical => 0,
         }
     }
@@ -257,14 +277,14 @@ impl SplitDirectionAndSize {
                     .first
                     .pixel_height
                     .saturating_add(self.second.pixel_height)
-                    .saturating_add(cell_height),
+                    .saturating_add(self.divider_pixel_height().max(cell_height)),
             },
             pixel_width: match self.direction {
                 SplitDirection::Horizontal => self
                     .first
                     .pixel_width
                     .saturating_add(self.second.pixel_width)
-                    .saturating_add(cell_width),
+                    .saturating_add(self.divider_pixel_width().max(cell_width)),
                 SplitDirection::Vertical => self.first.pixel_width.max(self.second.pixel_width),
             },
             dpi: self.first.dpi,
@@ -595,6 +615,8 @@ fn split_size_from_parent(
             SplitDirection::Horizontal => second_cols,
             SplitDirection::Vertical => second_rows,
         },
+        divider_pixel_width: cell_dimensions.pixel_width,
+        divider_pixel_height: cell_dimensions.pixel_height,
     }
 }
 
@@ -623,6 +645,8 @@ fn resize_tree_to_size(tree: &mut Tree, size: &TerminalSize, cell_dimensions: &T
                     cell_dimensions.pixel_width,
                     cell_dimensions.pixel_width,
                 );
+                data.divider_pixel_width = cell_dimensions.pixel_width;
+                data.divider_pixel_height = cell_dimensions.pixel_height;
 
                 data.first = terminal_size_with_pixels(
                     size.rows,
@@ -658,6 +682,8 @@ fn resize_tree_to_size(tree: &mut Tree, size: &TerminalSize, cell_dimensions: &T
                     cell_dimensions.pixel_height,
                     cell_dimensions.pixel_height,
                 );
+                data.divider_pixel_width = cell_dimensions.pixel_width;
+                data.divider_pixel_height = cell_dimensions.pixel_height;
 
                 data.first = terminal_size_with_pixels(
                     first_rows,
@@ -1417,8 +1443,12 @@ impl TabInner {
                         } else {
                             node.size().pixel_width
                         },
-                        divider_pixel_width: cell_dimensions.pixel_width,
-                        divider_pixel_height: cell_dimensions.pixel_height,
+                        divider_pixel_width: node
+                            .divider_pixel_width()
+                            .max(cell_dimensions.pixel_width),
+                        divider_pixel_height: node
+                            .divider_pixel_height()
+                            .max(cell_dimensions.pixel_height),
                     })
                 }
                 index += 1;
@@ -1516,6 +1546,8 @@ impl TabInner {
                     second_cols * cell_width,
                     pane_size.dpi,
                 );
+                node.divider_pixel_width = cell_width;
+                node.divider_pixel_height = cell_height;
             } else {
                 let (first_rows, second_rows) = split_child_lengths(
                     pane_size.rows,
@@ -1539,6 +1571,8 @@ impl TabInner {
                     pane_size.pixel_width,
                     pane_size.dpi,
                 );
+                node.divider_pixel_width = cell_width;
+                node.divider_pixel_height = cell_height;
             }
         }
     }
@@ -1675,7 +1709,7 @@ impl TabInner {
                         let (first_pixel_width, second_pixel_width) = split_child_pixels(
                             pixel_width,
                             node.first.cols,
-                            cell_dimensions.pixel_width,
+                            node.divider_pixel_width().max(cell_dimensions.pixel_width),
                             cell_dimensions.pixel_width,
                         );
                         node.first.pixel_width = first_pixel_width;
@@ -1712,7 +1746,8 @@ impl TabInner {
                         let (first_pixel_height, second_pixel_height) = split_child_pixels(
                             pixel_height,
                             node.first.rows,
-                            cell_dimensions.pixel_height,
+                            node.divider_pixel_height()
+                                .max(cell_dimensions.pixel_height),
                             cell_dimensions.pixel_height,
                         );
                         node.first.pixel_height = first_pixel_height;
@@ -2803,6 +2838,8 @@ mod test {
                     pixel_height: 600,
                     dpi: 96,
                 },
+                divider_pixel_width: 10,
+                divider_pixel_height: 25,
                 preferred_first: 39,
                 preferred_second: 40,
             }
@@ -2835,6 +2872,8 @@ mod test {
                     pixel_height: 275,
                     dpi: 96,
                 },
+                divider_pixel_width: 10,
+                divider_pixel_height: 25,
                 preferred_first: 11,
                 preferred_second: 12,
             }
@@ -3277,6 +3316,49 @@ mod test {
     }
 
     #[test]
+    fn split_rebuild_preserves_divider_pixels() {
+        let size = TerminalSize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 800,
+            pixel_height: 600,
+            dpi: 96,
+        };
+        let tab = Tab::new(&size);
+        tab.assign_pane(&FakePane::new(1, size));
+        split_pane(&tab, 0, 2, SplitDirection::Horizontal).unwrap();
+
+        let panes = tab.iter_panes();
+        assert_eq!(panes[1].pixel_left, 400);
+
+        panes[0]
+            .pane
+            .resize(TerminalSize {
+                rows: 24,
+                cols: 48,
+                pixel_width: 390,
+                pixel_height: 600,
+                dpi: 96,
+            })
+            .unwrap();
+        panes[1]
+            .pane
+            .resize(TerminalSize {
+                rows: 24,
+                cols: 40,
+                pixel_width: 400,
+                pixel_height: 600,
+                dpi: 96,
+            })
+            .unwrap();
+
+        tab.rebuild_splits_sizes_from_contained_panes_silently();
+
+        let panes = tab.iter_panes();
+        assert_eq!(panes[1].pixel_left, 400);
+    }
+
+    #[test]
     fn invalid_split_offsets_do_not_panic() {
         let split = SplitDirectionAndSize {
             direction: SplitDirection::Vertical,
@@ -3294,6 +3376,8 @@ mod test {
                 pixel_height: 10,
                 dpi: 96,
             },
+            divider_pixel_width: 10,
+            divider_pixel_height: 10,
             preferred_first: usize::MAX,
             preferred_second: 1,
         };
