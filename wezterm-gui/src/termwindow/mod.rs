@@ -2804,6 +2804,8 @@ impl TermWindow {
             DecreaseFontSize => self.decrease_font_size(),
             IncreaseFontSize => self.increase_font_size(),
             ResetFontSize => self.reset_font_size(),
+            DecreaseAllPaneFontSize => self.decrease_all_pane_font_size(),
+            IncreaseAllPaneFontSize => self.increase_all_pane_font_size(),
             DecreasePaneFontSize => self.decrease_pane_font_size(pane),
             IncreasePaneFontSize => self.increase_pane_font_size(pane),
             ResetPaneFontSize => self.reset_pane_font_size(pane),

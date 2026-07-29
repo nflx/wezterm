@@ -860,7 +860,19 @@ impl super::TermWindow {
         }
     }
 
-    fn set_pane_font_scale(&mut self, pane: &Arc<dyn Pane>, font_scale: Option<f64>) {
+    fn invalidate_pane_font_scale_outputs(&mut self) {
+        self.shape_generation += 1;
+        self.shape_cache.borrow_mut().clear();
+        self.line_to_ele_shape_cache.borrow_mut().clear();
+        self.line_quad_cache.borrow_mut().clear();
+        self.quad_generation += 1;
+
+        if let Some(window) = self.window.as_ref() {
+            window.invalidate();
+        }
+    }
+
+    fn set_pane_font_scale_state(&mut self, pane: &Arc<dyn Pane>, font_scale: Option<f64>) -> bool {
         let pane_id = pane.pane_id();
         let new_scale = font_scale.unwrap_or(1.0);
         let font_size = self.config.font_size * new_scale;
@@ -873,14 +885,14 @@ impl super::TermWindow {
                 new_scale,
                 theoretical_height
             );
-            return;
+            return false;
         }
 
         let font_scale = match normalize_font_scale(font_scale) {
             Ok(font_scale) => font_scale,
             Err(err) => {
                 log::warn!("refusing to set pane {} font scale: {:#}", pane_id, err);
-                return;
+                return false;
             }
         };
         self.pane_state(pane_id).font_scale = font_scale;
@@ -891,18 +903,49 @@ impl super::TermWindow {
                 err
             );
         }
+        true
+    }
+
+    fn set_pane_font_scale(&mut self, pane: &Arc<dyn Pane>, font_scale: Option<f64>) {
+        if !self.set_pane_font_scale_state(pane, font_scale) {
+            return;
+        }
+
         self.resize_active_tab_panes_for_font_scale();
         self.flush_connected_tab_resize(true);
+        self.invalidate_pane_font_scale_outputs();
+    }
 
-        self.shape_generation += 1;
-        self.shape_cache.borrow_mut().clear();
-        self.line_to_ele_shape_cache.borrow_mut().clear();
-        self.line_quad_cache.borrow_mut().clear();
-        self.quad_generation += 1;
+    fn adjust_all_pane_font_sizes(&mut self, factor: f64) {
+        let mux = Mux::get();
+        let Some(window) = mux.get_window(self.mux_window_id) else {
+            return;
+        };
 
-        if let Some(window) = self.window.as_ref() {
-            window.invalidate();
+        let mut seen = HashSet::new();
+        let mut changed = false;
+        let tabs: Vec<_> = window.iter().collect();
+
+        for tab in &tabs {
+            for pos in tab.iter_panes_ignoring_zoom() {
+                let pane_id = pos.pane.pane_id();
+                if !seen.insert(pane_id) {
+                    continue;
+                }
+                let font_scale = self.pane_font_scale(pane_id) * factor;
+                changed |= self.set_pane_font_scale_state(&pos.pane, Some(font_scale));
+            }
         }
+
+        if !changed {
+            return;
+        }
+
+        for tab in tabs {
+            self.resize_tab_panes_for_font_scale(&tab);
+        }
+        self.flush_connected_tab_resize(true);
+        self.invalidate_pane_font_scale_outputs();
     }
 
     pub fn decrease_pane_font_size(&mut self, pane: &Arc<dyn Pane>) {
@@ -915,6 +958,14 @@ impl super::TermWindow {
 
     pub fn reset_pane_font_size(&mut self, pane: &Arc<dyn Pane>) {
         self.set_pane_font_scale(pane, None);
+    }
+
+    pub fn decrease_all_pane_font_size(&mut self) {
+        self.adjust_all_pane_font_sizes(1.0 / 1.1);
+    }
+
+    pub fn increase_all_pane_font_size(&mut self) {
+        self.adjust_all_pane_font_sizes(1.1);
     }
 
     pub fn set_window_size(&mut self, size: TerminalSize, window: &Window) -> anyhow::Result<()> {
