@@ -295,6 +295,10 @@ pub struct PositionedSplit {
     /// For Horizontal splits, how tall the split should be, for Vertical
     /// splits how wide it should be, in pixels.
     pub pixel_size: usize,
+    /// Width of the divider cell between split children, in pixels.
+    pub divider_pixel_width: usize,
+    /// Height of the divider cell between split children, in pixels.
+    pub divider_pixel_height: usize,
 }
 
 fn is_pane(pane: &Arc<dyn Pane>, other: &Option<&Arc<dyn Pane>>) -> bool {
@@ -1413,6 +1417,8 @@ impl TabInner {
                         } else {
                             node.size().pixel_width
                         },
+                        divider_pixel_width: cell_dimensions.pixel_width,
+                        divider_pixel_height: cell_dimensions.pixel_height,
                     })
                 }
                 index += 1;
