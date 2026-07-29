@@ -11,11 +11,101 @@ use mux::{Mux, MuxNotification};
 use promise::spawn::spawn_into_main_thread;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use termwiz::surface::SequenceNo;
 use url::Url;
 use wezterm_term::terminal::Alert;
 use wezterm_term::StableRowIndex;
+
+lazy_static::lazy_static! {
+    static ref PENDING_SPLIT_REBUILDS: Mutex<HashMap<TabId, u64>> = Mutex::new(HashMap::new());
+    static ref LATEST_RESIZE_GENERATIONS: Mutex<HashMap<PaneId, u64>> = Mutex::new(HashMap::new());
+}
+
+fn should_apply_resize(pane_id: PaneId, resize_generation: u64) -> bool {
+    if resize_generation == 0 {
+        return true;
+    }
+
+    let mut latest = LATEST_RESIZE_GENERATIONS.lock().unwrap();
+    let entry = latest.entry(pane_id).or_insert(0);
+    if resize_generation < *entry {
+        if std::env::var_os("WEZTERM_PANE_FONT_TRACE").is_some() {
+            log::info!(
+                target: "pane_font_trace",
+                "server discard-stale-resize pane={} generation={} latest={}",
+                pane_id,
+                resize_generation,
+                *entry,
+            );
+        }
+        false
+    } else {
+        *entry = resize_generation;
+        true
+    }
+}
+
+fn schedule_split_rebuild(containing_tab_id: TabId) {
+    const SPLIT_REBUILD_DEBOUNCE_MS: u64 = 750;
+
+    let generation = {
+        let mut pending = PENDING_SPLIT_REBUILDS.lock().unwrap();
+        let generation = pending
+            .get(&containing_tab_id)
+            .copied()
+            .unwrap_or(0)
+            .saturating_add(1);
+        pending.insert(containing_tab_id, generation);
+        generation
+    };
+
+    if std::env::var_os("WEZTERM_PANE_FONT_TRACE").is_some() {
+        log::info!(
+            target: "pane_font_trace",
+            "server schedule-split-rebuild tab={} generation={} debounce_ms={}",
+            containing_tab_id,
+            generation,
+            SPLIT_REBUILD_DEBOUNCE_MS,
+        );
+    }
+
+    spawn_into_main_thread(async move {
+        smol::Timer::after(Duration::from_millis(SPLIT_REBUILD_DEBOUNCE_MS)).await;
+
+        let should_rebuild = {
+            let mut pending = PENDING_SPLIT_REBUILDS.lock().unwrap();
+            if pending.get(&containing_tab_id).copied() == Some(generation) {
+                pending.remove(&containing_tab_id);
+                true
+            } else {
+                false
+            }
+        };
+
+        if should_rebuild {
+            if let Some(tab) = Mux::get().get_tab(containing_tab_id) {
+                if std::env::var_os("WEZTERM_PANE_FONT_TRACE").is_some() {
+                    log::info!(
+                        target: "pane_font_trace",
+                        "server apply-split-rebuild tab={} generation={}",
+                        containing_tab_id,
+                        generation,
+                    );
+                }
+                tab.rebuild_splits_sizes_from_contained_panes_silently();
+            }
+        } else if std::env::var_os("WEZTERM_PANE_FONT_TRACE").is_some() {
+            log::info!(
+                target: "pane_font_trace",
+                "server skip-stale-split-rebuild tab={} generation={}",
+                containing_tab_id,
+                generation,
+            );
+        }
+    })
+    .detach();
+}
 
 #[derive(Clone)]
 pub struct PduSender {
@@ -635,21 +725,152 @@ impl SessionHandler {
                 pane_id,
                 size,
                 preserve_split,
+                resize_generation,
             }) => {
                 spawn_into_main_thread(async move {
                     catch(
                         move || {
+                            if !should_apply_resize(pane_id, resize_generation) {
+                                return Ok(Pdu::UnitResponse(UnitResponse {}));
+                            }
+
                             let mux = Mux::get();
                             let pane = mux
                                 .get_pane(pane_id)
                                 .ok_or_else(|| anyhow!("no such pane {}", pane_id))?;
-                            pane.resize(size)?;
-                            if !preserve_split {
+                            if preserve_split {
                                 let tab = mux
                                     .get_tab(containing_tab_id)
                                     .ok_or_else(|| anyhow!("no such tab {}", containing_tab_id))?;
+                                if tab.iter_panes_ignoring_zoom().len() == 1 {
+                                    tab.resize_preserving_split(size);
+                                } else {
+                                    pane.resize_preserving_split(size)?;
+                                    schedule_split_rebuild(containing_tab_id);
+                                }
+                            } else {
+                                pane.resize(size)?;
+                                let tab = mux
+                                    .get_tab(containing_tab_id)
+                                    .ok_or_else(|| anyhow!("no such tab {}", containing_tab_id))?;
+                                PENDING_SPLIT_REBUILDS
+                                    .lock()
+                                    .unwrap()
+                                    .remove(&containing_tab_id);
                                 tab.rebuild_splits_sizes_from_contained_panes();
                             }
+                            Ok(Pdu::UnitResponse(UnitResponse {}))
+                        },
+                        send_response,
+                    )
+                })
+                .detach();
+            }
+
+            Pdu::ResizePanes(ResizePanes {
+                containing_tab_id,
+                panes,
+            }) => {
+                let pane_count = panes.len();
+                if std::env::var_os("WEZTERM_PANE_FONT_TRACE").is_some() {
+                    log::info!(
+                        target: "pane_font_trace",
+                        "server resize-panes start serial={serial} tab={containing_tab_id} panes={pane_count}"
+                    );
+                }
+                if serial == 0 {
+                    spawn_into_main_thread(async move {
+                        let result = move || -> anyhow::Result<()> {
+                            let mux = Mux::get();
+                            let tab = mux
+                                .get_tab(containing_tab_id)
+                                .ok_or_else(|| anyhow!("no such tab {}", containing_tab_id))?;
+
+                            let single_pane_tab = tab.iter_panes_ignoring_zoom().len() == 1;
+                            for resize in panes {
+                                if !should_apply_resize(resize.pane_id, resize.resize_generation) {
+                                    continue;
+                                }
+
+                                let pane = mux
+                                    .get_pane(resize.pane_id)
+                                    .ok_or_else(|| anyhow!("no such pane {}", resize.pane_id))?;
+                                if resize.preserve_split {
+                                    if single_pane_tab {
+                                        tab.resize_preserving_split(resize.size);
+                                    } else {
+                                        pane.resize_preserving_split(resize.size)?;
+                                    }
+                                } else {
+                                    pane.resize(resize.size)?;
+                                }
+                            }
+
+                            PENDING_SPLIT_REBUILDS
+                                .lock()
+                                .unwrap()
+                                .remove(&containing_tab_id);
+                            tab.rebuild_splits_sizes_from_contained_panes();
+                            if std::env::var_os("WEZTERM_PANE_FONT_TRACE").is_some() {
+                                log::info!(
+                                    target: "pane_font_trace",
+                                    "server resize-panes done serial=0 tab={containing_tab_id} panes={pane_count}"
+                                );
+                            }
+
+                            Ok(())
+                        }();
+                        if let Err(err) = result {
+                            log::error!(
+                                "failed to apply one-way resize batch for tab {}: {:#}",
+                                containing_tab_id,
+                                err
+                            );
+                        }
+                    })
+                    .detach();
+                    return;
+                }
+                spawn_into_main_thread(async move {
+                    catch(
+                        move || {
+                            let mux = Mux::get();
+                            let tab = mux
+                                .get_tab(containing_tab_id)
+                                .ok_or_else(|| anyhow!("no such tab {}", containing_tab_id))?;
+
+                            let single_pane_tab = tab.iter_panes_ignoring_zoom().len() == 1;
+                            for resize in panes {
+                                if !should_apply_resize(resize.pane_id, resize.resize_generation) {
+                                    continue;
+                                }
+
+                                let pane = mux
+                                    .get_pane(resize.pane_id)
+                                    .ok_or_else(|| anyhow!("no such pane {}", resize.pane_id))?;
+                                if resize.preserve_split {
+                                    if single_pane_tab {
+                                        tab.resize_preserving_split(resize.size);
+                                    } else {
+                                        pane.resize_preserving_split(resize.size)?;
+                                    }
+                                } else {
+                                    pane.resize(resize.size)?;
+                                }
+                            }
+
+                            PENDING_SPLIT_REBUILDS
+                                .lock()
+                                .unwrap()
+                                .remove(&containing_tab_id);
+                            tab.rebuild_splits_sizes_from_contained_panes();
+                            if std::env::var_os("WEZTERM_PANE_FONT_TRACE").is_some() {
+                                log::info!(
+                                    target: "pane_font_trace",
+                                    "server resize-panes done serial={serial} tab={containing_tab_id} panes={pane_count}"
+                                );
+                            }
+
                             Ok(Pdu::UnitResponse(UnitResponse {}))
                         },
                         send_response,
@@ -790,6 +1011,12 @@ impl SessionHandler {
             }
 
             Pdu::GetPaneRenderChanges(GetPaneRenderChanges { pane_id, .. }) => {
+                if std::env::var_os("WEZTERM_PANE_FONT_TRACE").is_some() {
+                    log::info!(
+                        target: "pane_font_trace",
+                        "server render-poll start serial={serial} pane={pane_id}",
+                    );
+                }
                 let sender = self.to_write_tx.clone();
                 let per_pane = self.per_pane(pane_id);
                 spawn_into_main_thread(async move {
@@ -803,6 +1030,12 @@ impl SessionHandler {
                                 }
                                 None => false,
                             };
+                            if std::env::var_os("WEZTERM_PANE_FONT_TRACE").is_some() {
+                                log::info!(
+                                    target: "pane_font_trace",
+                                    "server render-poll done serial={serial} pane={pane_id} alive={is_alive}",
+                                );
+                            }
                             Ok(Pdu::LivenessResponse(LivenessResponse {
                                 pane_id,
                                 is_alive,

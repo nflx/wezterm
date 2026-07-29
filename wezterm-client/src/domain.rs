@@ -2,7 +2,7 @@ use crate::client::Client;
 use crate::pane::ClientPane;
 use anyhow::{anyhow, bail};
 use async_trait::async_trait;
-use codec::{ListPanesResponse, SpawnV2, SplitPane};
+use codec::{ListPanesResponse, ResizePane, SpawnV2, SplitPane};
 use config::keyassignment::SpawnTabDomain;
 use config::{SshDomain, TlsDomainClient, UnixDomain};
 use mux::connui::{ConnectionUI, ConnectionUIParams};
@@ -922,6 +922,18 @@ impl Domain for ClientDomain {
         let pane = local_pane
             .downcast_ref::<ClientPane>()
             .ok_or_else(|| anyhow!("pane_id {} is not a ClientPane", pane_id))?;
+
+        let mut pending_resizes = Vec::<ResizePane>::new();
+        for pos in tab.iter_panes() {
+            if let Some(pane) = pos.pane.downcast_ref::<ClientPane>() {
+                if let Some(resize) = pane.take_pending_resize_for_tab_sync(true) {
+                    pending_resizes.push(resize);
+                }
+            }
+        }
+        if !pending_resizes.is_empty() {
+            pane.flush_pending_tab_resize_now(pending_resizes).await?;
+        }
 
         let (command, command_dir, move_pane_id) = match source {
             SplitSource::Spawn {

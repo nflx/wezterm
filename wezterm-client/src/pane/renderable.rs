@@ -14,7 +14,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::ops::Range;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use termwiz::cell::{Cell, CellAttributes, Underline};
@@ -26,6 +26,74 @@ use wezterm_term::{KeyCode, KeyModifiers, Line, StableRowIndex};
 
 const MAX_POLL_INTERVAL: Duration = Duration::from_secs(30);
 const BASE_POLL_INTERVAL: Duration = Duration::from_millis(20);
+const MAX_IN_FLIGHT_RENDER_POLLS: usize = 16;
+const MAX_IN_FLIGHT_LINE_FETCHES: usize = 16;
+const MIN_POLL_COLS: usize = 1;
+const MIN_POLL_ROWS: usize = 1;
+
+static IN_FLIGHT_RENDER_POLLS: AtomicUsize = AtomicUsize::new(0);
+static IN_FLIGHT_LINE_FETCHES: AtomicUsize = AtomicUsize::new(0);
+
+fn pane_font_trace_enabled() -> bool {
+    std::env::var_os("WEZTERM_PANE_FONT_TRACE").is_some()
+}
+
+struct RenderPollPermit;
+
+fn try_acquire_counter(counter: &'static AtomicUsize, max: usize) -> bool {
+    let mut current = counter.load(Ordering::SeqCst);
+    loop {
+        if current >= max {
+            return false;
+        }
+        match counter.compare_exchange(current, current + 1, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return true,
+            Err(next) => current = next,
+        }
+    }
+}
+
+impl RenderPollPermit {
+    fn try_acquire() -> Option<Self> {
+        if try_acquire_counter(&IN_FLIGHT_RENDER_POLLS, MAX_IN_FLIGHT_RENDER_POLLS) {
+            Some(Self)
+        } else {
+            None
+        }
+    }
+}
+
+impl Drop for RenderPollPermit {
+    fn drop(&mut self) {
+        IN_FLIGHT_RENDER_POLLS
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+                Some(current.saturating_sub(1))
+            })
+            .ok();
+    }
+}
+
+struct LineFetchPermit;
+
+impl LineFetchPermit {
+    fn try_acquire() -> Option<Self> {
+        if try_acquire_counter(&IN_FLIGHT_LINE_FETCHES, MAX_IN_FLIGHT_LINE_FETCHES) {
+            Some(Self)
+        } else {
+            None
+        }
+    }
+}
+
+impl Drop for LineFetchPermit {
+    fn drop(&mut self) {
+        IN_FLIGHT_LINE_FETCHES
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+                Some(current.saturating_sub(1))
+            })
+            .ok();
+    }
+}
 
 #[derive(Debug)]
 enum LineEntry {
@@ -75,6 +143,7 @@ pub struct RenderableInner {
     last_send_time: Instant,
     pub last_recv_time: Instant,
     last_late_dirty: Instant,
+    tardy_logged: AtomicBool,
     last_input_rtt: u64,
 
     pub input_serial: InputSerial,
@@ -114,6 +183,7 @@ impl RenderableInner {
             last_send_time: now,
             last_recv_time: now,
             last_late_dirty: now,
+            tardy_logged: AtomicBool::new(false),
             last_input_rtt: 0,
             input_serial: InputSerial::empty(),
             seqno: SEQ_ZERO,
@@ -126,11 +196,38 @@ impl RenderableInner {
     /// showing.
     pub fn is_tardy(&self) -> bool {
         let elapsed = self.last_recv_time.elapsed();
-        if elapsed > self.poll_interval.max(Duration::from_secs(3)) {
+        let tardy = if elapsed > self.poll_interval.max(Duration::from_secs(3)) {
             self.last_send_time > self.last_recv_time
         } else {
             false
+        };
+
+        if pane_font_trace_enabled() {
+            if tardy {
+                if !self.tardy_logged.swap(true, Ordering::SeqCst) {
+                    log::info!(
+                        target: "pane_font_trace",
+                        "client render-poll tardy pane={} remote={} elapsed_ms={} poll_interval_ms={} in_flight={}",
+                        self.local_pane_id,
+                        self.remote_pane_id,
+                        elapsed.as_millis(),
+                        self.poll_interval.as_millis(),
+                        IN_FLIGHT_RENDER_POLLS.load(Ordering::SeqCst),
+                    );
+                }
+            } else if self.tardy_logged.swap(false, Ordering::SeqCst) {
+                log::info!(
+                    target: "pane_font_trace",
+                    "client render-poll recovered pane={} remote={} elapsed_ms={} in_flight={}",
+                    self.local_pane_id,
+                    self.remote_pane_id,
+                    elapsed.as_millis(),
+                    IN_FLIGHT_RENDER_POLLS.load(Ordering::SeqCst),
+                );
+            }
         }
+
+        tardy
     }
 
     /// Predictive echo can be noisy when the link is working well,
@@ -507,8 +604,36 @@ impl RenderableInner {
 
         let client = Arc::clone(&self.client);
         let remote_pane_id = self.remote_pane_id;
+        let Some(line_fetch_permit) = LineFetchPermit::try_acquire() else {
+            if pane_font_trace_enabled() {
+                log::info!(
+                    target: "pane_font_trace",
+                    "client get-lines skipped pane={} remote={} in_flight={} max={}",
+                    local_pane_id,
+                    remote_pane_id,
+                    IN_FLIGHT_LINE_FETCHES.load(Ordering::SeqCst),
+                    MAX_IN_FLIGHT_LINE_FETCHES,
+                );
+            }
+            for r in to_fetch.iter() {
+                for stable_row in r.clone() {
+                    self.make_stale(stable_row);
+                }
+            }
+            return;
+        };
 
         promise::spawn::spawn(async move {
+            let _line_fetch_permit = line_fetch_permit;
+            if pane_font_trace_enabled() {
+                log::info!(
+                    target: "pane_font_trace",
+                    "client get-lines start pane={} remote={} lines={:?}",
+                    local_pane_id,
+                    remote_pane_id,
+                    to_fetch,
+                );
+            }
             let result = client
                 .client
                 .get_lines(GetLines {
@@ -525,6 +650,15 @@ impl RenderableInner {
                 }
                 Err(err) => Err(err),
             };
+            if pane_font_trace_enabled() {
+                log::info!(
+                    target: "pane_font_trace",
+                    "client get-lines done pane={} remote={} ok={}",
+                    local_pane_id,
+                    remote_pane_id,
+                    result.is_ok(),
+                );
+            }
             Self::apply_lines(local_pane_id, result, to_fetch, now)
         })
         .detach();
@@ -593,16 +727,64 @@ impl RenderableInner {
             return Ok(());
         }
 
+        if self.dimensions.cols < MIN_POLL_COLS || self.dimensions.viewport_rows < MIN_POLL_ROWS {
+            if pane_font_trace_enabled() {
+                log::info!(
+                    target: "pane_font_trace",
+                    "client render-poll skipped-tiny pane={} remote={} size={}x{} min={}x{}",
+                    self.local_pane_id,
+                    self.remote_pane_id,
+                    self.dimensions.cols,
+                    self.dimensions.viewport_rows,
+                    MIN_POLL_COLS,
+                    MIN_POLL_ROWS,
+                );
+            }
+            return Ok(());
+        }
+        let Some(poll_permit) = RenderPollPermit::try_acquire() else {
+            let interval = (self.poll_interval + self.poll_interval).min(MAX_POLL_INTERVAL);
+            self.poll_interval = interval;
+            self.last_poll = Instant::now();
+            let local_pane_id = self.local_pane_id;
+            if pane_font_trace_enabled() {
+                log::info!(
+                    target: "pane_font_trace",
+                    "client render-poll skipped pane={} remote={} in_flight={} max={} retry_ms={}",
+                    local_pane_id,
+                    self.remote_pane_id,
+                    IN_FLIGHT_RENDER_POLLS.load(Ordering::SeqCst),
+                    MAX_IN_FLIGHT_RENDER_POLLS,
+                    interval.as_millis(),
+                );
+            }
+            promise::spawn::spawn(async move {
+                smol::Timer::after(interval).await;
+                Mux::notify_from_any_thread(mux::MuxNotification::PaneOutput(local_pane_id));
+            })
+            .detach();
+            return Ok(());
+        };
         let interval = self.poll_interval;
         let interval = (interval + interval).min(MAX_POLL_INTERVAL);
         self.poll_interval = interval;
-
         self.last_poll = Instant::now();
         self.poll_in_progress.store(true, Ordering::SeqCst);
         let remote_pane_id = self.remote_pane_id;
         let local_pane_id = self.local_pane_id;
         let client = Arc::clone(&self.client);
+        if pane_font_trace_enabled() {
+            log::info!(
+                target: "pane_font_trace",
+                "client render-poll start pane={} remote={} in_flight={} interval_ms={}",
+                local_pane_id,
+                remote_pane_id,
+                IN_FLIGHT_RENDER_POLLS.load(Ordering::SeqCst),
+                self.poll_interval.as_millis(),
+            );
+        }
         promise::spawn::spawn(async move {
+            let _poll_permit = poll_permit;
             let alive = match client
                 .client
                 .get_pane_render_changes(GetPaneRenderChanges {
@@ -610,11 +792,32 @@ impl RenderableInner {
                 })
                 .await
             {
-                Ok(resp) => resp.is_alive,
+                Ok(resp) => {
+                    if pane_font_trace_enabled() {
+                        log::info!(
+                            target: "pane_font_trace",
+                            "client render-poll response pane={} remote={} alive={}",
+                            local_pane_id,
+                            remote_pane_id,
+                            resp.is_alive,
+                        );
+                    }
+                    resp.is_alive
+                }
                 // if we got a timeout on a reconnectable, don't
                 // consider the tab to be dead; that helps to
                 // avoid having a tab get shuffled around
-                Err(_) => client.client.is_reconnectable,
+                Err(err) => {
+                    if pane_font_trace_enabled() {
+                        log::error!(
+                            target: "pane_font_trace",
+                            "client render-poll error pane={} remote={}: {err:#}",
+                            local_pane_id,
+                            remote_pane_id,
+                        );
+                    }
+                    client.client.is_reconnectable
+                }
             };
 
             let mux = Mux::get();
@@ -628,6 +831,15 @@ impl RenderableInner {
                 inner.dead = !alive;
                 inner.last_recv_time = Instant::now();
                 inner.poll_in_progress.store(false, Ordering::SeqCst);
+                if pane_font_trace_enabled() {
+                    log::info!(
+                        target: "pane_font_trace",
+                        "client render-poll done pane={} remote={} in_flight={}",
+                        local_pane_id,
+                        remote_pane_id,
+                        IN_FLIGHT_RENDER_POLLS.load(Ordering::SeqCst),
+                    );
+                }
             }
             Ok::<(), anyhow::Error>(())
         })
@@ -761,12 +973,19 @@ impl RenderableState {
                 }
             };
 
-            if inner.client.overlay_lag_indicator && idx == inner.dimensions.physical_top {
-                if inner.is_tardy() {
-                    let status = format!(
+            if idx == inner.dimensions.physical_top {
+                let status = if !inner.client.client.is_connected() {
+                    Some("wezterm: disconnected".to_string())
+                } else if inner.is_tardy() {
+                    Some(format!(
                         "wezterm: {:.0?}⏳since last response",
                         inner.last_recv_time.elapsed()
-                    );
+                    ))
+                } else {
+                    None
+                };
+
+                if let Some(status) = status {
                     // Right align it in the tab
                     let col = inner
                         .dimensions

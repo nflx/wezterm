@@ -68,7 +68,7 @@ where
         let rx_msg = item_rx.recv();
         let wait_for_read = stream.readable().map(|_| Ok(Item::Readable));
 
-        match smol::future::or(rx_msg, wait_for_read).await {
+        match smol::future::or(wait_for_read, rx_msg).await {
             Ok(Item::Readable) => {
                 let decoded = match Pdu::decode_async(&mut stream, None).await {
                     Ok(data) => data,
@@ -82,9 +82,29 @@ where
                         return Err(err).context("reading Pdu from client");
                     }
                 };
+                if std::env::var_os("WEZTERM_PANE_FONT_TRACE").is_some()
+                    && matches!(decoded.pdu, Pdu::ResizePanes(_))
+                {
+                    log::info!(
+                        target: "pane_font_trace",
+                        "server recv-pdu serial={} {}",
+                        decoded.serial,
+                        decoded.pdu.pdu_name()
+                    );
+                }
                 handler.process_one(decoded);
             }
             Ok(Item::WritePdu(decoded)) => {
+                if std::env::var_os("WEZTERM_PANE_FONT_TRACE").is_some()
+                    && matches!(decoded.pdu, Pdu::UnitResponse(_) | Pdu::ErrorResponse(_))
+                {
+                    log::info!(
+                        target: "pane_font_trace",
+                        "server write-pdu serial={} {}",
+                        decoded.serial,
+                        decoded.pdu.pdu_name()
+                    );
+                }
                 match decoded.pdu.encode_async(&mut stream, decoded.serial).await {
                     Ok(()) => {}
                     Err(err) => {

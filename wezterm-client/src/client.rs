@@ -30,6 +30,10 @@ use std::os::unix::process::CommandExt;
 #[cfg(windows)]
 use std::os::windows::io::{AsRawSocket, AsSocket, BorrowedSocket, RawSocket};
 use std::path::{Path, PathBuf};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::thread;
 use std::time::Duration;
 use thiserror::Error;
@@ -48,7 +52,25 @@ enum ReaderMessage {
         pdu: Pdu,
         promise: Sender<anyhow::Result<Pdu>>,
     },
+    SendPduNoResponse {
+        pdu: Pdu,
+    },
     Readable,
+    Tick,
+}
+
+fn pane_font_trace_enabled() -> bool {
+    std::env::var_os("WEZTERM_PANE_FONT_TRACE").is_some()
+}
+
+fn pane_font_trace_stack(label: &str) {
+    if std::env::var_os("WEZTERM_PANE_FONT_TRACE_STACKS").is_some() {
+        log::info!(
+            target: "pane_font_trace",
+            "{label} stack:\n{}",
+            std::backtrace::Backtrace::force_capture()
+        );
+    }
 }
 
 #[derive(Clone)]
@@ -59,6 +81,7 @@ pub struct Client {
     client_domain_config: ClientDomainConfig,
     pub is_reconnectable: bool,
     pub is_local: bool,
+    connected: Arc<AtomicBool>,
 }
 
 #[derive(Error, Debug, Clone, PartialEq, Eq)]
@@ -375,6 +398,8 @@ async fn client_thread_async(
     local_domain_id: Option<DomainId>,
     rx: &mut Receiver<ReaderMessage>,
 ) -> anyhow::Result<()> {
+    const MAX_OUTBOUND_DRAIN_PER_TURN: usize = 32;
+
     let mut next_serial = 1u64;
 
     struct Promises {
@@ -402,25 +427,128 @@ async fn client_thread_async(
     let mut stream = reconnectable.take_stream().unwrap();
 
     loop {
+        for _ in 0..MAX_OUTBOUND_DRAIN_PER_TURN {
+            let Ok(msg) = rx.try_recv() else {
+                break;
+            };
+            match msg {
+                ReaderMessage::SendPdu { pdu, promise } => {
+                    let serial = next_serial;
+                    next_serial += 1;
+                    let pdu_name = pdu.pdu_name();
+                    if std::env::var_os("WEZTERM_PANE_FONT_TRACE").is_some()
+                        && matches!(pdu, Pdu::ResizePanes(_))
+                    {
+                        log::info!(target: "pane_font_trace", "client send-pdu serial={serial} {pdu_name}");
+                    }
+                    promises.map.insert(serial, promise);
+
+                    pdu.encode_async(&mut stream, serial)
+                        .await
+                        .context("encoding a PDU to send to the server")?;
+                    stream.flush().await.context("flushing PDU to server")?;
+                    if std::env::var_os("WEZTERM_PANE_FONT_TRACE").is_some()
+                        && pdu_name == "ResizePanes"
+                    {
+                        log::info!(target: "pane_font_trace", "client sent-pdu serial={serial} {pdu_name}");
+                    }
+                }
+                ReaderMessage::SendPduNoResponse { pdu } => {
+                    let pdu_name = pdu.pdu_name();
+                    if pane_font_trace_enabled() && matches!(pdu, Pdu::ResizePanes(_)) {
+                        log::info!(target: "pane_font_trace", "client send-pdu serial=0 {pdu_name}");
+                        pane_font_trace_stack("client send-pdu-no-response");
+                    }
+
+                    pdu.encode_async(&mut stream, 0)
+                        .await
+                        .context("encoding a one-way PDU to send to the server")?;
+                    stream
+                        .flush()
+                        .await
+                        .context("flushing one-way PDU to server")?;
+                    if pane_font_trace_enabled() && pdu_name == "ResizePanes" {
+                        log::info!(target: "pane_font_trace", "client sent-pdu serial=0 {pdu_name}");
+                    }
+                }
+                ReaderMessage::Readable => break,
+                ReaderMessage::Tick => continue,
+            }
+        }
+
         let rx_msg = rx.recv();
         let wait_for_read = stream
             .wait_for_readable()
             .map(|_| Ok(ReaderMessage::Readable));
-
-        match smol::future::or(rx_msg, wait_for_read).await {
+        let wake_for_write_drain =
+            futures::FutureExt::map(smol::Timer::after(Duration::from_millis(16)), |_| {
+                Ok(ReaderMessage::Tick)
+            });
+        match smol::future::or(
+            wait_for_read,
+            smol::future::or(rx_msg, wake_for_write_drain),
+        )
+        .await
+        {
             Ok(ReaderMessage::SendPdu { pdu, promise }) => {
                 let serial = next_serial;
                 next_serial += 1;
+                let pdu_name = pdu.pdu_name();
+                if std::env::var_os("WEZTERM_PANE_FONT_TRACE").is_some()
+                    && matches!(pdu, Pdu::ResizePanes(_))
+                {
+                    log::info!(target: "pane_font_trace", "client send-pdu serial={serial} {pdu_name}");
+                }
                 promises.map.insert(serial, promise);
 
                 pdu.encode_async(&mut stream, serial)
                     .await
                     .context("encoding a PDU to send to the server")?;
                 stream.flush().await.context("flushing PDU to server")?;
+                if std::env::var_os("WEZTERM_PANE_FONT_TRACE").is_some()
+                    && pdu_name == "ResizePanes"
+                {
+                    log::info!(target: "pane_font_trace", "client sent-pdu serial={serial} {pdu_name}");
+                }
+            }
+            Ok(ReaderMessage::SendPduNoResponse { pdu }) => {
+                let pdu_name = pdu.pdu_name();
+                if pane_font_trace_enabled() && matches!(pdu, Pdu::ResizePanes(_)) {
+                    log::info!(target: "pane_font_trace", "client send-pdu serial=0 {pdu_name}");
+                    pane_font_trace_stack("client send-pdu-no-response");
+                }
+
+                pdu.encode_async(&mut stream, 0)
+                    .await
+                    .context("encoding a one-way PDU to send to the server")?;
+                stream
+                    .flush()
+                    .await
+                    .context("flushing one-way PDU to server")?;
+                if pane_font_trace_enabled() && pdu_name == "ResizePanes" {
+                    log::info!(target: "pane_font_trace", "client sent-pdu serial=0 {pdu_name}");
+                }
             }
             Ok(ReaderMessage::Readable) => {
+                if pane_font_trace_enabled() {
+                    log::info!(
+                        target: "pane_font_trace",
+                        "client decode-start next_serial={} promises={}",
+                        next_serial,
+                        promises.map.len()
+                    );
+                }
                 match Pdu::decode_async(&mut stream, Some(next_serial)).await {
                     Ok(decoded) => {
+                        if pane_font_trace_enabled() {
+                            log::info!(
+                                target: "pane_font_trace",
+                                "client decode-done serial={} {} promises={}",
+                                decoded.serial,
+                                decoded.pdu.pdu_name(),
+                                promises.map.len()
+                            );
+                        }
                         log::debug!(
                             "decoded serial {} {}",
                             decoded.serial,
@@ -435,7 +563,10 @@ async fn client_thread_async(
                                 })?;
                         } else if let Some(promise) = promises.map.remove(&decoded.serial) {
                             if promise.try_send(Ok(decoded.pdu)).is_err() {
-                                return Err(NotReconnectableError::ClientWasDestroyed.into());
+                                log::trace!(
+                                    "dropping response for abandoned rpc serial {}",
+                                    decoded.serial
+                                );
                             }
                         } else {
                             let reason =
@@ -452,6 +583,7 @@ async fn client_thread_async(
                     }
                 }
             }
+            Ok(ReaderMessage::Tick) => {}
             Err(_) => {
                 return Err(NotReconnectableError::ClientWasDestroyed.into());
             }
@@ -656,10 +788,11 @@ impl Reconnectable {
 
     fn reconnectable(&mut self) -> bool {
         match &self.config {
-            // It doesn't make sense to reconnect to a unix socket; we only
-            // get disconnected it it dies, so respawning it would not preserve
-            // the set of tabs and we'd have confusing and inconsistent state
-            ClientDomainConfig::Unix(_) => false,
+            // Unix mux reconnects are useful when the socket transport is
+            // interrupted but the server is still alive. Reconnect attempts do
+            // not auto-start a replacement server, so we don't silently attach
+            // to a different mux with different tabs.
+            ClientDomainConfig::Unix(_) => true,
             ClientDomainConfig::Tls(_) => true,
             // It *does* make sense to reconnect with an ssh session, but we
             // need to grow some smarts about whether the disconnect was because
@@ -1069,6 +1202,18 @@ impl Client {
         let is_local = reconnectable.is_local();
         let (sender, mut receiver) = unbounded();
         let client_id = ClientId::new();
+        let connected = Arc::new(AtomicBool::new(true));
+        let thread_connected = Arc::clone(&connected);
+        let tick_sender = sender.clone();
+
+        if reconnectable.reconnectable() {
+            thread::spawn(move || loop {
+                thread::sleep(Duration::from_millis(16));
+                if tick_sender.try_send(ReaderMessage::Tick).is_err() {
+                    break;
+                }
+            });
+        }
 
         thread::spawn(move || {
             const BASE_INTERVAL: Duration = Duration::from_secs(1);
@@ -1077,6 +1222,7 @@ impl Client {
             let mut backoff = BASE_INTERVAL;
             loop {
                 if let Err(e) = client_thread(&mut reconnectable, local_domain_id, &mut receiver) {
+                    thread_connected.store(false, Ordering::SeqCst);
                     if !reconnectable.reconnectable() || local_domain_id.is_none() {
                         log::debug!("client thread ended: {}", e);
                         break;
@@ -1111,6 +1257,7 @@ impl Client {
                         match reconnectable.connect(initial, &mut ui, no_auto_start) {
                             Ok(_) => {
                                 backoff = BASE_INTERVAL;
+                                thread_connected.store(true, Ordering::SeqCst);
                                 log::error!("Reconnected!");
                                 promise::spawn::spawn_into_main_thread(async move {
                                     ClientDomain::reattach(local_domain_id, ui).await.ok();
@@ -1163,11 +1310,16 @@ impl Client {
             is_local,
             client_id,
             client_domain_config,
+            connected,
         }
     }
 
     pub fn into_client_domain_config(self) -> ClientDomainConfig {
         self.client_domain_config
+    }
+
+    pub fn is_connected(&self) -> bool {
+        self.connected.load(Ordering::SeqCst)
     }
 
     pub async fn verify_version_compat(
@@ -1336,6 +1488,32 @@ impl Client {
         rx.recv().await.context("send_pdu recv")?
     }
 
+    pub fn send_pdu_no_response(&self, pdu: Pdu) -> anyhow::Result<()> {
+        let pdu_name = pdu.pdu_name();
+        if pane_font_trace_enabled() {
+            log::info!(target: "pane_font_trace", "client queue-pdu-no-response {pdu_name}");
+            pane_font_trace_stack("client queue-pdu-no-response");
+        }
+        let result = self
+            .sender
+            .send_blocking(ReaderMessage::SendPduNoResponse { pdu })
+            .map_err(|_| ChannelSendError)
+            .context("send_pdu_no_response send");
+        if pane_font_trace_enabled() {
+            match &result {
+                Ok(()) => log::info!(
+                    target: "pane_font_trace",
+                    "client queued-pdu-no-response {pdu_name}"
+                ),
+                Err(err) => log::error!(
+                    target: "pane_font_trace",
+                    "client queue-pdu-no-response failed {pdu_name}: {err:#}"
+                ),
+            }
+        }
+        result
+    }
+
     pub async fn resolve_pane_id(&self, pane_id: Option<PaneId>) -> anyhow::Result<PaneId> {
         let pane_id: PaneId = match pane_id {
             Some(p) => p,
@@ -1377,6 +1555,7 @@ impl Client {
     rpc!(key_down, SendKeyDown, UnitResponse);
     rpc!(mouse_event, SendMouseEvent, UnitResponse);
     rpc!(resize, Resize, UnitResponse);
+    rpc!(resize_panes, ResizePanes, UnitResponse);
     rpc!(set_pane_font_scale, SetPaneFontScale, UnitResponse);
     rpc!(set_zoomed, SetPaneZoomed, UnitResponse);
     rpc!(activate_pane_direction, ActivatePaneDirection, UnitResponse);

@@ -1,17 +1,24 @@
 use crate::resize_increment_calculator::ResizeIncrementCalculator;
 use crate::utilsprites::RenderMetrics;
 use ::window::{Dimensions, ResizeIncrement, Window, WindowOps, WindowState};
+use codec::ResizePane;
 use config::{ConfigHandle, DimensionContext};
 use mux::{
     pane::{normalize_font_scale, Pane, PaneId},
     tab::{PositionedPane, Tab},
+    window::WindowId as MuxWindowId,
     Mux,
 };
 use ordered_float::NotNan;
+use std::collections::HashSet;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex};
+use std::time::Duration;
 use wezterm_font::FontConfiguration;
 use wezterm_term::TerminalSize;
+
+static CONNECTED_TAB_RESIZE_FLUSHES: LazyLock<Mutex<HashSet<MuxWindowId>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
 
 #[derive(Debug, Clone, Copy)]
 pub struct RowsAndCols {
@@ -23,6 +30,56 @@ pub struct RowsAndCols {
 pub enum ScaleChange {
     Absolute(f64),
     Relative(f64),
+}
+
+fn pane_font_trace_enabled() -> bool {
+    std::env::var_os("WEZTERM_PANE_FONT_TRACE").is_some()
+}
+
+fn connected_tab_resize_has_pending(mux_window_id: MuxWindowId) -> bool {
+    let Some(tab) = Mux::get().get_active_tab_for_window(mux_window_id) else {
+        return false;
+    };
+
+    tab.iter_panes_ignoring_zoom().into_iter().any(|pos| {
+        pos.pane
+            .downcast_ref::<wezterm_client::pane::ClientPane>()
+            .is_some_and(|client_pane| client_pane.has_pending_resize())
+    })
+}
+
+fn take_connected_tab_resize_batch(
+    mux_window_id: MuxWindowId,
+    preserve_split: bool,
+) -> Option<(Arc<dyn Pane>, Vec<ResizePane>)> {
+    let tab = Mux::get().get_active_tab_for_window(mux_window_id)?;
+
+    let mut batch = vec![];
+    let mut batch_sender = None;
+
+    for pane in tab
+        .iter_panes_ignoring_zoom()
+        .into_iter()
+        .filter_map(|pos| {
+            let pane = Arc::clone(&pos.pane);
+            if let Some(client_pane) = pane.downcast_ref::<wezterm_client::pane::ClientPane>() {
+                client_pane.has_pending_resize().then_some(pane)
+            } else {
+                None
+            }
+        })
+    {
+        if let Some(client_pane) = pane.downcast_ref::<wezterm_client::pane::ClientPane>() {
+            if batch_sender.is_none() {
+                batch_sender = Some(Arc::clone(&pane));
+            }
+            if let Some(resize) = client_pane.take_pending_resize_for_tab_sync(preserve_split) {
+                batch.push(resize);
+            }
+        }
+    }
+
+    batch_sender.map(|sender| (sender, batch))
 }
 
 impl super::TermWindow {
@@ -302,10 +359,11 @@ impl super::TermWindow {
         let mux = Mux::get();
         if let Some(window) = mux.get_window(self.mux_window_id) {
             for tab in window.iter() {
-                tab.resize(size);
+                tab.resize_preserving_split(size);
                 self.resize_tab_panes_for_font_scale(&tab);
             }
         };
+        self.flush_connected_tab_resize(true);
         self.resize_overlays();
         self.invalidate_fancy_tab_bar();
         self.update_title();
@@ -567,6 +625,41 @@ impl super::TermWindow {
         let font_scale = self.pane_font_scale(pos.pane.pane_id());
         let size = self.pane_size_for_font_scale(pos.pixel_width, pos.pixel_height, font_scale)?;
         let dims = pos.pane.get_dimensions();
+        let is_client = pos
+            .pane
+            .downcast_ref::<wezterm_client::pane::ClientPane>()
+            .is_some();
+
+        if pane_font_trace_enabled() {
+            log::info!(
+                target: "pane_font_trace",
+                "gui resize-check pane={} idx={} active={} zoomed={} client={} rect_cells={}x{}+{}+{} rect_px={}x{}+{}+{} font_scale={:.3} actual={}x{} px={}x{} dpi={} computed={}x{} px={}x{} dpi={}",
+                pos.pane.pane_id(),
+                pos.index,
+                pos.is_active,
+                pos.is_zoomed,
+                is_client,
+                pos.width,
+                pos.height,
+                pos.left,
+                pos.top,
+                pos.pixel_width,
+                pos.pixel_height,
+                pos.pixel_left,
+                pos.pixel_top,
+                font_scale,
+                dims.cols,
+                dims.viewport_rows,
+                dims.pixel_width,
+                dims.pixel_height,
+                dims.dpi,
+                size.cols,
+                size.rows,
+                size.pixel_width,
+                size.pixel_height,
+                size.dpi,
+            );
+        }
 
         if dims.cols == size.cols
             && dims.viewport_rows == size.rows
@@ -578,8 +671,30 @@ impl super::TermWindow {
         }
 
         if let Some(client_pane) = pos.pane.downcast_ref::<wezterm_client::pane::ClientPane>() {
+            if pane_font_trace_enabled() {
+                log::info!(
+                    target: "pane_font_trace",
+                    "gui resize-apply client pane={} size={}x{} px={}x{} preserve_split=true",
+                    pos.pane.pane_id(),
+                    size.cols,
+                    size.rows,
+                    size.pixel_width,
+                    size.pixel_height,
+                );
+            }
             client_pane.resize_preserving_split(size)?;
         } else {
+            if pane_font_trace_enabled() {
+                log::info!(
+                    target: "pane_font_trace",
+                    "gui resize-apply local pane={} size={}x{} px={}x{}",
+                    pos.pane.pane_id(),
+                    size.cols,
+                    size.rows,
+                    size.pixel_width,
+                    size.pixel_height,
+                );
+            }
             pos.pane.resize(size)?;
         }
         Ok(true)
@@ -635,6 +750,78 @@ impl super::TermWindow {
             return;
         };
         self.resize_tab_panes_for_font_scale(&tab);
+    }
+
+    pub(crate) fn flush_connected_tab_resize(&self, preserve_split: bool) {
+        if !connected_tab_resize_has_pending(self.mux_window_id) {
+            return;
+        }
+
+        let mux_window_id = self.mux_window_id;
+        if !CONNECTED_TAB_RESIZE_FLUSHES
+            .lock()
+            .expect("CONNECTED_TAB_RESIZE_FLUSHES mutex poisoned")
+            .insert(mux_window_id)
+        {
+            return;
+        }
+
+        if pane_font_trace_enabled() {
+            log::info!(
+                target: "pane_font_trace",
+                "gui flush-task spawn window={} preserve_split={}",
+                mux_window_id,
+                preserve_split
+            );
+            if std::env::var_os("WEZTERM_PANE_FONT_TRACE_STACKS").is_some() {
+                log::info!(
+                    target: "pane_font_trace",
+                    "gui flush-task spawn stack:\n{}",
+                    std::backtrace::Backtrace::force_capture()
+                );
+            }
+        }
+
+        promise::spawn::spawn(async move {
+            loop {
+                smol::Timer::after(Duration::from_millis(16)).await;
+
+                let Some((batch_sender, batch)) =
+                    take_connected_tab_resize_batch(mux_window_id, preserve_split)
+                else {
+                    break;
+                };
+
+                if pane_font_trace_enabled() {
+                    log::info!(
+                        target: "pane_font_trace",
+                        "gui flush-task begin window={} panes={}",
+                        mux_window_id,
+                        batch.len()
+                    );
+                }
+
+                if let Some(client_pane) =
+                    batch_sender.downcast_ref::<wezterm_client::pane::ClientPane>()
+                {
+                    if let Err(err) = client_pane.flush_pending_tab_resize_now(batch).await {
+                        log::error!("failed to flush final tab resize batch: {err:#}");
+                    } else if pane_font_trace_enabled() {
+                        log::info!(target: "pane_font_trace", "gui flush-task done");
+                    }
+                } else if pane_font_trace_enabled() {
+                    log::error!(target: "pane_font_trace", "gui flush-task no client pane sender");
+                }
+            }
+
+            CONNECTED_TAB_RESIZE_FLUSHES
+                .lock()
+                .expect("CONNECTED_TAB_RESIZE_FLUSHES mutex poisoned")
+                .remove(&mux_window_id);
+
+            Ok::<(), anyhow::Error>(())
+        })
+        .detach();
     }
 
     pub fn sync_tab_pane_font_scales_from_mux(&mut self, tab_id: mux::tab::TabId) {
@@ -705,6 +892,7 @@ impl super::TermWindow {
             );
         }
         self.resize_active_tab_panes_for_font_scale();
+        self.flush_connected_tab_resize(true);
 
         self.shape_generation += 1;
         self.shape_cache.borrow_mut().clear();
