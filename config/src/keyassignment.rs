@@ -554,6 +554,7 @@ pub enum KeyAssignment {
     ResetFontSize,
     IncreaseAllPaneFontSize,
     DecreaseAllPaneFontSize,
+    ResetAllPaneFontSize,
     IncreasePaneFontSize,
     DecreasePaneFontSize,
     ResetPaneFontSize,
