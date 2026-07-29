@@ -916,7 +916,7 @@ impl super::TermWindow {
         self.invalidate_pane_font_scale_outputs();
     }
 
-    fn update_all_pane_font_sizes_in_current_window(
+    fn update_window_pane_font_sizes(
         &mut self,
         scale_for_pane: impl Fn(&Self, PaneId) -> Option<f64>,
     ) {
@@ -950,8 +950,8 @@ impl super::TermWindow {
         self.invalidate_pane_font_scale_outputs();
     }
 
-    fn adjust_all_pane_font_sizes(&mut self, factor: f64) {
-        self.update_all_pane_font_sizes_in_current_window(|this, pane_id| {
+    fn adjust_window_pane_font_sizes(&mut self, factor: f64) {
+        self.update_window_pane_font_sizes(|this, pane_id| {
             Some(this.pane_font_scale(pane_id) * factor)
         });
     }
@@ -968,16 +968,16 @@ impl super::TermWindow {
         self.set_pane_font_scale(pane, None);
     }
 
-    pub fn decrease_all_pane_font_size(&mut self) {
-        self.adjust_all_pane_font_sizes(1.0 / 1.1);
+    pub fn decrease_window_pane_font_size(&mut self) {
+        self.adjust_window_pane_font_sizes(1.0 / 1.1);
     }
 
-    pub fn increase_all_pane_font_size(&mut self) {
-        self.adjust_all_pane_font_sizes(1.1);
+    pub fn increase_window_pane_font_size(&mut self) {
+        self.adjust_window_pane_font_sizes(1.1);
     }
 
-    pub fn reset_all_pane_font_size(&mut self) {
-        self.update_all_pane_font_sizes_in_current_window(|_, _| None);
+    pub fn reset_window_pane_font_size(&mut self) {
+        self.update_window_pane_font_sizes(|_, _| None);
     }
 
     pub fn set_window_size(&mut self, size: TerminalSize, window: &Window) -> anyhow::Result<()> {

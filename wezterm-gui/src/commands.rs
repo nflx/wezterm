@@ -912,9 +912,9 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             menubar: &["View", "Font Size"],
             icon: Some("md_format_size"),
         },
-        DecreaseAllPaneFontSize => CommandDef {
-            brief: "Decrease all pane font sizes".into(),
-            doc: "Scales all pane font sizes in this window smaller by 10%, preserving pane-specific differences".into(),
+        DecreaseWindowPaneFontSize => CommandDef {
+            brief: "Decrease window pane font sizes".into(),
+            doc: "Scales pane-specific font size overrides in this window smaller by 10%, preserving pane-specific differences".into(),
             keys: vec![],
             args: &[ArgType::ActiveWindow],
             menubar: &["View", "Font Size"],
@@ -939,9 +939,9 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             menubar: &["View", "Font Size"],
             icon: Some("md_format_size"),
         },
-        IncreaseAllPaneFontSize => CommandDef {
-            brief: "Increase all pane font sizes".into(),
-            doc: "Scales all pane font sizes in this window larger by 10%, preserving pane-specific differences".into(),
+        IncreaseWindowPaneFontSize => CommandDef {
+            brief: "Increase window pane font sizes".into(),
+            doc: "Scales pane-specific font size overrides in this window larger by 10%, preserving pane-specific differences".into(),
             keys: vec![],
             args: &[ArgType::ActiveWindow],
             menubar: &["View", "Font Size"],
@@ -966,8 +966,8 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             menubar: &["View", "Font Size"],
             icon: Some("md_format_size"),
         },
-        ResetAllPaneFontSize => CommandDef {
-            brief: "Reset all pane font sizes".into(),
+        ResetWindowPaneFontSize => CommandDef {
+            brief: "Reset window pane font sizes".into(),
             doc: "Clears pane-specific font size overrides in this window".into(),
             keys: vec![],
             args: &[ArgType::ActiveWindow],
@@ -2106,9 +2106,9 @@ fn compute_default_actions() -> Vec<KeyAssignment> {
         DecreaseFontSize,
         IncreaseFontSize,
         ResetFontSize,
-        DecreaseAllPaneFontSize,
-        IncreaseAllPaneFontSize,
-        ResetAllPaneFontSize,
+        DecreaseWindowPaneFontSize,
+        IncreaseWindowPaneFontSize,
+        ResetWindowPaneFontSize,
         DecreasePaneFontSize,
         IncreasePaneFontSize,
         ResetPaneFontSize,
