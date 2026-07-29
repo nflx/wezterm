@@ -966,6 +966,14 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             menubar: &["View", "Font Size"],
             icon: Some("md_format_size"),
         },
+        ResetAllPaneFontSize => CommandDef {
+            brief: "Reset all pane font sizes".into(),
+            doc: "Clears pane-specific font size overrides in this window".into(),
+            keys: vec![],
+            args: &[ArgType::ActiveWindow],
+            menubar: &["View", "Font Size"],
+            icon: Some("md_format_size"),
+        },
         ResetPaneFontSize => CommandDef {
             brief: "Reset pane font size".into(),
             doc: "Restores the active pane font size to match your configuration file".into(),
@@ -2100,6 +2108,7 @@ fn compute_default_actions() -> Vec<KeyAssignment> {
         ResetFontSize,
         DecreaseAllPaneFontSize,
         IncreaseAllPaneFontSize,
+        ResetAllPaneFontSize,
         DecreasePaneFontSize,
         IncreasePaneFontSize,
         ResetPaneFontSize,
