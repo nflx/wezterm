@@ -13,8 +13,8 @@ impl crate::TermWindow {
     ) -> anyhow::Result<()> {
         let palette = pane.palette();
         let foreground = palette.split.to_linear();
-        let cell_width = self.render_metrics.cell_size.width as f32;
-        let cell_height = self.render_metrics.cell_size.height as f32;
+        let divider_width = split.divider_pixel_width as f32;
+        let divider_height = split.divider_pixel_height as f32;
 
         let border = self.get_os_border();
         let first_row_offset = if self.show_tab_bar && !self.config.tab_bar_at_bottom {
@@ -33,16 +33,16 @@ impl crate::TermWindow {
                 layers,
                 2,
                 euclid::rect(
-                    pos_x + (cell_width / 2.0),
-                    pos_y - (cell_height / 2.0),
+                    pos_x + (divider_width / 2.0),
+                    pos_y - (divider_height / 2.0),
                     self.render_metrics.underline_height as f32,
-                    split.pixel_size as f32 + cell_height,
+                    split.pixel_size as f32 + divider_height,
                 ),
                 foreground,
             )?;
             self.ui_items.push(UIItem {
                 x: border.left.get() as usize + padding_left as usize + split.pixel_left,
-                width: cell_width as usize,
+                width: split.divider_pixel_width,
                 y: padding_top as usize + first_row_offset as usize + split.pixel_top,
                 height: split.pixel_size,
                 item_type: UIItemType::Split(split.clone()),
@@ -52,9 +52,9 @@ impl crate::TermWindow {
                 layers,
                 2,
                 euclid::rect(
-                    pos_x - (cell_width / 2.0),
-                    pos_y + (cell_height / 2.0),
-                    split.pixel_size as f32 + cell_width,
+                    pos_x - (divider_width / 2.0),
+                    pos_y + (divider_height / 2.0),
+                    split.pixel_size as f32 + divider_width,
                     self.render_metrics.underline_height as f32,
                 ),
                 foreground,
@@ -63,7 +63,7 @@ impl crate::TermWindow {
                 x: border.left.get() as usize + padding_left as usize + split.pixel_left,
                 width: split.pixel_size,
                 y: padding_top as usize + first_row_offset as usize + split.pixel_top,
-                height: cell_height as usize,
+                height: split.divider_pixel_height,
                 item_type: UIItemType::Split(split.clone()),
             });
         }
