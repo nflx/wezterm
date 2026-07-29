@@ -677,7 +677,12 @@ fn resize_tree_to_size(tree: &mut Tree, size: &TerminalSize, cell_dimensions: &T
     }
 }
 
-fn apply_sizes_from_splits_impl(tree: &Tree, size: &TerminalSize, preserve_split: bool) {
+fn apply_sizes_from_splits_impl(
+    tree: &Tree,
+    size: &TerminalSize,
+    preserve_split: bool,
+    defer_preserve_split: bool,
+) {
     match tree {
         Tree::Empty => return,
         Tree::Node { data: None, .. } => return,
@@ -686,12 +691,21 @@ fn apply_sizes_from_splits_impl(tree: &Tree, size: &TerminalSize, preserve_split
             right,
             data: Some(data),
         } => {
-            apply_sizes_from_splits_impl(&*left, &data.first, preserve_split);
-            apply_sizes_from_splits_impl(&*right, &data.second, preserve_split);
+            apply_sizes_from_splits_impl(&*left, &data.first, preserve_split, defer_preserve_split);
+            apply_sizes_from_splits_impl(
+                &*right,
+                &data.second,
+                preserve_split,
+                defer_preserve_split,
+            );
         }
         Tree::Leaf(pane) => {
             if preserve_split {
-                pane.resize_preserving_split(*size).ok();
+                if defer_preserve_split {
+                    pane.resize_preserving_split_for_split_drag(*size).ok();
+                } else {
+                    pane.resize_preserving_split(*size).ok();
+                }
             } else {
                 pane.resize(*size).ok();
             }
@@ -700,11 +714,15 @@ fn apply_sizes_from_splits_impl(tree: &Tree, size: &TerminalSize, preserve_split
 }
 
 fn apply_sizes_from_splits(tree: &Tree, size: &TerminalSize) {
-    apply_sizes_from_splits_impl(tree, size, false);
+    apply_sizes_from_splits_impl(tree, size, false, false);
 }
 
 fn apply_sizes_from_splits_preserving_split(tree: &Tree, size: &TerminalSize) {
-    apply_sizes_from_splits_impl(tree, size, true);
+    apply_sizes_from_splits_impl(tree, size, true, false);
+}
+
+fn apply_sizes_from_splits_preserving_split_for_split_drag(tree: &Tree, size: &TerminalSize) {
+    apply_sizes_from_splits_impl(tree, size, true, true);
 }
 
 fn cell_dimensions(size: &TerminalSize) -> TerminalSize {
@@ -822,6 +840,10 @@ impl Tab {
         self.inner.lock().resize(size)
     }
 
+    pub fn resize_preserving_split(&self, size: TerminalSize) {
+        self.inner.lock().resize_preserving_split(size)
+    }
+
     /// Called when running in the mux server after an individual pane
     /// has been resized.
     /// Because the split manipulation happened on the GUI we "lost"
@@ -838,7 +860,13 @@ impl Tab {
     pub fn rebuild_splits_sizes_from_contained_panes(&self) {
         self.inner
             .lock()
-            .rebuild_splits_sizes_from_contained_panes()
+            .rebuild_splits_sizes_from_contained_panes(true)
+    }
+
+    pub fn rebuild_splits_sizes_from_contained_panes_silently(&self) {
+        self.inner
+            .lock()
+            .rebuild_splits_sizes_from_contained_panes(false)
     }
 
     /// Given split_index, the topological index of a split returned by
@@ -849,6 +877,12 @@ impl Tab {
     /// their panes are resized accordingly.
     pub fn resize_split_by(&self, split_index: usize, delta: isize) {
         self.inner.lock().resize_split_by(split_index, delta)
+    }
+
+    pub fn resize_split_by_preserving_split(&self, split_index: usize, delta: isize) {
+        self.inner
+            .lock()
+            .resize_split_by_preserving_split(split_index, delta)
     }
 
     /// Adjusts the size of the active pane in the specified direction
@@ -1404,6 +1438,10 @@ impl TabInner {
         self.resize_impl(size, false);
     }
 
+    fn resize_preserving_split(&mut self, size: TerminalSize) {
+        self.resize_impl(size, true);
+    }
+
     fn resize_impl(&mut self, size: TerminalSize, preserve_split: bool) {
         if size.rows == 0 || size.cols == 0 {
             // Ignore "impossible" resize requests
@@ -1433,7 +1471,7 @@ impl TabInner {
             self.size = size;
 
             // And then resize the individual panes to match
-            apply_sizes_from_splits_impl(self.pane.as_mut().unwrap(), &size, preserve_split);
+            apply_sizes_from_splits_impl(self.pane.as_mut().unwrap(), &size, preserve_split, false);
         }
 
         Mux::try_get().map(|mux| mux.notify(MuxNotification::TabResized(self.id)));
@@ -1449,31 +1487,57 @@ impl TabInner {
             .checked_div(pane_size.rows)
             .unwrap_or(1);
         if let Ok(Some(node)) = cursor.node_mut() {
-            // Adjust the size of the node; we preserve the size of the first
-            // child and adjust the second, so if we are split down the middle
-            // and the window is made wider, the right column will grow in
-            // size, leaving the left at its current width.
             if node.direction == SplitDirection::Horizontal {
-                node.first.rows = pane_size.rows;
-                node.second.rows = pane_size.rows;
+                let (first_cols, second_cols) = split_child_lengths(
+                    pane_size.cols,
+                    node.preferred_first_axis_size(),
+                    node.preferred_second_axis_size(),
+                    1,
+                    1,
+                );
 
-                node.second.cols = pane_size.cols.saturating_sub(1 + node.first.cols);
+                node.first = terminal_size_with_pixels(
+                    pane_size.rows,
+                    first_cols,
+                    pane_size.pixel_height,
+                    first_cols * cell_width,
+                    pane_size.dpi,
+                );
+                node.second = terminal_size_with_pixels(
+                    pane_size.rows,
+                    second_cols,
+                    pane_size.pixel_height,
+                    second_cols * cell_width,
+                    pane_size.dpi,
+                );
             } else {
-                node.first.cols = pane_size.cols;
-                node.second.cols = pane_size.cols;
+                let (first_rows, second_rows) = split_child_lengths(
+                    pane_size.rows,
+                    node.preferred_first_axis_size(),
+                    node.preferred_second_axis_size(),
+                    1,
+                    1,
+                );
 
-                node.second.rows = pane_size.rows.saturating_sub(1 + node.first.rows);
+                node.first = terminal_size_with_pixels(
+                    first_rows,
+                    pane_size.cols,
+                    first_rows * cell_height,
+                    pane_size.pixel_width,
+                    pane_size.dpi,
+                );
+                node.second = terminal_size_with_pixels(
+                    second_rows,
+                    pane_size.cols,
+                    second_rows * cell_height,
+                    pane_size.pixel_width,
+                    pane_size.dpi,
+                );
             }
-            node.set_preferred_from_current();
-            node.first.pixel_width = node.first.cols * cell_width;
-            node.first.pixel_height = node.first.rows * cell_height;
-
-            node.second.pixel_width = node.second.cols * cell_width;
-            node.second.pixel_height = node.second.rows * cell_height;
         }
     }
 
-    fn rebuild_splits_sizes_from_contained_panes(&mut self) {
+    fn rebuild_splits_sizes_from_contained_panes(&mut self, notify: bool) {
         if self.zoomed.is_some() {
             return;
         }
@@ -1500,7 +1564,6 @@ impl TabInner {
                         if let Some(second) = compute_size(right) {
                             data.second = second;
                         }
-                        data.set_preferred_from_current();
                         Some(data.size())
                     } else {
                         None
@@ -1514,10 +1577,20 @@ impl TabInner {
                 self.size = size;
             }
         }
-        Mux::try_get().map(|mux| mux.notify(MuxNotification::TabResized(self.id)));
+        if notify {
+            Mux::try_get().map(|mux| mux.notify(MuxNotification::TabResized(self.id)));
+        }
     }
 
     fn resize_split_by(&mut self, split_index: usize, delta: isize) {
+        self.resize_split_by_impl(split_index, delta, false)
+    }
+
+    fn resize_split_by_preserving_split(&mut self, split_index: usize, delta: isize) {
+        self.resize_split_by_impl(split_index, delta, true)
+    }
+
+    fn resize_split_by_impl(&mut self, split_index: usize, delta: isize, preserve_split: bool) {
         if self.zoomed.is_some() {
             return;
         }
@@ -1529,7 +1602,11 @@ impl TabInner {
             {
                 return;
             }
-            apply_sizes_from_splits(root, &self.size);
+            if preserve_split {
+                apply_sizes_from_splits_preserving_split_for_split_drag(root, &self.size);
+            } else {
+                apply_sizes_from_splits(root, &self.size);
+            }
             Mux::try_get().map(|mux| mux.notify(MuxNotification::TabResized(self.id)));
         }
     }
@@ -1576,16 +1653,18 @@ impl TabInner {
                         let old_first = node.first;
                         let old_second = node.second;
 
-                        let mut cols = node.first.cols as isize;
-                        cols = cols.saturating_add(delta).max(first_min as isize).min(
-                            (width as isize)
-                                .saturating_sub(second_min as isize)
-                                .saturating_sub(1),
-                        );
+                        let requested_cols = (node.first.cols as isize).saturating_add(delta);
+                        let min_cols = first_min as isize;
+                        let max_cols = (width as isize)
+                            .saturating_sub(second_min as isize)
+                            .saturating_sub(1);
+                        let cols = requested_cols.max(min_cols).min(max_cols);
                         node.first.cols = cols as usize;
 
                         node.second.cols = width.saturating_sub(node.first.cols.saturating_add(1));
-                        node.set_preferred_from_current();
+                        if requested_cols == cols {
+                            node.set_preferred_from_current();
+                        }
 
                         let (first_pixel_width, second_pixel_width) = split_child_pixels(
                             pixel_width,
@@ -1611,16 +1690,18 @@ impl TabInner {
                         let old_first = node.first;
                         let old_second = node.second;
 
-                        let mut rows = node.first.rows as isize;
-                        rows = rows.saturating_add(delta).max(first_min as isize).min(
-                            (height as isize)
-                                .saturating_sub(second_min as isize)
-                                .saturating_sub(1),
-                        );
+                        let requested_rows = (node.first.rows as isize).saturating_add(delta);
+                        let min_rows = first_min as isize;
+                        let max_rows = (height as isize)
+                            .saturating_sub(second_min as isize)
+                            .saturating_sub(1);
+                        let rows = requested_rows.max(min_rows).min(max_rows);
                         node.first.rows = rows as usize;
 
                         node.second.rows = height.saturating_sub(node.first.rows.saturating_add(1));
-                        node.set_preferred_from_current();
+                        if requested_rows == rows {
+                            node.set_preferred_from_current();
+                        }
 
                         let (first_pixel_height, second_pixel_height) = split_child_pixels(
                             pixel_height,
@@ -3027,6 +3108,86 @@ mod test {
             33,
             nested_widths.iter().sum::<usize>(),
             "nested pane widths should retain the restored parent space: {:?}",
+            nested_widths,
+        );
+    }
+
+    #[test]
+    fn rebuild_does_not_make_squeezed_nested_sizes_preferred() {
+        let size = TerminalSize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 800,
+            pixel_height: 600,
+            dpi: 96,
+        };
+
+        let tab = Tab::new(&size);
+        tab.assign_pane(&FakePane::new(1, size));
+
+        split_pane(&tab, 0, 2, SplitDirection::Horizontal).unwrap();
+        split_pane(&tab, 1, 3, SplitDirection::Horizontal).unwrap();
+        split_pane(&tab, 2, 4, SplitDirection::Horizontal).unwrap();
+
+        tab.resize_split_by(0, 1000);
+        tab.rebuild_splits_sizes_from_contained_panes();
+
+        for _ in 0..30 {
+            tab.resize_split_by(0, -1);
+            tab.rebuild_splits_sizes_from_contained_panes();
+        }
+
+        let panes = tab.iter_panes();
+        assert_eq!(4, panes.len());
+
+        let nested_widths: Vec<usize> = panes[1..].iter().map(|pane| pane.width).collect();
+        assert!(
+            nested_widths.iter().all(|width| *width > 4),
+            "nested pane widths should recover after server rebuilds: {:?}",
+            nested_widths,
+        );
+    }
+
+    #[test]
+    fn clamped_drag_does_not_make_minimum_size_preferred() {
+        let size = TerminalSize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 800,
+            pixel_height: 600,
+            dpi: 96,
+        };
+
+        let tab = Tab::new(&size);
+        tab.assign_pane(&FakePane::new(1, size));
+
+        split_pane(&tab, 0, 2, SplitDirection::Horizontal).unwrap();
+        split_pane(&tab, 1, 3, SplitDirection::Horizontal).unwrap();
+        split_pane(&tab, 2, 4, SplitDirection::Horizontal).unwrap();
+
+        tab.resize_split_by(0, 1000);
+        tab.rebuild_splits_sizes_from_contained_panes();
+
+        for _ in 0..30 {
+            tab.resize_split_by(0, -1);
+            tab.rebuild_splits_sizes_from_contained_panes();
+        }
+
+        tab.resize_split_by(1, -1000);
+        tab.rebuild_splits_sizes_from_contained_panes();
+
+        for _ in 0..16 {
+            tab.resize_split_by(1, 1);
+            tab.rebuild_splits_sizes_from_contained_panes();
+        }
+
+        let panes = tab.iter_panes();
+        assert_eq!(4, panes.len());
+
+        let nested_widths: Vec<usize> = panes[1..3].iter().map(|pane| pane.width).collect();
+        assert!(
+            nested_widths.iter().all(|width| *width > 4),
+            "clamped nested drag should not pin panes at minimum: {:?}",
             nested_widths,
         );
     }

@@ -503,6 +503,7 @@ pdu! {
     GetPaneDirectionResponse: 61,
     AdjustPaneSize: 62,
     SetPaneFontScale: 63,
+    ResizePanes: 64,
 }
 
 impl Pdu {
@@ -516,6 +517,7 @@ impl Pdu {
             | Self::SendMouseEvent(_)
             | Self::SendPaste(_)
             | Self::Resize(_)
+            | Self::ResizePanes(_)
             | Self::SetPaneFontScale(_)
             | Self::SetClipboard(_)
             | Self::SetPaneZoomed(_)
@@ -857,6 +859,23 @@ pub struct Resize {
     pub pane_id: PaneId,
     pub size: TerminalSize,
     pub preserve_split: bool,
+    #[serde(default)]
+    pub resize_generation: u64,
+}
+
+#[derive(Deserialize, Serialize, PartialEq, Debug)]
+pub struct ResizePane {
+    pub pane_id: PaneId,
+    pub size: TerminalSize,
+    pub preserve_split: bool,
+    #[serde(default)]
+    pub resize_generation: u64,
+}
+
+#[derive(Deserialize, Serialize, PartialEq, Debug)]
+pub struct ResizePanes {
+    pub containing_tab_id: TabId,
+    pub panes: Vec<ResizePane>,
 }
 
 #[derive(Deserialize, Serialize, PartialEq, Debug)]

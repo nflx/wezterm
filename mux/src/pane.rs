@@ -268,6 +268,9 @@ pub trait Pane: Downcast + Send + Sync {
     fn resize_preserving_split(&self, size: TerminalSize) -> anyhow::Result<()> {
         self.resize(size)
     }
+    fn resize_preserving_split_for_split_drag(&self, size: TerminalSize) -> anyhow::Result<()> {
+        self.resize_preserving_split(size)
+    }
     fn font_scale(&self) -> Option<f64> {
         None
     }

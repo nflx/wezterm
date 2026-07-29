@@ -1284,29 +1284,23 @@ impl TermWindow {
                     tab_id,
                 } => {
                     let mux = Mux::get();
-                    let mut size = self.terminal_size;
+                    let size = self.terminal_size;
                     if let Some(tab) = mux.get_tab(tab_id) {
                         // If we attached to a remote domain and loaded in
-                        // a tab async, we need to fixup its size, either
-                        // by resizing it or resizes ourselves.
-                        // The strategy here is to adjust both by taking
-                        // the maximal size in both horizontal and vertical
-                        // dimensions and applying that. In practice that
-                        // means that a new local client will resize larger
-                        // to adjust to the size of an existing client.
+                        // a tab async, fit it to this GUI window. Trying to
+                        // preserve a larger remote tab size here can leave a
+                        // tiled/managed window with a full-width terminal grid.
                         let tab_size = tab.get_size();
-                        size.rows = size.rows.max(tab_size.rows);
-                        size.cols = size.cols.max(tab_size.cols);
-
-                        if size.rows != self.terminal_size.rows
-                            || size.cols != self.terminal_size.cols
-                            || size.pixel_width != self.terminal_size.pixel_width
-                            || size.pixel_height != self.terminal_size.pixel_height
+                        if tab_size.rows != size.rows
+                            || tab_size.cols != size.cols
+                            || tab_size.pixel_width != size.pixel_width
+                            || tab_size.pixel_height != size.pixel_height
                         {
-                            self.set_window_size(size, window)?;
+                            tab.resize_preserving_split(size);
+                            self.resize_tab_id_panes_for_font_scale(tab_id);
                         } else if tab_size.dpi == 0 {
                             log::debug!("fixup dpi in newly added tab");
-                            tab.resize(self.terminal_size);
+                            tab.resize_preserving_split(self.terminal_size);
                         }
                     }
                 }
@@ -1412,7 +1406,7 @@ impl TermWindow {
                 let mux = Mux::get();
                 if let Some(window) = mux.get_window(self.mux_window_id) {
                     for tab in window.iter() {
-                        tab.resize(self.terminal_size);
+                        tab.resize_preserving_split(self.terminal_size);
                     }
                 };
                 self.update_title();
@@ -2116,7 +2110,7 @@ impl TermWindow {
             }
         };
 
-        let title = match title {
+        let mut title = match title {
             Some(title) => title,
             None => {
                 if let (Some(pos), Some(tab)) = (active_pane, active_tab) {
@@ -2136,6 +2130,14 @@ impl TermWindow {
                 }
             }
         };
+
+        if let Some(status) = self.get_panes_to_render().into_iter().find_map(|pos| {
+            pos.pane
+                .downcast_ref::<wezterm_client::pane::ClientPane>()
+                .and_then(|pane| pane.connection_status_label())
+        }) {
+            title = format!("[mux {status}] {title}");
+        }
 
         if let Some(window) = self.window.as_ref() {
             window.set_title(&title);

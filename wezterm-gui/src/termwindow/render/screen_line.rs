@@ -277,10 +277,10 @@ impl crate::TermWindow {
                         };
 
                     let left = x.max(gl_x + params.left_pixel_x);
-                    let right = (x + cell_width).min(gl_x + params.left_pixel_x + params.pixel_width);
-                    let top = pos_y.max(
-                        (self.dimensions.pixel_height as f32 / -2.) + params.pane_top_pixel_y,
-                    );
+                    let right =
+                        (x + cell_width).min(gl_x + params.left_pixel_x + params.pixel_width);
+                    let top = pos_y
+                        .max((self.dimensions.pixel_height as f32 / -2.) + params.pane_top_pixel_y);
                     let bottom = (pos_y + cell_height).min(
                         (self.dimensions.pixel_height as f32 / -2.)
                             + params.pane_top_pixel_y
@@ -413,11 +413,10 @@ impl crate::TermWindow {
                 if draw_basic {
                     let cursor_width = (cursor_range.end - cursor_range.start) as f32 * cell_width;
                     let left = pos_x.max(gl_x + params.left_pixel_x);
-                    let right = (pos_x + cursor_width)
-                        .min(gl_x + params.left_pixel_x + params.pixel_width);
-                    let top = pos_y.max(
-                        (self.dimensions.pixel_height as f32 / -2.) + params.pane_top_pixel_y,
-                    );
+                    let right =
+                        (pos_x + cursor_width).min(gl_x + params.left_pixel_x + params.pixel_width);
+                    let top = pos_y
+                        .max((self.dimensions.pixel_height as f32 / -2.) + params.pane_top_pixel_y);
                     let bottom = (pos_y + cell_height).min(
                         (self.dimensions.pixel_height as f32 / -2.)
                             + params.pane_top_pixel_y

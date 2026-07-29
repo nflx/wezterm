@@ -353,24 +353,22 @@ impl super::TermWindow {
         };
 
         if delta != 0 {
-            tab.resize_split_by(split.index, delta);
+            if tab.iter_panes_ignoring_zoom().iter().any(|pos| {
+                pos.pane
+                    .downcast_ref::<wezterm_client::pane::ClientPane>()
+                    .is_some()
+            }) {
+                tab.resize_split_by_preserving_split(split.index, delta);
+            } else {
+                tab.resize_split_by(split.index, delta);
+            }
             context.invalidate();
         }
         self.dragging.replace((item, start_event));
     }
 
     fn flush_connected_split_resize(&mut self) {
-        let mux = Mux::get();
-        let tab = match mux.get_active_tab_for_window(self.mux_window_id) {
-            Some(tab) => tab,
-            None => return,
-        };
-
-        for pos in tab.iter_panes_ignoring_zoom() {
-            if let Some(client_pane) = pos.pane.downcast_ref::<wezterm_client::pane::ClientPane>() {
-                client_pane.flush_pending_resize(false);
-            }
-        }
+        self.flush_connected_tab_resize(true);
     }
 
     fn drag_scroll_thumb(
