@@ -910,6 +910,8 @@ impl TermWindow {
             myself.load_os_parameters();
             window.show();
             myself.subscribe_to_pane_updates();
+            myself.fit_mux_window_tabs_to_terminal_size();
+            Self::schedule_startup_mux_window_fit(window.clone());
             myself.emit_window_event("window-config-reloaded", None);
             myself.emit_status_event();
         }
@@ -1281,28 +1283,15 @@ impl TermWindow {
                 } => {}
                 MuxNotification::TabAddedToWindow {
                     window_id: _,
-                    tab_id,
+                    tab_id: _,
                 } => {
-                    let mux = Mux::get();
-                    let size = self.terminal_size;
-                    if let Some(tab) = mux.get_tab(tab_id) {
-                        // If we attached to a remote domain and loaded in
-                        // a tab async, fit it to this GUI window. Trying to
-                        // preserve a larger remote tab size here can leave a
-                        // tiled/managed window with a full-width terminal grid.
-                        let tab_size = tab.get_size();
-                        if tab_size.rows != size.rows
-                            || tab_size.cols != size.cols
-                            || tab_size.pixel_width != size.pixel_width
-                            || tab_size.pixel_height != size.pixel_height
-                        {
-                            tab.resize_preserving_split(size);
-                            self.resize_tab_id_panes_for_font_scale(tab_id);
-                        } else if tab_size.dpi == 0 {
-                            log::debug!("fixup dpi in newly added tab");
-                            tab.resize_preserving_split(self.terminal_size);
-                        }
-                    }
+                    // If we attached to a remote domain and loaded in a tab
+                    // async, fit it to this GUI window. Trying to preserve a
+                    // larger remote tab size here can leave a tiled/managed
+                    // window with a full-width terminal grid. Also covers the
+                    // startup case where the tab appeared before this
+                    // TermWindow subscribed to mux notifications.
+                    self.fit_mux_window_tabs_to_terminal_size();
                 }
                 MuxNotification::PaneOutput(pane_id) => {
                     self.mux_pane_output_event(pane_id);
@@ -1616,6 +1605,92 @@ impl TermWindow {
             .detach();
             true
         });
+    }
+
+    fn schedule_startup_mux_window_fit(window: Window) {
+        promise::spawn::spawn(async move {
+            Timer::after(Duration::from_millis(50)).await;
+            window.notify(TermWindowNotif::Apply(Box::new(|term_window| {
+                term_window.fit_mux_window_tabs_to_terminal_size();
+                if let Some(window) = term_window.window.clone() {
+                    window.invalidate();
+                }
+            })));
+        })
+        .detach();
+    }
+
+    fn fit_mux_window_tabs_to_terminal_size(&mut self) {
+        let mux = Mux::get();
+        let size = self.terminal_size_for_dimensions(&self.dimensions);
+        self.terminal_size = size;
+        let Some(window) = mux.get_window(self.mux_window_id) else {
+            return;
+        };
+
+        let mut changed = false;
+        for tab in window.iter() {
+            let tab_size = tab.get_size();
+            if tab_size.rows != size.rows
+                || tab_size.cols != size.cols
+                || tab_size.pixel_width != size.pixel_width
+                || tab_size.pixel_height != size.pixel_height
+                || tab_size.dpi != size.dpi
+            {
+                tab.resize_preserving_split(size);
+                changed = true;
+            }
+            self.resize_tab_id_panes_for_font_scale(tab.tab_id());
+        }
+
+        if changed {
+            self.flush_connected_tab_resize(true);
+        }
+    }
+
+    fn terminal_size_for_dimensions(&self, dimensions: &Dimensions) -> TerminalSize {
+        let config = &self.config;
+        let tab_bar_height = if self.show_tab_bar {
+            self.tab_bar_pixel_height().unwrap_or(0.)
+        } else {
+            0.
+        };
+        let border = self.get_os_border();
+        let h_context = DimensionContext {
+            dpi: dimensions.dpi as f32,
+            pixel_max: self.terminal_size.pixel_width as f32,
+            pixel_cell: self.render_metrics.cell_size.width as f32,
+        };
+        let v_context = DimensionContext {
+            dpi: dimensions.dpi as f32,
+            pixel_max: self.terminal_size.pixel_height as f32,
+            pixel_cell: self.render_metrics.cell_size.height as f32,
+        };
+        let padding_left = config.window_padding.left.evaluate_as_pixels(h_context) as usize;
+        let padding_top = config.window_padding.top.evaluate_as_pixels(v_context) as usize;
+        let padding_bottom = config.window_padding.bottom.evaluate_as_pixels(v_context) as usize;
+        let padding_right = resize::effective_right_padding(&config, h_context);
+
+        let avail_width = dimensions.pixel_width.saturating_sub(
+            padding_left + padding_right + (border.left + border.right).get() as usize,
+        );
+        let avail_height = dimensions
+            .pixel_height
+            .saturating_sub(
+                padding_top + padding_bottom + (border.top + border.bottom).get() as usize,
+            )
+            .saturating_sub(tab_bar_height as usize);
+
+        let rows = avail_height / self.render_metrics.cell_size.height as usize;
+        let cols = avail_width / self.render_metrics.cell_size.width as usize;
+
+        TerminalSize {
+            rows,
+            cols,
+            pixel_height: rows * self.render_metrics.cell_size.height as usize,
+            pixel_width: cols * self.render_metrics.cell_size.width as usize,
+            dpi: dimensions.dpi as u32,
+        }
     }
 
     fn emit_status_event(&mut self) {

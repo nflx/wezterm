@@ -749,7 +749,17 @@ impl super::TermWindow {
         let Some(tab) = Mux::get().get_tab(tab_id) else {
             return;
         };
+        let tab_size = tab.get_size();
+        if tab_size.rows != self.terminal_size.rows
+            || tab_size.cols != self.terminal_size.cols
+            || tab_size.pixel_width != self.terminal_size.pixel_width
+            || tab_size.pixel_height != self.terminal_size.pixel_height
+            || tab_size.dpi != self.terminal_size.dpi
+        {
+            tab.resize_preserving_split(self.terminal_size);
+        }
         self.resize_tab_panes_for_font_scale(&tab);
+        self.flush_connected_tab_resize(true);
     }
 
     pub(crate) fn flush_connected_tab_resize(&self, preserve_split: bool) {
