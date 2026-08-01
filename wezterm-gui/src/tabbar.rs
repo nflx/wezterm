@@ -150,22 +150,10 @@ const INDETERMINATE_SPINNER_INTERVAL: Duration = Duration::from_millis(100);
 /// they stay in step no matter when a repaint happens to rebuild the tab bar.
 static SPINNER_EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
 
-/// Renders `value` as a braille cell whose lit dots count up in the cell's
-/// reading order, down the left column then down the right column. Stepping
-/// `value` through 0..=255 reproduces the `dots8Bit` animation of
-/// https://github.com/sindresorhus/cli-spinners without a lookup table.
-fn braille_counter(value: u8) -> char {
-    // Unicode braille dot bit values in reading order: dots 1, 2, 3, 7 fill the
-    // left column and dots 4, 5, 6, 8 the right column.
-    const DOTS: [u32; 8] = [0x01, 0x02, 0x04, 0x40, 0x08, 0x10, 0x20, 0x80];
-    let mut pattern = 0u32;
-    for (bit, dot) in DOTS.iter().enumerate() {
-        if value & (1 << bit) != 0 {
-            pattern |= dot;
-        }
-    }
-    char::from_u32(0x2800 + pattern).expect("braille pattern is a valid codepoint")
-}
+/// ASCII frames keep the tab spinner legible regardless of the configured
+/// primary font or fallback coverage. In particular, Nerd Fonts do not all
+/// include the Unicode Braille block used by the former spinner.
+const INDETERMINATE_SPINNER_FRAMES: [char; 4] = ['|', '/', '-', '\\'];
 
 /// Returns the spinner glyph to show for the current moment, advancing one
 /// frame per INDETERMINATE_SPINNER_INTERVAL. `seed` offsets the starting frame
@@ -173,8 +161,8 @@ fn braille_counter(value: u8) -> char {
 fn indeterminate_spinner_glyph(seed: u64) -> char {
     let elapsed = SPINNER_EPOCH.elapsed().as_millis() as u64;
     let interval = INDETERMINATE_SPINNER_INTERVAL.as_millis() as u64;
-    // braille_counter wraps at 256, matching the animation's frame count.
-    braille_counter((elapsed / interval + seed) as u8)
+    let frame = (elapsed / interval + seed) % INDETERMINATE_SPINNER_FRAMES.len() as u64;
+    INDETERMINATE_SPINNER_FRAMES[frame as usize]
 }
 
 /// Returns the instant at which the spinner next advances a frame, snapped to
