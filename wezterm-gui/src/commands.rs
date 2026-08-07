@@ -2195,6 +2195,7 @@ fn compute_default_actions() -> Vec<KeyAssignment> {
         ActivatePaneDirection(PaneDirection::Up),
         ActivatePaneDirection(PaneDirection::Down),
         TogglePaneZoomState,
+        TogglePaneSidebar,
         ActivateLastTab,
         ShowLauncher,
         ShowTabNavigator,
