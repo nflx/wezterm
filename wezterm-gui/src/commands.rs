@@ -1646,6 +1646,14 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             menubar: &["Window"],
             icon: Some("md_fullscreen"),
         },
+        TogglePaneSidebar => CommandDef {
+            brief: "Toggle Left Pane Sidebar".into(),
+            doc: "Hides or restores the left child of the tab's root split".into(),
+            keys: vec![],
+            args: &[ArgType::ActivePane],
+            menubar: &["Window"],
+            icon: Some("cod_layout_sidebar_left"),
+        },
         ActivateLastTab => CommandDef {
             brief: "Activate the last active tab".into(),
             doc: "If there was no prior active tab, has no effect.".into(),

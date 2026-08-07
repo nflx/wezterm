@@ -45,6 +45,12 @@ struct TabInner {
     zoomed: Option<Arc<dyn Pane>>,
     title: String,
     recency: Recency,
+    hidden_left_sidebar: Option<HiddenLeftSidebar>,
+}
+
+struct HiddenLeftSidebar {
+    tree: Tree,
+    split: SplitDirectionAndSize,
 }
 
 /// A Tab is a container of Panes
@@ -470,6 +476,14 @@ fn compute_min_size(tree: &mut Tree) -> (usize, usize) {
     }
 }
 
+fn count_tree_leaves(tree: &Tree) -> usize {
+    match tree {
+        Tree::Empty => 0,
+        Tree::Leaf(_) => 1,
+        Tree::Node { left, right, .. } => count_tree_leaves(left) + count_tree_leaves(right),
+    }
+}
+
 fn split_child_lengths(
     total: usize,
     first_current: usize,
@@ -828,6 +842,14 @@ impl Tab {
         self.inner.lock().toggle_zoom()
     }
 
+    pub fn left_sidebar_hidden(&self) -> bool {
+        self.inner.lock().hidden_left_sidebar.is_some()
+    }
+
+    pub fn set_left_sidebar_hidden(&self, hidden: bool) -> anyhow::Result<()> {
+        self.inner.lock().set_left_sidebar_hidden(hidden)
+    }
+
     pub fn contains_pane(&self, pane: PaneId) -> bool {
         self.inner.lock().contains_pane(pane)
     }
@@ -1054,6 +1076,7 @@ impl TabInner {
             zoomed: None,
             title: String::new(),
             recency: Recency::default(),
+            hidden_left_sidebar: None,
         }
     }
 
@@ -1066,6 +1089,7 @@ impl TabInner {
 
         log::debug!("sync_with_pane_tree with size {:?}", size);
 
+        let sidebar_hidden = root.left_sidebar_hidden();
         let t = build_from_pane_tree(root.into_tree(), &mut active, &mut zoomed, &mut make_pane);
         let mut cursor = t.cursor();
 
@@ -1096,6 +1120,13 @@ impl TabInner {
         self.pane.replace(cursor.tree());
         self.zoomed = zoomed;
         self.size = size;
+        self.hidden_left_sidebar = None;
+
+        if sidebar_hidden {
+            if let Err(err) = self.set_left_sidebar_hidden(true) {
+                log::error!("failed to restore hidden left sidebar: {err:#}");
+            }
+        }
 
         if let Some(zoomed) = &self.zoomed {
             zoomed.resize_preserving_split(size).ok();
@@ -1136,25 +1167,98 @@ impl TabInner {
         };
 
         let active = self.get_active_pane();
-        let zoomed = self.zoomed.as_ref();
+        let zoomed = self.zoomed.clone();
         let cell_dimensions = self.cell_dimensions();
-        if let Some(root) = self.pane.as_ref() {
-            pane_tree(
-                root,
-                tab_id,
-                window_id,
-                active.as_ref(),
-                zoomed,
-                &workspace,
-                0,
-                0,
-                0,
-                0,
-                cell_dimensions,
-            )
+        let was_hidden = self.hidden_left_sidebar.is_some();
+        if was_hidden {
+            self.restore_hidden_left_sidebar_tree();
+        }
+        let result = if let Some(root) = self.pane.as_ref() {
+            PaneNode::TabRoot {
+                root: Box::new(pane_tree(
+                    root,
+                    tab_id,
+                    window_id,
+                    active.as_ref(),
+                    zoomed.as_ref(),
+                    &workspace,
+                    0,
+                    0,
+                    0,
+                    0,
+                    cell_dimensions,
+                )),
+                left_sidebar_hidden: was_hidden,
+            }
         } else {
             PaneNode::Empty
+        };
+        if was_hidden {
+            self.detach_left_sidebar_tree()
+                .expect("restoring a previously hidden left sidebar must succeed");
         }
+        result
+    }
+
+    fn restore_hidden_left_sidebar_tree(&mut self) {
+        let Some(hidden) = self.hidden_left_sidebar.take() else {
+            return;
+        };
+        let main = self.pane.take().unwrap_or(Tree::Empty);
+        let left_count = count_tree_leaves(&hidden.tree);
+        self.pane = Some(Tree::Node {
+            left: Box::new(hidden.tree),
+            right: Box::new(main),
+            data: Some(hidden.split),
+        });
+        self.active = self.active.saturating_add(left_count);
+    }
+
+    fn detach_left_sidebar_tree(&mut self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.hidden_left_sidebar.is_none(),
+            "left sidebar is already hidden"
+        );
+        let root = self.pane.take().unwrap_or(Tree::Empty);
+        match root {
+            Tree::Node {
+                left,
+                right,
+                data: Some(split),
+            } if split.direction == SplitDirection::Horizontal => {
+                let left_count = count_tree_leaves(&left);
+                self.pane = Some(*right);
+                self.active = self.active.saturating_sub(left_count);
+                self.hidden_left_sidebar = Some(HiddenLeftSidebar { tree: *left, split });
+                Ok(())
+            }
+            other => {
+                self.pane = Some(other);
+                anyhow::bail!("the tab root must be a horizontal split to hide its left sidebar")
+            }
+        }
+    }
+
+    fn set_left_sidebar_hidden(&mut self, hidden: bool) -> anyhow::Result<()> {
+        if hidden == self.hidden_left_sidebar.is_some() {
+            return Ok(());
+        }
+        if hidden {
+            self.detach_left_sidebar_tree()?;
+            if self.active > 0 {
+                self.active = 0;
+            }
+            if self.zoomed.is_none() {
+                self.resize(self.size);
+            }
+        } else {
+            self.restore_hidden_left_sidebar_tree();
+            if self.zoomed.is_none() {
+                self.resize(self.size);
+            }
+        }
+        Mux::try_get().map(|mux| mux.notify(MuxNotification::TabResized(self.id)));
+        Ok(())
     }
 
     /// Returns a count of how many panes are in this tab
@@ -2554,6 +2658,10 @@ impl TabInner {
 #[derive(Deserialize, Serialize, PartialEq, Debug)]
 pub enum PaneNode {
     Empty,
+    TabRoot {
+        root: Box<PaneNode>,
+        left_sidebar_hidden: bool,
+    },
     Split {
         left: Box<PaneNode>,
         right: Box<PaneNode>,
@@ -2566,6 +2674,7 @@ impl PaneNode {
     pub fn into_tree(self) -> bintree::Tree<PaneEntry, SplitDirectionAndSize> {
         match self {
             PaneNode::Empty => bintree::Tree::Empty,
+            PaneNode::TabRoot { root, .. } => (*root).into_tree(),
             PaneNode::Split { left, right, node } => bintree::Tree::Node {
                 left: Box::new((*left).into_tree()),
                 right: Box::new((*right).into_tree()),
@@ -2578,6 +2687,7 @@ impl PaneNode {
     pub fn root_size(&self) -> Option<TerminalSize> {
         match self {
             PaneNode::Empty => None,
+            PaneNode::TabRoot { root, .. } => root.root_size(),
             PaneNode::Split { node, .. } => Some(node.size()),
             PaneNode::Leaf(entry) => Some(entry.size),
         }
@@ -2586,12 +2696,23 @@ impl PaneNode {
     pub fn window_and_tab_ids(&self) -> Option<(WindowId, TabId)> {
         match self {
             PaneNode::Empty => None,
+            PaneNode::TabRoot { root, .. } => root.window_and_tab_ids(),
             PaneNode::Split { left, right, .. } => match left.window_and_tab_ids() {
                 Some(res) => Some(res),
                 None => right.window_and_tab_ids(),
             },
             PaneNode::Leaf(entry) => Some((entry.window_id, entry.tab_id)),
         }
+    }
+
+    pub fn left_sidebar_hidden(&self) -> bool {
+        matches!(
+            self,
+            PaneNode::TabRoot {
+                left_sidebar_hidden: true,
+                ..
+            }
+        )
     }
 }
 
@@ -3235,6 +3356,73 @@ mod test {
             "clamped nested drag should not pin panes at minimum: {:?}",
             nested_widths,
         );
+    }
+
+    #[test]
+    fn left_sidebar_toggle_preserves_widget_subtree_and_expands_main_area() {
+        let size = TerminalSize {
+            rows: 24,
+            cols: 100,
+            pixel_width: 1000,
+            pixel_height: 600,
+            dpi: 96,
+        };
+        let tab = Tab::new(&size);
+        tab.assign_pane(&FakePane::new(1, size));
+        split_pane(&tab, 0, 2, SplitDirection::Horizontal).unwrap();
+        split_pane(&tab, 1, 3, SplitDirection::Vertical).unwrap();
+
+        assert_eq!(
+            vec![1, 2, 3],
+            tab.iter_panes()
+                .iter()
+                .map(|pane| pane.pane.pane_id())
+                .collect::<Vec<_>>()
+        );
+
+        tab.set_left_sidebar_hidden(true).unwrap();
+        assert!(tab.left_sidebar_hidden());
+        let hidden = tab.iter_panes();
+        assert_eq!(
+            vec![2, 3],
+            hidden
+                .iter()
+                .map(|pane| pane.pane.pane_id())
+                .collect::<Vec<_>>()
+        );
+        assert!(hidden.iter().all(|pane| pane.left == 0));
+        assert!(
+            hidden.iter().all(|pane| pane.width == size.cols),
+            "hidden main pane widths: {:?}",
+            hidden.iter().map(|pane| pane.width).collect::<Vec<_>>()
+        );
+
+        tab.set_left_sidebar_hidden(false).unwrap();
+        assert!(!tab.left_sidebar_hidden());
+        assert_eq!(
+            vec![1, 2, 3],
+            tab.iter_panes()
+                .iter()
+                .map(|pane| pane.pane.pane_id())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn left_sidebar_requires_horizontal_root_split() {
+        let size = TerminalSize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 800,
+            pixel_height: 600,
+            dpi: 96,
+        };
+        let tab = Tab::new(&size);
+        tab.assign_pane(&FakePane::new(1, size));
+        split_pane(&tab, 0, 2, SplitDirection::Vertical).unwrap();
+
+        assert!(tab.set_left_sidebar_hidden(true).is_err());
+        assert_eq!(2, tab.iter_panes().len());
     }
 
     fn split_pane(

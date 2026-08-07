@@ -285,6 +285,7 @@ pub trait Pane: Downcast + Send + Sync {
     /// Called as a hint that the pane is being resized as part of
     /// a zoom-to-fill-all-the-tab-space operation.
     fn set_zoomed(&self, _zoomed: bool) {}
+    fn set_left_sidebar_hidden(&self, _hidden: bool) {}
     fn key_down(&self, key: KeyCode, mods: KeyModifiers) -> anyhow::Result<()>;
     fn key_up(&self, key: KeyCode, mods: KeyModifiers) -> anyhow::Result<()>;
     fn perform_assignment(&self, _assignment: &KeyAssignment) -> PerformAssignmentResult {

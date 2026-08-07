@@ -878,6 +878,21 @@ impl Pane for ClientPane {
         inner.update_last_send();
     }
 
+    fn set_left_sidebar_hidden(&self, hidden: bool) {
+        let client = Arc::clone(&self.client);
+        let remote_tab_id = self.remote_tab_id;
+        promise::spawn::spawn(async move {
+            client
+                .client
+                .set_left_sidebar_hidden(SetLeftSidebarHidden {
+                    containing_tab_id: remote_tab_id,
+                    hidden,
+                })
+                .await
+        })
+        .detach();
+    }
+
     fn resize(&self, size: TerminalSize) -> anyhow::Result<()> {
         self.resize_impl(size, false, true)
     }
