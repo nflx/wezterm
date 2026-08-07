@@ -1,16 +1,16 @@
 use crate::tabbar::TabBarItem;
 use crate::termwindow::{
-    GuiWin, MouseCapture, PositionedSplit, ScrollHit, TermWindowNotif, UIItem, UIItemType, TMB,
+    GuiWin, MouseCapture, PositionedSplit, ScrollHit, TMB, TermWindowNotif, UIItem, UIItemType,
 };
 use ::window::{
     MouseButtons as WMB, MouseCursor, MouseEvent, MouseEventKind as WMEK, MousePress,
     WindowDecorations, WindowOps, WindowState,
 };
-use config::keyassignment::{KeyAssignment, MouseEventTrigger, SpawnTabDomain};
 use config::MouseEventAltScreen;
+use config::keyassignment::{KeyAssignment, MouseEventTrigger, SpawnTabDomain};
+use mux::Mux;
 use mux::pane::{Pane, WithPaneLines};
 use mux::tab::{PositionedPane, SplitDirection};
-use mux::Mux;
 use mux_lua::MuxPane;
 use std::convert::TryInto;
 use std::ops::Sub;
@@ -345,13 +345,13 @@ impl super::TermWindow {
         let delta = match (split.direction, current_split.as_ref()) {
             (SplitDirection::Horizontal, Some(current)) => {
                 let mouse_delta_cells =
-                    event.coords.x.saturating_sub(start_event.coords.x) / cell_width;
+                    signed_cell_delta(event.coords.x, start_event.coords.x, cell_width);
                 let target_left = (split.left as isize).saturating_add(mouse_delta_cells);
                 target_left.saturating_sub(current.left as isize)
             }
             (SplitDirection::Vertical, Some(current)) => {
                 let mouse_delta_cells =
-                    event.coords.y.saturating_sub(start_event.coords.y) / cell_height;
+                    signed_cell_delta(event.coords.y, start_event.coords.y, cell_height);
                 let target_top = (split.top as isize).saturating_add(mouse_delta_cells);
                 target_top.saturating_sub(current.top as isize)
             }
@@ -1119,6 +1119,22 @@ impl super::TermWindow {
                 context.invalidate();
             }
         }
+    }
+}
+
+fn signed_cell_delta(current: isize, start: isize, cell_size: isize) -> isize {
+    current.saturating_sub(start) / cell_size.max(1)
+}
+
+#[cfg(test)]
+mod test {
+    use super::signed_cell_delta;
+
+    #[test]
+    fn split_drag_delta_preserves_both_directions() {
+        assert_eq!(signed_cell_delta(140, 100, 10), 4);
+        assert_eq!(signed_cell_delta(60, 100, 10), -4);
+        assert_eq!(signed_cell_delta(96, 100, 10), 0);
     }
 }
 
