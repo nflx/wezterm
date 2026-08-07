@@ -46,9 +46,15 @@ struct TabInner {
     title: String,
     recency: Recency,
     hidden_left_sidebar: Option<HiddenLeftSidebar>,
+    hidden_right_sidebar: Option<HiddenRightSidebar>,
 }
 
 struct HiddenLeftSidebar {
+    tree: Tree,
+    split: SplitDirectionAndSize,
+}
+
+struct HiddenRightSidebar {
     tree: Tree,
     split: SplitDirectionAndSize,
 }
@@ -850,6 +856,14 @@ impl Tab {
         self.inner.lock().set_left_sidebar_hidden(hidden)
     }
 
+    pub fn right_sidebar_hidden(&self) -> bool {
+        self.inner.lock().hidden_right_sidebar.is_some()
+    }
+
+    pub fn set_right_sidebar_hidden(&self, hidden: bool) -> anyhow::Result<()> {
+        self.inner.lock().set_right_sidebar_hidden(hidden)
+    }
+
     pub fn contains_pane(&self, pane: PaneId) -> bool {
         self.inner.lock().contains_pane(pane)
     }
@@ -1077,6 +1091,7 @@ impl TabInner {
             title: String::new(),
             recency: Recency::default(),
             hidden_left_sidebar: None,
+            hidden_right_sidebar: None,
         }
     }
 
@@ -1089,7 +1104,8 @@ impl TabInner {
 
         log::debug!("sync_with_pane_tree with size {:?}", size);
 
-        let sidebar_hidden = root.left_sidebar_hidden();
+        let left_sidebar_hidden = root.left_sidebar_hidden();
+        let right_sidebar_hidden = root.right_sidebar_hidden();
         let t = build_from_pane_tree(root.into_tree(), &mut active, &mut zoomed, &mut make_pane);
         let mut cursor = t.cursor();
 
@@ -1121,10 +1137,15 @@ impl TabInner {
         self.zoomed = zoomed;
         self.size = size;
         self.hidden_left_sidebar = None;
+        self.hidden_right_sidebar = None;
 
-        if sidebar_hidden {
+        if left_sidebar_hidden {
             if let Err(err) = self.set_left_sidebar_hidden(true) {
                 log::error!("failed to restore hidden left sidebar: {err:#}");
+            }
+        } else if right_sidebar_hidden {
+            if let Err(err) = self.set_right_sidebar_hidden(true) {
+                log::error!("failed to restore hidden right sidebar: {err:#}");
             }
         }
 
@@ -1169,9 +1190,12 @@ impl TabInner {
         let active = self.get_active_pane();
         let zoomed = self.zoomed.clone();
         let cell_dimensions = self.cell_dimensions();
-        let was_hidden = self.hidden_left_sidebar.is_some();
-        if was_hidden {
+        let left_was_hidden = self.hidden_left_sidebar.is_some();
+        let right_was_hidden = self.hidden_right_sidebar.is_some();
+        if left_was_hidden {
             self.restore_hidden_left_sidebar_tree();
+        } else if right_was_hidden {
+            self.restore_hidden_right_sidebar_tree();
         }
         let result = if let Some(root) = self.pane.as_ref() {
             PaneNode::TabRoot {
@@ -1188,14 +1212,18 @@ impl TabInner {
                     0,
                     cell_dimensions,
                 )),
-                left_sidebar_hidden: was_hidden,
+                left_sidebar_hidden: left_was_hidden,
+                right_sidebar_hidden: right_was_hidden,
             }
         } else {
             PaneNode::Empty
         };
-        if was_hidden {
+        if left_was_hidden {
             self.detach_left_sidebar_tree()
                 .expect("restoring a previously hidden left sidebar must succeed");
+        } else if right_was_hidden {
+            self.detach_right_sidebar_tree()
+                .expect("restoring a previously hidden right sidebar must succeed");
         }
         result
     }
@@ -1244,6 +1272,10 @@ impl TabInner {
             return Ok(());
         }
         if hidden {
+            anyhow::ensure!(
+                self.hidden_right_sidebar.is_none(),
+                "cannot hide both sidebars at once"
+            );
             self.detach_left_sidebar_tree()?;
             if self.active > 0 {
                 self.active = 0;
@@ -1253,6 +1285,71 @@ impl TabInner {
             }
         } else {
             self.restore_hidden_left_sidebar_tree();
+            if self.zoomed.is_none() {
+                self.resize(self.size);
+            }
+        }
+        Mux::try_get().map(|mux| mux.notify(MuxNotification::TabResized(self.id)));
+        Ok(())
+    }
+
+    fn restore_hidden_right_sidebar_tree(&mut self) {
+        let Some(hidden) = self.hidden_right_sidebar.take() else {
+            return;
+        };
+        let main = self.pane.take().unwrap_or(Tree::Empty);
+        self.pane = Some(Tree::Node {
+            left: Box::new(main),
+            right: Box::new(hidden.tree),
+            data: Some(hidden.split),
+        });
+    }
+
+    fn detach_right_sidebar_tree(&mut self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.hidden_right_sidebar.is_none(),
+            "right sidebar is already hidden"
+        );
+        let root = self.pane.take().unwrap_or(Tree::Empty);
+        match root {
+            Tree::Node {
+                left,
+                right,
+                data: Some(split),
+            } if split.direction == SplitDirection::Horizontal => {
+                let left_count = count_tree_leaves(&left);
+                self.pane = Some(*left);
+                if self.active >= left_count {
+                    self.active = 0;
+                }
+                self.hidden_right_sidebar = Some(HiddenRightSidebar {
+                    tree: *right,
+                    split,
+                });
+                Ok(())
+            }
+            other => {
+                self.pane = Some(other);
+                anyhow::bail!("the tab root must be a horizontal split to hide its right sidebar")
+            }
+        }
+    }
+
+    fn set_right_sidebar_hidden(&mut self, hidden: bool) -> anyhow::Result<()> {
+        if hidden == self.hidden_right_sidebar.is_some() {
+            return Ok(());
+        }
+        if hidden {
+            anyhow::ensure!(
+                self.hidden_left_sidebar.is_none(),
+                "cannot hide both sidebars at once"
+            );
+            self.detach_right_sidebar_tree()?;
+            if self.zoomed.is_none() {
+                self.resize(self.size);
+            }
+        } else {
+            self.restore_hidden_right_sidebar_tree();
             if self.zoomed.is_none() {
                 self.resize(self.size);
             }
@@ -2661,6 +2758,7 @@ pub enum PaneNode {
     TabRoot {
         root: Box<PaneNode>,
         left_sidebar_hidden: bool,
+        right_sidebar_hidden: bool,
     },
     Split {
         left: Box<PaneNode>,
@@ -2710,6 +2808,16 @@ impl PaneNode {
             self,
             PaneNode::TabRoot {
                 left_sidebar_hidden: true,
+                ..
+            }
+        )
+    }
+
+    pub fn right_sidebar_hidden(&self) -> bool {
+        matches!(
+            self,
+            PaneNode::TabRoot {
+                right_sidebar_hidden: true,
                 ..
             }
         )
@@ -3423,6 +3531,52 @@ mod test {
 
         assert!(tab.set_left_sidebar_hidden(true).is_err());
         assert_eq!(2, tab.iter_panes().len());
+    }
+
+    #[test]
+    fn right_sidebar_toggle_preserves_widget_subtree_and_expands_main_area() {
+        let size = TerminalSize {
+            rows: 24,
+            cols: 100,
+            pixel_width: 1000,
+            pixel_height: 600,
+            dpi: 96,
+        };
+        let tab = Tab::new(&size);
+        tab.assign_pane(&FakePane::new(1, size));
+        split_pane(&tab, 0, 2, SplitDirection::Horizontal).unwrap();
+        split_pane(&tab, 0, 3, SplitDirection::Vertical).unwrap();
+
+        assert_eq!(
+            vec![1, 3, 2],
+            tab.iter_panes()
+                .iter()
+                .map(|pane| pane.pane.pane_id())
+                .collect::<Vec<_>>()
+        );
+
+        tab.set_right_sidebar_hidden(true).unwrap();
+        assert!(tab.right_sidebar_hidden());
+        let hidden = tab.iter_panes();
+        assert_eq!(
+            vec![1, 3],
+            hidden
+                .iter()
+                .map(|pane| pane.pane.pane_id())
+                .collect::<Vec<_>>()
+        );
+        assert!(hidden.iter().all(|pane| pane.left == 0));
+        assert!(hidden.iter().all(|pane| pane.width == size.cols));
+
+        tab.set_right_sidebar_hidden(false).unwrap();
+        assert!(!tab.right_sidebar_hidden());
+        assert_eq!(
+            vec![1, 3, 2],
+            tab.iter_panes()
+                .iter()
+                .map(|pane| pane.pane.pane_id())
+                .collect::<Vec<_>>()
+        );
     }
 
     fn split_pane(

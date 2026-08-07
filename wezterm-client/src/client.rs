@@ -1560,6 +1560,11 @@ impl Client {
     rpc!(set_pane_font_scale, SetPaneFontScale, UnitResponse);
     rpc!(set_zoomed, SetPaneZoomed, UnitResponse);
     rpc!(set_left_sidebar_hidden, SetLeftSidebarHidden, UnitResponse);
+    rpc!(
+        set_right_sidebar_hidden,
+        SetRightSidebarHidden,
+        UnitResponse
+    );
     rpc!(activate_pane_direction, ActivatePaneDirection, UnitResponse);
     rpc!(
         get_pane_render_changes,

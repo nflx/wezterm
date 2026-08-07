@@ -441,7 +441,7 @@ macro_rules! pdu {
 /// The overall version of the codec.
 /// This must be bumped when backwards incompatible changes
 /// are made to the types and protocol.
-pub const CODEC_VERSION: usize = 49;
+pub const CODEC_VERSION: usize = 50;
 
 // Defines the Pdu enum.
 // Each struct has an explicit identifying number.
@@ -506,6 +506,7 @@ pdu! {
     ResizePanes: 64,
     ResizeSplit: 65,
     SetLeftSidebarHidden: 66,
+    SetRightSidebarHidden: 67,
 }
 
 impl Pdu {
@@ -525,6 +526,7 @@ impl Pdu {
             | Self::SetClipboard(_)
             | Self::SetPaneZoomed(_)
             | Self::SetLeftSidebarHidden(_)
+            | Self::SetRightSidebarHidden(_)
             | Self::SpawnV2(_) => true,
             _ => false,
         }
@@ -906,6 +908,12 @@ pub struct SetPaneZoomed {
 
 #[derive(Deserialize, Serialize, PartialEq, Debug)]
 pub struct SetLeftSidebarHidden {
+    pub containing_tab_id: TabId,
+    pub hidden: bool,
+}
+
+#[derive(Deserialize, Serialize, PartialEq, Debug)]
+pub struct SetRightSidebarHidden {
     pub containing_tab_id: TabId,
     pub hidden: bool,
 }

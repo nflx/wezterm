@@ -3163,6 +3163,16 @@ impl TermWindow {
                 tab.set_left_sidebar_hidden(hidden)?;
                 pane.set_left_sidebar_hidden(hidden);
             }
+            ToggleRightPaneSidebar => {
+                let mux = Mux::get();
+                let tab = match mux.get_active_tab_for_window(self.mux_window_id) {
+                    Some(tab) => tab,
+                    None => return Ok(PerformAssignmentResult::Handled),
+                };
+                let hidden = !tab.right_sidebar_hidden();
+                tab.set_right_sidebar_hidden(hidden)?;
+                pane.set_right_sidebar_hidden(hidden);
+            }
             SetPaneZoomState(zoomed) => {
                 let mux = Mux::get();
                 let tab = match mux.get_active_tab_for_window(self.mux_window_id) {

@@ -1654,6 +1654,14 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             menubar: &["Window"],
             icon: Some("cod_layout_sidebar_left"),
         },
+        ToggleRightPaneSidebar => CommandDef {
+            brief: "Toggle Right Pane Sidebar".into(),
+            doc: "Hides or restores the right child of the tab's root split".into(),
+            keys: vec![],
+            args: &[ArgType::ActivePane],
+            menubar: &["Window"],
+            icon: Some("cod_layout_sidebar_right"),
+        },
         ActivateLastTab => CommandDef {
             brief: "Activate the last active tab".into(),
             doc: "If there was no prior active tab, has no effect.".into(),
@@ -2196,6 +2204,7 @@ fn compute_default_actions() -> Vec<KeyAssignment> {
         ActivatePaneDirection(PaneDirection::Down),
         TogglePaneZoomState,
         TogglePaneSidebar,
+        ToggleRightPaneSidebar,
         ActivateLastTab,
         ShowLauncher,
         ShowTabNavigator,

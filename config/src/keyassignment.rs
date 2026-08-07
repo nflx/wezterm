@@ -606,6 +606,7 @@ pub enum KeyAssignment {
     ActivatePaneByIndex(usize),
     TogglePaneZoomState,
     TogglePaneSidebar,
+    ToggleRightPaneSidebar,
     SetPaneZoomState(bool),
     CloseCurrentPane {
         confirm: bool,

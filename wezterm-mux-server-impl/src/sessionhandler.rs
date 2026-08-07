@@ -694,6 +694,26 @@ impl SessionHandler {
                 .detach();
             }
 
+            Pdu::SetRightSidebarHidden(SetRightSidebarHidden {
+                containing_tab_id,
+                hidden,
+            }) => {
+                spawn_into_main_thread(async move {
+                    catch(
+                        move || {
+                            let mux = Mux::get();
+                            let tab = mux
+                                .get_tab(containing_tab_id)
+                                .ok_or_else(|| anyhow!("no such tab {}", containing_tab_id))?;
+                            tab.set_right_sidebar_hidden(hidden)?;
+                            Ok(Pdu::UnitResponse(UnitResponse {}))
+                        },
+                        send_response,
+                    )
+                })
+                .detach();
+            }
+
             Pdu::GetPaneDirection(GetPaneDirection { pane_id, direction }) => {
                 spawn_into_main_thread(async move {
                     catch(
