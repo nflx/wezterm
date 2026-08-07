@@ -1556,6 +1556,7 @@ impl Client {
     rpc!(mouse_event, SendMouseEvent, UnitResponse);
     rpc!(resize, Resize, UnitResponse);
     rpc!(resize_panes, ResizePanes, UnitResponse);
+    rpc!(resize_split, ResizeSplit, UnitResponse);
     rpc!(set_pane_font_scale, SetPaneFontScale, UnitResponse);
     rpc!(set_zoomed, SetPaneZoomed, UnitResponse);
     rpc!(activate_pane_direction, ActivatePaneDirection, UnitResponse);

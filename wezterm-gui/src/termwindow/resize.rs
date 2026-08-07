@@ -834,6 +834,43 @@ impl super::TermWindow {
         .detach();
     }
 
+    pub(crate) fn flush_connected_split_resize_at(
+        &self,
+        split_index: usize,
+        start_position: usize,
+    ) {
+        let Some(tab) = Mux::get().get_active_tab_for_window(self.mux_window_id) else {
+            return;
+        };
+        let Some(split) = tab.iter_splits().into_iter().nth(split_index) else {
+            return;
+        };
+        let position = match split.direction {
+            mux::tab::SplitDirection::Horizontal => split.left,
+            mux::tab::SplitDirection::Vertical => split.top,
+        };
+        let delta = position as isize - start_position as isize;
+        let Some((batch_sender, batch)) = take_connected_tab_resize_batch(self.mux_window_id, true)
+        else {
+            return;
+        };
+
+        promise::spawn::spawn(async move {
+            if let Some(client_pane) =
+                batch_sender.downcast_ref::<wezterm_client::pane::ClientPane>()
+            {
+                if let Err(err) = client_pane
+                    .flush_pending_split_resize_now(split_index, delta, batch)
+                    .await
+                {
+                    log::error!("failed to synchronize connected split resize: {err:#}");
+                }
+            }
+            Ok::<(), anyhow::Error>(())
+        })
+        .detach();
+    }
+
     pub fn sync_tab_pane_font_scales_from_mux(&mut self, tab_id: mux::tab::TabId) {
         let Some(tab) = Mux::get().get_tab(tab_id) else {
             return;

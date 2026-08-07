@@ -504,6 +504,7 @@ pdu! {
     AdjustPaneSize: 62,
     SetPaneFontScale: 63,
     ResizePanes: 64,
+    ResizeSplit: 65,
 }
 
 impl Pdu {
@@ -518,6 +519,7 @@ impl Pdu {
             | Self::SendPaste(_)
             | Self::Resize(_)
             | Self::ResizePanes(_)
+            | Self::ResizeSplit(_)
             | Self::SetPaneFontScale(_)
             | Self::SetClipboard(_)
             | Self::SetPaneZoomed(_)
@@ -875,6 +877,15 @@ pub struct ResizePane {
 #[derive(Deserialize, Serialize, PartialEq, Debug)]
 pub struct ResizePanes {
     pub containing_tab_id: TabId,
+    pub panes: Vec<ResizePane>,
+}
+
+#[derive(Deserialize, Serialize, PartialEq, Debug)]
+pub struct ResizeSplit {
+    pub containing_tab_id: TabId,
+    pub split_index: usize,
+    /// Divider movement in the tab's logical cell coordinate space.
+    pub delta: isize,
     pub panes: Vec<ResizePane>,
 }
 

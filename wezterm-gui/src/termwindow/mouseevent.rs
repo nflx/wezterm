@@ -198,7 +198,13 @@ impl super::TermWindow {
                     // Completed a drag
                     if press == &MousePress::Left && matches!(item.item_type, UIItemType::Split(_))
                     {
-                        self.flush_connected_split_resize();
+                        if let UIItemType::Split(split) = item.item_type {
+                            let start_position = match split.direction {
+                                SplitDirection::Horizontal => split.left,
+                                SplitDirection::Vertical => split.top,
+                            };
+                            self.flush_connected_split_resize(split.index, start_position);
+                        }
                     }
                     return;
                 }
@@ -367,8 +373,8 @@ impl super::TermWindow {
         self.dragging.replace((item, start_event));
     }
 
-    fn flush_connected_split_resize(&mut self) {
-        self.flush_connected_tab_resize(true);
+    fn flush_connected_split_resize(&mut self, split_index: usize, start_position: usize) {
+        self.flush_connected_split_resize_at(split_index, start_position);
     }
 
     fn drag_scroll_thumb(

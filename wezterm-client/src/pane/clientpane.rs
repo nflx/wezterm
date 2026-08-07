@@ -599,6 +599,24 @@ impl ClientPane {
         result
     }
 
+    pub async fn flush_pending_split_resize_now(
+        &self,
+        split_index: usize,
+        delta: isize,
+        panes: Vec<ResizePane>,
+    ) -> anyhow::Result<()> {
+        self.client
+            .client
+            .resize_split(ResizeSplit {
+                containing_tab_id: self.remote_tab_id,
+                split_index,
+                delta,
+                panes,
+            })
+            .await?;
+        Ok(())
+    }
+
     fn current_size(&self) -> TerminalSize {
         let size = {
             let render = self.renderable.lock();

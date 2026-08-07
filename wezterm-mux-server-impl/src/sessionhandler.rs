@@ -879,6 +879,38 @@ impl SessionHandler {
                 .detach();
             }
 
+            Pdu::ResizeSplit(ResizeSplit {
+                containing_tab_id,
+                split_index,
+                delta,
+                panes,
+            }) => {
+                spawn_into_main_thread(async move {
+                    catch(
+                        move || {
+                            let mux = Mux::get();
+                            let tab = mux
+                                .get_tab(containing_tab_id)
+                                .ok_or_else(|| anyhow!("no such tab {}", containing_tab_id))?;
+
+                            tab.resize_split_by(split_index, delta);
+                            for resize in panes {
+                                if !should_apply_resize(resize.pane_id, resize.resize_generation) {
+                                    continue;
+                                }
+                                let pane = mux
+                                    .get_pane(resize.pane_id)
+                                    .ok_or_else(|| anyhow!("no such pane {}", resize.pane_id))?;
+                                pane.resize_preserving_split(resize.size)?;
+                            }
+                            Ok(Pdu::UnitResponse(UnitResponse {}))
+                        },
+                        send_response,
+                    )
+                })
+                .detach();
+            }
+
             Pdu::SetPaneFontScale(SetPaneFontScale {
                 pane_id,
                 font_scale,
