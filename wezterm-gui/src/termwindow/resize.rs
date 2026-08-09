@@ -3,12 +3,10 @@ use crate::utilsprites::RenderMetrics;
 use ::window::{Dimensions, ResizeIncrement, Window, WindowOps, WindowState};
 use codec::ResizePane;
 use config::{ConfigHandle, DimensionContext};
-use mux::{
-    pane::{normalize_font_scale, Pane, PaneId},
-    tab::{PositionedPane, Tab},
-    window::WindowId as MuxWindowId,
-    Mux,
-};
+use mux::pane::{normalize_font_scale, Pane, PaneId};
+use mux::tab::{PositionedPane, Tab};
+use mux::window::WindowId as MuxWindowId;
+use mux::Mux;
 use ordered_float::NotNan;
 use std::collections::HashSet;
 use std::rc::Rc;
