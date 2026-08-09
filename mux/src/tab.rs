@@ -57,6 +57,7 @@ struct HiddenLeftSidebar {
 struct HiddenRightSidebar {
     tree: Tree,
     split: SplitDirectionAndSize,
+    right_spine_depth: usize,
 }
 
 /// A Tab is a container of Panes
@@ -487,6 +488,77 @@ fn count_tree_leaves(tree: &Tree) -> usize {
         Tree::Empty => 0,
         Tree::Leaf(_) => 1,
         Tree::Node { left, right, .. } => count_tree_leaves(left) + count_tree_leaves(right),
+    }
+}
+
+fn detach_right_sidebar_tree(
+    root: Tree,
+) -> Result<(Tree, Tree, SplitDirectionAndSize, usize), Tree> {
+    match root {
+        Tree::Node {
+            left,
+            right,
+            data: Some(split),
+        } if split.direction == SplitDirection::Horizontal => {
+            let right_continues_column = matches!(
+                right.as_ref(),
+                Tree::Node {
+                    data: Some(nested),
+                    ..
+                } if nested.direction == SplitDirection::Horizontal
+            );
+            if right_continues_column {
+                match detach_right_sidebar_tree(*right) {
+                    Ok((main_right, tree, sidebar_split, depth)) => Ok((
+                        Tree::Node {
+                            left,
+                            right: Box::new(main_right),
+                            data: Some(split),
+                        },
+                        tree,
+                        sidebar_split,
+                        depth + 1,
+                    )),
+                    Err(right) => Err(Tree::Node {
+                        left,
+                        right: Box::new(right),
+                        data: Some(split),
+                    }),
+                }
+            } else {
+                Ok((*left, *right, split, 0))
+            }
+        }
+        root => Err(root),
+    }
+}
+
+fn restore_right_sidebar_tree(
+    main: Tree,
+    sidebar: Tree,
+    split: SplitDirectionAndSize,
+    right_spine_depth: usize,
+) -> Tree {
+    if right_spine_depth == 0 {
+        return Tree::Node {
+            left: Box::new(main),
+            right: Box::new(sidebar),
+            data: Some(split),
+        };
+    }
+
+    match main {
+        Tree::Node { left, right, data } => Tree::Node {
+            left,
+            right: Box::new(restore_right_sidebar_tree(
+                *right,
+                sidebar,
+                split,
+                right_spine_depth - 1,
+            )),
+            data,
+        },
+        _ => unreachable!("hidden right sidebar path must remain present in the main pane tree"),
     }
 }
 
@@ -1298,11 +1370,12 @@ impl TabInner {
             return;
         };
         let main = self.pane.take().unwrap_or(Tree::Empty);
-        self.pane = Some(Tree::Node {
-            left: Box::new(main),
-            right: Box::new(hidden.tree),
-            data: Some(hidden.split),
-        });
+        self.pane = Some(restore_right_sidebar_tree(
+            main,
+            hidden.tree,
+            hidden.split,
+            hidden.right_spine_depth,
+        ));
     }
 
     fn detach_right_sidebar_tree(&mut self) -> anyhow::Result<()> {
@@ -1311,25 +1384,22 @@ impl TabInner {
             "right sidebar is already hidden"
         );
         let root = self.pane.take().unwrap_or(Tree::Empty);
-        match root {
-            Tree::Node {
-                left,
-                right,
-                data: Some(split),
-            } if split.direction == SplitDirection::Horizontal => {
-                let left_count = count_tree_leaves(&left);
-                self.pane = Some(*left);
-                if self.active >= left_count {
+        match detach_right_sidebar_tree(root) {
+            Ok((main, tree, split, right_spine_depth)) => {
+                let main_count = count_tree_leaves(&main);
+                self.pane = Some(main);
+                if self.active >= main_count {
                     self.active = 0;
                 }
                 self.hidden_right_sidebar = Some(HiddenRightSidebar {
-                    tree: *right,
+                    tree,
                     split,
+                    right_spine_depth,
                 });
                 Ok(())
             }
-            other => {
-                self.pane = Some(other);
+            Err(root) => {
+                self.pane = Some(root);
                 anyhow::bail!("the tab root must be a horizontal split to hide its right sidebar")
             }
         }
@@ -3577,6 +3647,54 @@ mod test {
                 .map(|pane| pane.pane.pane_id())
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn right_sidebar_toggle_hides_only_rightmost_column_after_repeated_splits() {
+        let size = TerminalSize {
+            rows: 24,
+            cols: 100,
+            pixel_width: 1000,
+            pixel_height: 600,
+            dpi: 96,
+        };
+
+        for pane_count in 3..=5 {
+            let tab = Tab::new(&size);
+            tab.assign_pane(&FakePane::new(1, size));
+            for pane_index in 0..pane_count - 1 {
+                split_pane(&tab, pane_index, pane_index + 2, SplitDirection::Horizontal).unwrap();
+            }
+
+            let all_panes = (1..=pane_count).collect::<Vec<_>>();
+            assert_eq!(
+                all_panes,
+                tab.iter_panes()
+                    .iter()
+                    .map(|pane| pane.pane.pane_id())
+                    .collect::<Vec<_>>()
+            );
+
+            tab.set_right_sidebar_hidden(true).unwrap();
+            assert_eq!(
+                (1..pane_count).collect::<Vec<_>>(),
+                tab.iter_panes()
+                    .iter()
+                    .map(|pane| pane.pane.pane_id())
+                    .collect::<Vec<_>>(),
+                "only the rightmost pane should be hidden for {pane_count} panes"
+            );
+
+            tab.set_right_sidebar_hidden(false).unwrap();
+            assert_eq!(
+                all_panes,
+                tab.iter_panes()
+                    .iter()
+                    .map(|pane| pane.pane.pane_id())
+                    .collect::<Vec<_>>(),
+                "the original pane order should be restored for {pane_count} panes"
+            );
+        }
     }
 
     fn split_pane(
