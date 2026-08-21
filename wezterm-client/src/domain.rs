@@ -608,7 +608,7 @@ impl ClientDomain {
 
                 log::debug!("domain: {} tree: {:#?}", inner.local_domain_id, tabroot);
                 let mut workspace = None;
-                tab.sync_with_pane_tree(root_size, tabroot, |entry| {
+                tab.sync_with_pane_tree_preserving_pane_sizes(root_size, tabroot, |entry| {
                     workspace.replace(entry.workspace.clone());
                     remote_panes_to_forget.remove(&entry.pane_id);
                     if let Some(pane_id) = inner.remote_to_local_pane_id(entry.pane_id) {
@@ -616,6 +616,7 @@ impl ClientDomain {
                             Some(pane) => {
                                 if let Some(pane) = pane.downcast_ref::<ClientPane>() {
                                     pane.set_local_font_scale_from_mux(entry.font_scale);
+                                    pane.set_local_dimensions_from_mux(entry.size);
                                 }
                                 pane
                             }

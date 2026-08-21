@@ -899,7 +899,26 @@ impl Tab {
     where
         F: FnMut(PaneEntry) -> Arc<dyn Pane>,
     {
-        self.inner.lock().sync_with_pane_tree(size, root, make_pane)
+        self.inner
+            .lock()
+            .sync_with_pane_tree(size, root, make_pane, true)
+    }
+
+    /// Synchronize a remotely supplied topology while retaining the dimensions
+    /// carried by each remote pane. Split-tree cell dimensions use the tab's
+    /// base font metrics and are not the terminal dimensions of panes with an
+    /// individual font scale.
+    pub fn sync_with_pane_tree_preserving_pane_sizes<F>(
+        &self,
+        size: TerminalSize,
+        root: PaneNode,
+        make_pane: F,
+    ) where
+        F: FnMut(PaneEntry) -> Arc<dyn Pane>,
+    {
+        self.inner
+            .lock()
+            .sync_with_pane_tree(size, root, make_pane, false)
     }
 
     pub fn codec_pane_tree(&self) -> PaneNode {
@@ -1173,8 +1192,13 @@ impl TabInner {
         }
     }
 
-    fn sync_with_pane_tree<F>(&mut self, size: TerminalSize, root: PaneNode, mut make_pane: F)
-    where
+    fn sync_with_pane_tree<F>(
+        &mut self,
+        size: TerminalSize,
+        root: PaneNode,
+        mut make_pane: F,
+        resize_panes: bool,
+    ) where
         F: FnMut(PaneEntry) -> Arc<dyn Pane>,
     {
         let mut active = None;
@@ -1227,10 +1251,14 @@ impl TabInner {
             }
         }
 
-        if let Some(zoomed) = &self.zoomed {
-            zoomed.resize_preserving_split(size).ok();
-        } else if let Some(root) = self.pane.as_mut() {
-            apply_sizes_from_splits_preserving_split(root, &size);
+        if resize_panes {
+            if let Some(zoomed) = &self.zoomed {
+                zoomed.resize_preserving_split(size).ok();
+            } else if let Some(root) = self.pane.as_mut() {
+                apply_sizes_from_splits_preserving_split(root, &size);
+            }
+        }
+        if self.zoomed.is_none() {
             Mux::try_get().map(|mux| mux.notify(MuxNotification::TabResized(self.id)));
         }
 

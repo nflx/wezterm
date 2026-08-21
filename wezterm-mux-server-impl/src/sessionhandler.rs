@@ -19,15 +19,18 @@ use wezterm_term::StableRowIndex;
 
 lazy_static::lazy_static! {
     static ref PENDING_SPLIT_REBUILDS: Mutex<HashMap<TabId, u64>> = Mutex::new(HashMap::new());
-    static ref LATEST_RESIZE_GENERATIONS: Mutex<HashMap<PaneId, u64>> = Mutex::new(HashMap::new());
 }
 
-fn should_apply_resize(pane_id: PaneId, resize_generation: u64) -> bool {
+fn should_apply_resize(
+    latest_resize_generations: &Mutex<HashMap<PaneId, u64>>,
+    pane_id: PaneId,
+    resize_generation: u64,
+) -> bool {
     if resize_generation == 0 {
         return true;
     }
 
-    let mut latest = LATEST_RESIZE_GENERATIONS.lock().unwrap();
+    let mut latest = latest_resize_generations.lock().unwrap();
     let entry = latest.entry(pane_id).or_insert(0);
     if resize_generation < *entry {
         if std::env::var_os("WEZTERM_PANE_FONT_TRACE").is_some() {
@@ -289,6 +292,7 @@ fn maybe_push_pane_changes(
 pub struct SessionHandler {
     to_write_tx: PduSender,
     per_pane: HashMap<TabId, Arc<Mutex<PerPane>>>,
+    latest_resize_generations: Arc<Mutex<HashMap<PaneId, u64>>>,
     client_id: Option<Arc<ClientId>>,
     proxy_client_id: Option<ClientId>,
 }
@@ -307,6 +311,7 @@ impl SessionHandler {
         Self {
             to_write_tx,
             per_pane: HashMap::new(),
+            latest_resize_generations: Arc::new(Mutex::new(HashMap::new())),
             client_id: None,
             proxy_client_id: None,
         }
@@ -337,6 +342,7 @@ impl SessionHandler {
     pub fn process_one(&mut self, decoded: DecodedPdu) {
         let start = Instant::now();
         let sender = self.to_write_tx.clone();
+        let latest_resize_generations = Arc::clone(&self.latest_resize_generations);
         let serial = decoded.serial;
 
         if let Some(client_id) = &self.client_id {
@@ -770,7 +776,11 @@ impl SessionHandler {
                 spawn_into_main_thread(async move {
                     catch(
                         move || {
-                            if !should_apply_resize(pane_id, resize_generation) {
+                            if !should_apply_resize(
+                                &latest_resize_generations,
+                                pane_id,
+                                resize_generation,
+                            ) {
                                 return Ok(Pdu::UnitResponse(UnitResponse {}));
                             }
 
@@ -819,6 +829,7 @@ impl SessionHandler {
                     );
                 }
                 if serial == 0 {
+                    let one_way_latest_resize_generations = Arc::clone(&latest_resize_generations);
                     spawn_into_main_thread(async move {
                         let result = move || -> anyhow::Result<()> {
                             let mux = Mux::get();
@@ -828,7 +839,11 @@ impl SessionHandler {
 
                             let single_pane_tab = tab.iter_panes_ignoring_zoom().len() == 1;
                             for resize in panes {
-                                if !should_apply_resize(resize.pane_id, resize.resize_generation) {
+                                if !should_apply_resize(
+                                    &one_way_latest_resize_generations,
+                                    resize.pane_id,
+                                    resize.resize_generation,
+                                ) {
                                     continue;
                                 }
 
@@ -881,7 +896,11 @@ impl SessionHandler {
 
                             let single_pane_tab = tab.iter_panes_ignoring_zoom().len() == 1;
                             for resize in panes {
-                                if !should_apply_resize(resize.pane_id, resize.resize_generation) {
+                                if !should_apply_resize(
+                                    &latest_resize_generations,
+                                    resize.pane_id,
+                                    resize.resize_generation,
+                                ) {
                                     continue;
                                 }
 
@@ -935,7 +954,11 @@ impl SessionHandler {
 
                             tab.resize_split_by(split_index, delta);
                             for resize in panes {
-                                if !should_apply_resize(resize.pane_id, resize.resize_generation) {
+                                if !should_apply_resize(
+                                    &latest_resize_generations,
+                                    resize.pane_id,
+                                    resize.resize_generation,
+                                ) {
                                     continue;
                                 }
                                 let pane = mux
@@ -1464,4 +1487,27 @@ async fn move_pane(
         tab_id: tab.tab_id(),
         window_id,
     }))
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn resize_generations_are_scoped_to_a_client_session() {
+        let first_session = Mutex::new(HashMap::new());
+        assert!(should_apply_resize(&first_session, 7, 9000));
+        assert!(!should_apply_resize(&first_session, 7, 1));
+
+        let reconnected_session = Mutex::new(HashMap::new());
+        assert!(should_apply_resize(&reconnected_session, 7, 1));
+    }
+
+    #[test]
+    fn unsequenced_resizes_are_always_applied() {
+        let session = Mutex::new(HashMap::new());
+        assert!(should_apply_resize(&session, 7, 50));
+        assert!(should_apply_resize(&session, 7, 0));
+        assert!(!should_apply_resize(&session, 7, 49));
+    }
 }
