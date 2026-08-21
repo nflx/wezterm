@@ -571,7 +571,10 @@ impl Mux {
             .get_tab(tab_id)
             .ok_or_else(|| anyhow::anyhow!("tab {tab_id} not found"))?;
 
-        tab.set_active_pane(&pane);
+        // This method is itself called while handling PaneFocused.  Re-emitting
+        // PaneFocused here creates a feedback loop when two queued focus events
+        // refer to different panes.
+        tab.reconcile_active_pane(&pane);
 
         Ok(())
     }

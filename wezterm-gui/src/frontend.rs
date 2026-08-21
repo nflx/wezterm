@@ -80,6 +80,15 @@ impl GuiFrontEnd {
                 MuxNotification::PaneFocused(pane_id) => {
                     promise::spawn::spawn_into_main_thread(async move {
                         let mux = Mux::get();
+                        // PaneRemoved and PaneFocused are delivered
+                        // asynchronously.  A focus event already queued when a
+                        // pane is removed is stale and requires no action.
+                        if mux.get_pane(pane_id).is_none() {
+                            log::debug!(
+                                "Ignoring stale PaneFocused notification for pane {pane_id}"
+                            );
+                            return;
+                        }
                         if let Err(err) = mux.focus_pane_and_containing_tab(pane_id) {
                             log::error!("Error reconciling PaneFocused notification: {err:#}");
                         }
