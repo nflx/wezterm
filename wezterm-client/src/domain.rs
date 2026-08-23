@@ -616,7 +616,6 @@ impl ClientDomain {
                             Some(pane) => {
                                 if let Some(pane) = pane.downcast_ref::<ClientPane>() {
                                     pane.set_local_font_scale_from_mux(entry.font_scale);
-                                    pane.set_local_dimensions_from_mux(entry.size);
                                 }
                                 pane
                             }

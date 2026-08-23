@@ -732,26 +732,6 @@ impl ClientPane {
         Ok(())
     }
 
-    /// Apply dimensions received from the remote mux without echoing a resize
-    /// request back to that mux.
-    pub fn set_local_dimensions_from_mux(&self, size: TerminalSize) {
-        let render = self.renderable.lock();
-        let mut inner = render.inner.borrow_mut();
-        let changed = inner.dimensions.cols != size.cols
-            || inner.dimensions.viewport_rows != size.rows
-            || inner.dimensions.pixel_width != size.pixel_width
-            || inner.dimensions.pixel_height != size.pixel_height
-            || inner.dimensions.dpi != size.dpi;
-        if changed {
-            inner.dimensions.cols = size.cols;
-            inner.dimensions.viewport_rows = size.rows;
-            inner.dimensions.pixel_width = size.pixel_width;
-            inner.dimensions.pixel_height = size.pixel_height;
-            inner.dimensions.dpi = size.dpi;
-            inner.make_all_stale();
-        }
-    }
-
     /// Arrange to suppress the next Pane::kill call.
     /// This is a bit of a hack that we use when closing a window;
     /// our Domain::local_window_is_closing impl calls this for each

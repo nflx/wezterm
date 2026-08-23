@@ -3117,6 +3117,54 @@ mod test {
     }
 
     #[test]
+    fn remote_tree_sync_preserves_existing_pane_dimensions() {
+        let remote_size = TerminalSize {
+            rows: 18,
+            cols: 36,
+            pixel_width: 360,
+            pixel_height: 342,
+            dpi: 96,
+        };
+        let font_aware_size = TerminalSize {
+            rows: 22,
+            cols: 51,
+            ..remote_size
+        };
+        let pane = FakePane::new(1, font_aware_size);
+        let tab = Tab::new(&remote_size);
+        let pane_for_sync = Arc::clone(&pane);
+        let root = PaneNode::Leaf(PaneEntry {
+            window_id: 1,
+            tab_id: tab.tab_id(),
+            pane_id: pane.pane_id(),
+            title: String::new(),
+            size: remote_size,
+            working_dir: None,
+            is_active_pane: true,
+            is_zoomed_pane: false,
+            workspace: String::new(),
+            cursor_pos: StableCursorPosition::default(),
+            physical_top: 0,
+            top_row: 0,
+            left_col: 0,
+            top_px: 0,
+            left_px: 0,
+            font_scale: Some(0.75),
+            tty_name: None,
+        });
+
+        tab.sync_with_pane_tree_preserving_pane_sizes(remote_size, root, move |_| {
+            Arc::clone(&pane_for_sync)
+        });
+
+        let dimensions = pane.get_dimensions();
+        assert_eq!(dimensions.cols, font_aware_size.cols);
+        assert_eq!(dimensions.viewport_rows, font_aware_size.rows);
+        assert_eq!(dimensions.pixel_width, font_aware_size.pixel_width);
+        assert_eq!(dimensions.pixel_height, font_aware_size.pixel_height);
+    }
+
+    #[test]
     fn tab_splitting() {
         let size = TerminalSize {
             rows: 24,
