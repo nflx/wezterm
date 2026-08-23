@@ -17,6 +17,8 @@ use wezterm_term::TerminalSize;
 
 static CONNECTED_TAB_RESIZE_FLUSHES: LazyLock<Mutex<HashSet<MuxWindowId>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
+static CONNECTED_SPLIT_DRAGS: LazyLock<Mutex<HashSet<MuxWindowId>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
 
 #[derive(Debug, Clone, Copy)]
 pub struct RowsAndCols {
@@ -71,6 +73,13 @@ fn connected_tab_resize_has_pending(mux_window_id: MuxWindowId) -> bool {
             .downcast_ref::<wezterm_client::pane::ClientPane>()
             .is_some_and(|client_pane| client_pane.has_pending_resize())
     })
+}
+
+fn connected_split_drag_active(mux_window_id: MuxWindowId) -> bool {
+    CONNECTED_SPLIT_DRAGS
+        .lock()
+        .expect("CONNECTED_SPLIT_DRAGS mutex poisoned")
+        .contains(&mux_window_id)
 }
 
 fn take_connected_tab_resize_batch(
@@ -802,6 +811,13 @@ impl super::TermWindow {
     }
 
     pub(crate) fn flush_connected_tab_resize(&self, preserve_split: bool) {
+        // A split drag is a single geometry transaction. Sending the
+        // intermediate font-aware pane sizes as ordinary ResizePanes requests
+        // makes the server rebuild its split tree from each partial update.
+        // Keep those sizes local until mouse release sends one ResizeSplit.
+        if connected_split_drag_active(self.mux_window_id) {
+            return;
+        }
         if !connected_tab_resize_has_pending(self.mux_window_id) {
             return;
         }
@@ -834,6 +850,10 @@ impl super::TermWindow {
         promise::spawn::spawn(async move {
             loop {
                 smol::Timer::after(Duration::from_millis(16)).await;
+
+                if connected_split_drag_active(mux_window_id) {
+                    break;
+                }
 
                 let Some((batch_sender, batch)) =
                     take_connected_tab_resize_batch(mux_window_id, preserve_split)
@@ -873,26 +893,73 @@ impl super::TermWindow {
         .detach();
     }
 
+    pub(crate) fn begin_connected_split_resize(&self) {
+        let inserted = CONNECTED_SPLIT_DRAGS
+            .lock()
+            .expect("CONNECTED_SPLIT_DRAGS mutex poisoned")
+            .insert(self.mux_window_id);
+        if inserted && pane_font_trace_enabled() {
+            log::info!(
+                target: "pane_font_trace",
+                "gui split-drag begin window={}",
+                self.mux_window_id
+            );
+        }
+    }
+
+    pub(crate) fn connected_split_resize_active(&self) -> bool {
+        connected_split_drag_active(self.mux_window_id)
+    }
+
     pub(crate) fn flush_connected_split_resize_at(
         &self,
         split_index: usize,
         start_position: usize,
     ) {
-        let Some(tab) = Mux::get().get_active_tab_for_window(self.mux_window_id) else {
+        let resize = (|| {
+            let tab = Mux::get().get_active_tab_for_window(self.mux_window_id)?;
+            let split = tab.iter_splits().into_iter().nth(split_index)?;
+            let position = match split.direction {
+                mux::tab::SplitDirection::Horizontal => split.left,
+                mux::tab::SplitDirection::Vertical => split.top,
+            };
+            let delta = position as isize - start_position as isize;
+
+            // Mouse motion only updates the split tree. Perform the expensive
+            // terminal reflow once, using the final pixel rectangles, before
+            // collecting the authoritative release batch.
+            self.resize_tab_panes_for_font_scale(&tab);
+            let (batch_sender, batch) = take_connected_tab_resize_batch(self.mux_window_id, true)?;
+            Some((batch_sender, batch, delta))
+        })();
+
+        CONNECTED_SPLIT_DRAGS
+            .lock()
+            .expect("CONNECTED_SPLIT_DRAGS mutex poisoned")
+            .remove(&self.mux_window_id);
+
+        let Some((batch_sender, batch, delta)) = resize else {
+            if pane_font_trace_enabled() {
+                log::info!(
+                    target: "pane_font_trace",
+                    "gui split-drag release window={} split={} no-pending-batch",
+                    self.mux_window_id,
+                    split_index
+                );
+            }
             return;
         };
-        let Some(split) = tab.iter_splits().into_iter().nth(split_index) else {
-            return;
-        };
-        let position = match split.direction {
-            mux::tab::SplitDirection::Horizontal => split.left,
-            mux::tab::SplitDirection::Vertical => split.top,
-        };
-        let delta = position as isize - start_position as isize;
-        let Some((batch_sender, batch)) = take_connected_tab_resize_batch(self.mux_window_id, true)
-        else {
-            return;
-        };
+
+        if pane_font_trace_enabled() {
+            log::info!(
+                target: "pane_font_trace",
+                "gui split-drag release window={} split={} delta={} panes={}",
+                self.mux_window_id,
+                split_index,
+                delta,
+                batch.len()
+            );
+        }
 
         promise::spawn::spawn(async move {
             if let Some(client_pane) =

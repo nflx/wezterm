@@ -605,6 +605,16 @@ impl ClientPane {
         delta: isize,
         panes: Vec<ResizePane>,
     ) -> anyhow::Result<()> {
+        if pane_font_trace_enabled() {
+            log::info!(
+                target: "pane_font_trace",
+                "client flush-split tab={} split={} delta={} panes={}",
+                self.remote_tab_id,
+                split_index,
+                delta,
+                panes.len()
+            );
+        }
         self.client
             .client
             .resize_split(ResizeSplit {

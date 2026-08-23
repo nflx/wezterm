@@ -1330,16 +1330,23 @@ impl TermWindow {
                 }
                 MuxNotification::TabResized(tab_id) => {
                     // Also handled by wezterm-client
-                    self.sync_tab_pane_font_scales_from_mux(tab_id);
-                    self.apply_pending_split_font_scales(tab_id);
-                    self.resize_tab_id_panes_for_font_scale(tab_id);
-                    self.shape_generation += 1;
-                    self.shape_cache.borrow_mut().clear();
-                    self.line_to_ele_shape_cache.borrow_mut().clear();
-                    self.quad_generation += 1;
-                    self.line_quad_cache.borrow_mut().clear();
-                    self.update_title_post_status();
-                    window.invalidate();
+                    if self.connected_split_resize_active() {
+                        // Split motion changes pane rectangles at pointer rate.
+                        // Painting those rectangles is cheap; terminal reflow
+                        // and cache invalidation are deferred until release.
+                        window.invalidate();
+                    } else {
+                        self.sync_tab_pane_font_scales_from_mux(tab_id);
+                        self.apply_pending_split_font_scales(tab_id);
+                        self.resize_tab_id_panes_for_font_scale(tab_id);
+                        self.shape_generation += 1;
+                        self.shape_cache.borrow_mut().clear();
+                        self.line_to_ele_shape_cache.borrow_mut().clear();
+                        self.quad_generation += 1;
+                        self.line_quad_cache.borrow_mut().clear();
+                        self.update_title_post_status();
+                        window.invalidate();
+                    }
                 }
                 MuxNotification::TabTitleChanged { .. } => {
                     self.update_title_post_status();

@@ -344,16 +344,14 @@ impl super::TermWindow {
         let current_split = tab.iter_splits().into_iter().nth(split.index);
         let delta = match (split.direction, current_split.as_ref()) {
             (SplitDirection::Horizontal, Some(current)) => {
-                let mouse_delta_cells =
-                    signed_cell_delta(event.coords.x, start_event.coords.x, cell_width);
-                let target_left = (split.left as isize).saturating_add(mouse_delta_cells);
-                target_left.saturating_sub(current.left as isize)
+                let target_left = (split.pixel_left as isize)
+                    .saturating_add(event.coords.x.saturating_sub(start_event.coords.x));
+                signed_cell_delta(target_left, current.pixel_left as isize, cell_width)
             }
             (SplitDirection::Vertical, Some(current)) => {
-                let mouse_delta_cells =
-                    signed_cell_delta(event.coords.y, start_event.coords.y, cell_height);
-                let target_top = (split.top as isize).saturating_add(mouse_delta_cells);
-                target_top.saturating_sub(current.top as isize)
+                let target_top = (split.pixel_top as isize)
+                    .saturating_add(event.coords.y.saturating_sub(start_event.coords.y));
+                signed_cell_delta(target_top, current.pixel_top as isize, cell_height)
             }
             _ => 0,
         };
@@ -364,6 +362,7 @@ impl super::TermWindow {
                     .downcast_ref::<wezterm_client::pane::ClientPane>()
                     .is_some()
             }) {
+                self.begin_connected_split_resize();
                 tab.resize_split_by_preserving_split(split.index, delta);
             } else {
                 tab.resize_split_by(split.index, delta);
