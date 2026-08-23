@@ -34,6 +34,33 @@ fn pane_font_trace_enabled() -> bool {
     std::env::var_os("WEZTERM_PANE_FONT_TRACE").is_some()
 }
 
+/// A connected mux tab can contain panes with different font scales, so its
+/// aggregate row/column count is not comparable to the GUI window's base-font
+/// grid. Its physical extent is authoritative during remote reconciliation.
+fn connected_tab_needs_physical_resize(tab: TerminalSize, window: TerminalSize) -> bool {
+    if tab.dpi != window.dpi {
+        return true;
+    }
+
+    // Nested split calculations can accumulate a handful of pixels of
+    // rounding error. Resizing the complete tab to correct less than one base
+    // cell destroys the font-aware row/column counts and feeds the result back
+    // to the mux. A real terminal-grid resize crosses at least one base cell.
+    let cell_width = window
+        .pixel_width
+        .checked_div(window.cols)
+        .unwrap_or(1)
+        .max(1);
+    let cell_height = window
+        .pixel_height
+        .checked_div(window.rows)
+        .unwrap_or(1)
+        .max(1);
+
+    tab.pixel_width.abs_diff(window.pixel_width) >= cell_width
+        || tab.pixel_height.abs_diff(window.pixel_height) >= cell_height
+}
+
 fn connected_tab_resize_has_pending(mux_window_id: MuxWindowId) -> bool {
     let Some(tab) = Mux::get().get_active_tab_for_window(mux_window_id) else {
         return false;
@@ -748,12 +775,26 @@ impl super::TermWindow {
             return;
         };
         let tab_size = tab.get_size();
-        if tab_size.rows != self.terminal_size.rows
-            || tab_size.cols != self.terminal_size.cols
-            || tab_size.pixel_width != self.terminal_size.pixel_width
-            || tab_size.pixel_height != self.terminal_size.pixel_height
-            || tab_size.dpi != self.terminal_size.dpi
-        {
+        let needs_physical_resize =
+            connected_tab_needs_physical_resize(tab_size, self.terminal_size);
+        if needs_physical_resize && pane_font_trace_enabled() {
+            log::info!(
+                target: "pane_font_trace",
+                "gui connected-tab physical-resize tab={} actual={}x{} px={}x{} dpi={} window={}x{} px={}x{} dpi={}",
+                tab_id,
+                tab_size.cols,
+                tab_size.rows,
+                tab_size.pixel_width,
+                tab_size.pixel_height,
+                tab_size.dpi,
+                self.terminal_size.cols,
+                self.terminal_size.rows,
+                self.terminal_size.pixel_width,
+                self.terminal_size.pixel_height,
+                self.terminal_size.dpi,
+            );
+        }
+        if needs_physical_resize {
             tab.resize_preserving_split(self.terminal_size);
         }
         self.resize_tab_panes_for_font_scale(&tab);
@@ -1117,5 +1158,54 @@ pub fn effective_right_padding(config: &ConfigHandle, context: DimensionContext)
         context.pixel_cell as usize
     } else {
         config.window_padding.right.evaluate_as_pixels(context) as usize
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::connected_tab_needs_physical_resize;
+    use wezterm_term::TerminalSize;
+
+    fn size(rows: usize, cols: usize, pixel_width: usize, pixel_height: usize) -> TerminalSize {
+        TerminalSize {
+            rows,
+            cols,
+            pixel_width,
+            pixel_height,
+            dpi: 96,
+        }
+    }
+
+    #[test]
+    fn mixed_font_cell_counts_do_not_resize_same_physical_tab() {
+        let mixed_font_tab = size(34, 93, 780, 722);
+        let base_font_window = size(38, 78, 780, 722);
+
+        assert!(!connected_tab_needs_physical_resize(
+            mixed_font_tab,
+            base_font_window
+        ));
+    }
+
+    #[test]
+    fn connected_tab_resizes_when_physical_extent_changes() {
+        let tab = size(38, 78, 780, 722);
+        let wider_window = size(38, 79, 790, 722);
+        let mut higher_dpi_window = tab;
+        higher_dpi_window.dpi = 144;
+
+        assert!(connected_tab_needs_physical_resize(tab, wider_window));
+        assert!(connected_tab_needs_physical_resize(tab, higher_dpi_window));
+    }
+
+    #[test]
+    fn connected_tab_ignores_sub_cell_split_rounding() {
+        let rounded_remote_tab = size(32, 107, 1101, 739);
+        let base_font_window = size(32, 110, 1100, 736);
+
+        assert!(!connected_tab_needs_physical_resize(
+            rounded_remote_tab,
+            base_font_window
+        ));
     }
 }
