@@ -916,8 +916,14 @@ impl Pane for ClientPane {
         self.resize_impl(size, true, true)
     }
 
-    fn resize_preserving_split_for_split_drag(&self, size: TerminalSize) -> anyhow::Result<()> {
-        self.resize_impl(size, true, true)
+    fn resize_preserving_split_for_split_drag(&self, _size: TerminalSize) -> anyhow::Result<()> {
+        // The split tree uses the window's base-font grid, which is not the
+        // terminal grid for a pane with an individual font scale. Applying
+        // that intermediate size makes the terminal reflow once here and
+        // again when TermWindow handles the synchronous TabResized event.
+        // Defer the leaf resize so TermWindow applies only the final,
+        // font-aware size and batches that size to the remote mux.
+        Ok(())
     }
 
     fn font_scale(&self) -> Option<f64> {
