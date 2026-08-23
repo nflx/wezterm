@@ -1332,6 +1332,58 @@ impl Mux {
         Ok((tab, window_id))
     }
 
+    /// Move a pane beside a target pane, either within one tab or across two
+    /// existing tabs. The target tab owns the resulting split geometry.
+    pub fn reposition_pane(
+        &self,
+        pane_id: PaneId,
+        target_pane_id: PaneId,
+        request: crate::tab::SplitRequest,
+    ) -> anyhow::Result<()> {
+        let (source_domain, source_window, source_tab_id) = self
+            .resolve_pane_id(pane_id)
+            .ok_or_else(|| anyhow!("pane {pane_id} not found"))?;
+        let (target_domain, target_window, target_tab_id) = self
+            .resolve_pane_id(target_pane_id)
+            .ok_or_else(|| anyhow!("target pane {target_pane_id} not found"))?;
+        if source_window != target_window {
+            anyhow::bail!("cross-window pane reposition is not supported");
+        }
+        if source_domain != target_domain {
+            anyhow::bail!("cannot reposition panes across mux domains");
+        }
+
+        let source_tab = self
+            .get_tab(source_tab_id)
+            .ok_or_else(|| anyhow!("source tab {source_tab_id} not found"))?;
+        if source_tab_id == target_tab_id {
+            return source_tab.reposition_pane(pane_id, target_pane_id, request);
+        }
+
+        let target_tab = self
+            .get_tab(target_tab_id)
+            .ok_or_else(|| anyhow!("target tab {target_tab_id} not found"))?;
+        let target_index = target_tab
+            .iter_panes_ignoring_zoom()
+            .iter()
+            .position(|pos| pos.pane.pane_id() == target_pane_id)
+            .ok_or_else(|| anyhow!("target pane {target_pane_id} is not in its tab"))?;
+        target_tab
+            .compute_split_size(target_index, request)
+            .ok_or_else(|| anyhow!("target pane is too small to split"))?;
+
+        let pane = source_tab
+            .remove_pane(pane_id)
+            .ok_or_else(|| anyhow!("failed to detach pane {pane_id}"))?;
+        let inserted = target_tab.split_and_insert(target_index, request, pane)?;
+        target_tab.set_active_idx(inserted);
+
+        if source_tab.is_dead() {
+            self.remove_tab(source_tab_id);
+        }
+        Ok(())
+    }
+
     pub async fn spawn_tab_or_window(
         &self,
         window_id: Option<WindowId>,

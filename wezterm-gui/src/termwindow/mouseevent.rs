@@ -1,16 +1,16 @@
 use crate::tabbar::TabBarItem;
 use crate::termwindow::{
-    GuiWin, MouseCapture, PositionedSplit, ScrollHit, TermWindowNotif, UIItem, UIItemType, TMB,
+    GuiWin, MouseCapture, PositionedSplit, ScrollHit, TMB, TermWindowNotif, UIItem, UIItemType,
 };
 use ::window::{
     MouseButtons as WMB, MouseCursor, MouseEvent, MouseEventKind as WMEK, MousePress,
     WindowDecorations, WindowOps, WindowState,
 };
-use config::keyassignment::{KeyAssignment, MouseEventTrigger, SpawnTabDomain};
 use config::MouseEventAltScreen;
+use config::keyassignment::{KeyAssignment, MouseEventTrigger, SpawnTabDomain};
+use mux::Mux;
 use mux::pane::{Pane, WithPaneLines};
 use mux::tab::{PositionedPane, SplitDirection};
-use mux::Mux;
 use mux_lua::MuxPane;
 use std::convert::TryInto;
 use std::ops::Sub;
@@ -99,6 +99,164 @@ impl super::TermWindow {
             .cloned()
     }
 
+    fn pane_drop_target(
+        &self,
+        event: &MouseEvent,
+        source_pane_id: mux::pane::PaneId,
+    ) -> Option<super::PaneDropTarget> {
+        let tab = Mux::get().get_active_tab_for_window(self.mux_window_id)?;
+        let pos = tab.iter_panes().into_iter().find(|pos| {
+            pos.pane.pane_id() != source_pane_id && self.event_in_positioned_pane(event, pos)
+        })?;
+        let (left, top) = self.pane_content_origin_pixels(&pos);
+        let width = pos.pixel_width.max(1) as f32;
+        let height = pos.pixel_height.max(1) as f32;
+        let rel_x = ((event.coords.x as f32 - left) / width).clamp(0., 1.);
+        let rel_y = ((event.coords.y as f32 - top) / height).clamp(0., 1.);
+        let distances = [rel_x, 1. - rel_x, rel_y, 1. - rel_y];
+        let edge = distances
+            .iter()
+            .enumerate()
+            .min_by(|a, b| a.1.total_cmp(b.1))
+            .map(|(idx, _)| idx)?;
+        let (zone, x, y, width, height) = match edge {
+            0 => (super::PaneDropZone::Left, left, top, width / 2., height),
+            1 => (
+                super::PaneDropZone::Right,
+                left + width / 2.,
+                top,
+                width / 2.,
+                height,
+            ),
+            2 => (super::PaneDropZone::Top, left, top, width, height / 2.),
+            _ => (
+                super::PaneDropZone::Bottom,
+                left,
+                top + height / 2.,
+                width,
+                height / 2.,
+            ),
+        };
+        Some(super::PaneDropTarget {
+            pane_id: pos.pane.pane_id(),
+            zone,
+            x,
+            y,
+            width,
+            height,
+        })
+    }
+
+    fn finish_pane_drag(&mut self) {
+        let drag = match self.pane_drag.take() {
+            Some(drag) => drag,
+            None => return,
+        };
+        let source_pane_id = drag.source_pane_id;
+        let target = match drag.target {
+            Some(target) => target,
+            None => return,
+        };
+        let (direction, target_is_second) = match target.zone {
+            super::PaneDropZone::Left => (SplitDirection::Horizontal, false),
+            super::PaneDropZone::Right => (SplitDirection::Horizontal, true),
+            super::PaneDropZone::Top => (SplitDirection::Vertical, false),
+            super::PaneDropZone::Bottom => (SplitDirection::Vertical, true),
+        };
+        if let Some(tab) = Mux::get().get_active_tab_for_window(self.mux_window_id) {
+            let request = mux::tab::SplitRequest {
+                direction,
+                target_is_second,
+                top_level: false,
+                size: mux::tab::SplitSize::Percent(50),
+            };
+
+            let panes = tab.iter_panes_ignoring_zoom();
+            let source = Mux::get().get_pane(source_pane_id);
+            let remote_target = panes
+                .iter()
+                .find(|pos| pos.pane.pane_id() == target.pane_id)
+                .and_then(|pos| {
+                    pos.pane
+                        .downcast_ref::<wezterm_client::pane::ClientPane>()
+                        .map(|pane| pane.remote_pane_id)
+                });
+
+            if let (Some(source), Some(remote_target_pane_id)) = (source, remote_target) {
+                if source
+                    .downcast_ref::<wezterm_client::pane::ClientPane>()
+                    .is_some()
+                {
+                    let source = Arc::clone(&source);
+                    promise::spawn::spawn_into_main_thread(async move {
+                        let client_source = source
+                            .downcast_ref::<wezterm_client::pane::ClientPane>()
+                            .expect("source pane type changed");
+                        if let Err(err) = client_source
+                            .reposition_pane(remote_target_pane_id, request)
+                            .await
+                        {
+                            log::error!("failed to reposition remote pane: {err:#}");
+                        }
+                    })
+                    .detach();
+                    return;
+                }
+            }
+
+            if let Err(err) = Mux::get().reposition_pane(source_pane_id, target.pane_id, request) {
+                log::error!("failed to reposition pane: {err:#}");
+            }
+        }
+    }
+
+    fn update_pane_drag_hover(&mut self, event: &MouseEvent) -> bool {
+        let hovered_tab = self.resolve_ui_item(event).and_then(|item| match item.item_type {
+            UIItemType::TabBar(TabBarItem::Tab { tab_idx, .. }) => Some(tab_idx),
+            _ => None,
+        });
+
+        let drag = match self.pane_drag.as_mut() {
+            Some(drag) => drag,
+            None => return false,
+        };
+        if hovered_tab.is_none() {
+            drag.hover_tab = None;
+            return false;
+        }
+
+        drag.target = None;
+        if drag.hover_tab == hovered_tab {
+            return true;
+        }
+        drag.hover_tab = hovered_tab;
+
+        let Some(tab_idx) = hovered_tab else {
+            return true;
+        };
+        let Some(window) = self.window.clone() else {
+            return true;
+        };
+        promise::spawn::spawn_into_main_thread(async move {
+            smol::Timer::after(Duration::from_millis(450)).await;
+            window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                let still_hovered = term_window
+                    .pane_drag
+                    .as_ref()
+                    .and_then(|drag| drag.hover_tab)
+                    == Some(tab_idx);
+                if still_hovered {
+                    term_window.activate_tab(tab_idx as isize).ok();
+                    if let Some(window) = term_window.window.as_ref() {
+                        window.invalidate();
+                    }
+                }
+            })));
+        })
+        .detach();
+        true
+    }
+
     fn leave_ui_item(&mut self, item: &UIItem) {
         match item.item_type {
             UIItemType::TabBar(_) => {
@@ -131,6 +289,59 @@ impl super::TermWindow {
         };
 
         self.current_mouse_event.replace(event.clone());
+
+        // Alt+left drag is reserved for moving panes and must not be sent to
+        // the terminal application or interpreted as text selection.
+        if let Some(source_pane_id) = self.pane_drag.as_ref().map(|drag| drag.source_pane_id) {
+            match event.kind {
+                WMEK::Move => {
+                    let hovering_tab = self.update_pane_drag_hover(&event);
+                    let target = if hovering_tab {
+                        None
+                    } else {
+                        self.pane_drop_target(&event, source_pane_id)
+                    };
+                    if let Some(drag) = self.pane_drag.as_mut() {
+                        drag.target = target;
+                    }
+                    context.invalidate();
+                    return;
+                }
+                WMEK::Release(MousePress::Left) => {
+                    self.current_mouse_capture = None;
+                    self.current_mouse_buttons
+                        .retain(|p| p != &MousePress::Left);
+                    self.finish_pane_drag();
+                    context.invalidate();
+                    return;
+                }
+                _ => return,
+            }
+        }
+
+        if event.kind == WMEK::Press(MousePress::Left)
+            && event.modifiers.contains(::window::Modifiers::ALT)
+        {
+            if let Some(tab) = Mux::get().get_active_tab_for_window(self.mux_window_id) {
+                if tab.get_zoomed_pane().is_none() {
+                    if let Some(pos) = tab
+                        .iter_panes()
+                        .into_iter()
+                        .find(|pos| self.event_in_positioned_pane(&event, pos))
+                    {
+                        self.pane_drag = Some(super::PaneDragState {
+                            source_pane_id: pos.pane.pane_id(),
+                            target: None,
+                            hover_tab: None,
+                        });
+                        self.current_mouse_capture = Some(MouseCapture::UI);
+                        self.current_mouse_buttons.push(MousePress::Left);
+                        context.invalidate();
+                        return;
+                    }
+                }
+            }
+        }
 
         let border = self.get_os_border();
 

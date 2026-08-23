@@ -1,6 +1,6 @@
 use crate::termwindow::{RenderFrame, TermWindowNotif};
-use ::window::bitmaps::atlas::OutOfTextureSpace;
 use ::window::WindowOps;
+use ::window::bitmaps::atlas::OutOfTextureSpace;
 use anyhow::Context;
 use smol::Timer;
 use std::time::{Duration, Instant};
@@ -258,6 +258,38 @@ impl crate::TermWindow {
                 }
             }
             self.paint_pane(&pos, &mut layers).context("paint_pane")?;
+        }
+
+        if let Some(target) = self
+            .pane_drag
+            .as_ref()
+            .and_then(|drag| drag.target.as_ref())
+        {
+            let rect = euclid::rect(target.x, target.y, target.width, target.height);
+            let fill = window::color::LinearRgba::with_components(0.20, 0.55, 1.0, 0.20);
+            let frame = window::color::LinearRgba::with_components(0.30, 0.70, 1.0, 0.95);
+            self.filled_rectangle(&mut layers, 2, rect, fill)
+                .context("pane drop highlight fill")?;
+            let thickness = 3.0_f32.min(target.width / 2.).min(target.height / 2.);
+            for edge in [
+                euclid::rect(target.x, target.y, target.width, thickness),
+                euclid::rect(
+                    target.x,
+                    target.y + target.height - thickness,
+                    target.width,
+                    thickness,
+                ),
+                euclid::rect(target.x, target.y, thickness, target.height),
+                euclid::rect(
+                    target.x + target.width - thickness,
+                    target.y,
+                    thickness,
+                    target.height,
+                ),
+            ] {
+                self.filled_rectangle(&mut layers, 2, edge, frame)
+                    .context("pane drop highlight frame")?;
+            }
         }
 
         if let Some(pane) = self.get_active_pane_or_overlay() {

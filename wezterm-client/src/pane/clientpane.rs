@@ -20,6 +20,7 @@ use ratelim::RateLimiter;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::ops::Range;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use termwiz::input::KeyEvent;
@@ -36,7 +37,7 @@ pub struct ClientPane {
     client: Arc<ClientInner>,
     local_pane_id: PaneId,
     pub remote_pane_id: PaneId,
-    pub remote_tab_id: TabId,
+    remote_tab_id: AtomicUsize,
     pub renderable: Mutex<RenderableState>,
     configured_palette: Mutex<ColorPalette>,
     palette: Mutex<ColorPalette>,
@@ -115,6 +116,14 @@ async fn resize_remote_pane(
 }
 
 impl ClientPane {
+    pub fn remote_tab_id(&self) -> TabId {
+        self.remote_tab_id.load(Ordering::Relaxed)
+    }
+
+    pub fn set_remote_tab_id(&self, remote_tab_id: TabId) {
+        self.remote_tab_id.store(remote_tab_id, Ordering::Relaxed);
+    }
+
     pub fn new(
         client: &Arc<ClientInner>,
         remote_tab_id: TabId,
@@ -182,7 +191,7 @@ impl ClientPane {
             mouse,
             remote_pane_id,
             local_pane_id,
-            remote_tab_id,
+            remote_tab_id: AtomicUsize::new(remote_tab_id),
             application_palette: Mutex::new(false),
             renderable: Mutex::new(render),
             writer: Mutex::new(writer),
@@ -353,7 +362,7 @@ impl ClientPane {
                     "client enqueue local={} remote={} tab={} generation={} preserve_split={} defer_remote={} size={}x{} px={}x{} dpi={} worker_running={}",
                     self.local_pane_id,
                     self.remote_pane_id,
-                    self.remote_tab_id,
+                    self.remote_tab_id(),
                     pending.generation,
                     preserve_split,
                     defer_remote,
@@ -377,7 +386,7 @@ impl ClientPane {
         let queue = Arc::clone(&self.resize_queue);
         let client = Arc::clone(&self.client);
         let remote_pane_id = self.remote_pane_id;
-        let remote_tab_id = self.remote_tab_id;
+        let remote_tab_id = self.remote_tab_id();
 
         promise::spawn::spawn(async move {
             loop {
@@ -489,7 +498,7 @@ impl ClientPane {
 
         let client = Arc::clone(&self.client);
         let remote_pane_id = self.remote_pane_id;
-        let remote_tab_id = self.remote_tab_id;
+        let remote_tab_id = self.remote_tab_id();
         promise::spawn::spawn(async move {
             if let Err(err) = resize_remote_pane(
                 client,
@@ -524,7 +533,7 @@ impl ClientPane {
 
         resize_remote_pane(
             Arc::clone(&self.client),
-            self.remote_tab_id,
+            self.remote_tab_id(),
             self.remote_pane_id,
             size,
             preserve_split,
@@ -575,24 +584,24 @@ impl ClientPane {
             log::info!(
                 target: "pane_font_trace",
                 "client flush-batch tab={} panes={} [{}]",
-                self.remote_tab_id,
+                self.remote_tab_id(),
                 panes.len(),
                 summary,
             );
         }
 
-        let result = resize_remote_panes(Arc::clone(&self.client), self.remote_tab_id, panes).await;
+        let result = resize_remote_panes(Arc::clone(&self.client), self.remote_tab_id(), panes).await;
         if pane_font_trace_enabled() {
             match &result {
                 Ok(()) => log::info!(
                     target: "pane_font_trace",
                     "client flush-batch sent tab={}",
-                    self.remote_tab_id
+                    self.remote_tab_id()
                 ),
                 Err(err) => log::error!(
                     target: "pane_font_trace",
                     "client flush-batch send failed tab={}: {err:#}",
-                    self.remote_tab_id
+                    self.remote_tab_id()
                 ),
             }
         }
@@ -609,7 +618,7 @@ impl ClientPane {
             log::info!(
                 target: "pane_font_trace",
                 "client flush-split tab={} split={} delta={} panes={}",
-                self.remote_tab_id,
+                self.remote_tab_id(),
                 split_index,
                 delta,
                 panes.len()
@@ -618,10 +627,27 @@ impl ClientPane {
         self.client
             .client
             .resize_split(ResizeSplit {
-                containing_tab_id: self.remote_tab_id,
+                containing_tab_id: self.remote_tab_id(),
                 split_index,
                 delta,
                 panes,
+            })
+            .await?;
+        Ok(())
+    }
+
+    pub async fn reposition_pane(
+        &self,
+        target_remote_pane_id: PaneId,
+        request: mux::tab::SplitRequest,
+    ) -> anyhow::Result<()> {
+        self.client
+            .client
+            .reposition_pane(RepositionPane {
+                containing_tab_id: self.remote_tab_id(),
+                pane_id: self.remote_pane_id,
+                target_pane_id: target_remote_pane_id,
+                request,
             })
             .await?;
         Ok(())
@@ -656,7 +682,7 @@ impl ClientPane {
                     "client flush local={} remote={} tab={} generation={} preserve_split={} size={}x{} px={}x{} dpi={}",
                     self.local_pane_id,
                     self.remote_pane_id,
-                    self.remote_tab_id,
+                    self.remote_tab_id(),
                     queue.generation,
                     preserve_split,
                     size.cols,
@@ -707,7 +733,7 @@ impl ClientPane {
                 "client resize-impl local={} remote={} tab={} preserve_split={} changed={} actual={}x{} px={}x{} next={}x{} px={}x{} dpi={}",
                 self.local_pane_id,
                 self.remote_pane_id,
-                self.remote_tab_id,
+                self.remote_tab_id(),
                 preserve_split,
                 dimensions_changed,
                 inner.dimensions.cols,
@@ -871,7 +897,7 @@ impl Pane for ClientPane {
         let mut inner = render.inner.borrow_mut();
         let client = Arc::clone(&self.client);
         let remote_pane_id = self.remote_pane_id;
-        let remote_tab_id = self.remote_tab_id;
+        let remote_tab_id = self.remote_tab_id();
         // Invalidate any cached rows on a resize
         inner.make_all_stale();
         promise::spawn::spawn(async move {
@@ -890,7 +916,7 @@ impl Pane for ClientPane {
 
     fn set_left_sidebar_hidden(&self, hidden: bool) {
         let client = Arc::clone(&self.client);
-        let remote_tab_id = self.remote_tab_id;
+        let remote_tab_id = self.remote_tab_id();
         promise::spawn::spawn(async move {
             client
                 .client
@@ -905,7 +931,7 @@ impl Pane for ClientPane {
 
     fn set_right_sidebar_hidden(&self, hidden: bool) {
         let client = Arc::clone(&self.client);
-        let remote_tab_id = self.remote_tab_id;
+        let remote_tab_id = self.remote_tab_id();
         promise::spawn::spawn(async move {
             client
                 .client

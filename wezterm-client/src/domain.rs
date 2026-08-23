@@ -615,6 +615,7 @@ impl ClientDomain {
                         match mux.get_pane(pane_id) {
                             Some(pane) => {
                                 if let Some(pane) = pane.downcast_ref::<ClientPane>() {
+                                    pane.set_remote_tab_id(entry.tab_id);
                                     pane.set_local_font_scale_from_mux(entry.font_scale);
                                 }
                                 pane

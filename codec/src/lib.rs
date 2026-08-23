@@ -507,6 +507,7 @@ pdu! {
     ResizeSplit: 65,
     SetLeftSidebarHidden: 66,
     SetRightSidebarHidden: 67,
+    RepositionPane: 68,
 }
 
 impl Pdu {
@@ -522,6 +523,7 @@ impl Pdu {
             | Self::Resize(_)
             | Self::ResizePanes(_)
             | Self::ResizeSplit(_)
+            | Self::RepositionPane(_)
             | Self::SetPaneFontScale(_)
             | Self::SetClipboard(_)
             | Self::SetPaneZoomed(_)
@@ -891,6 +893,14 @@ pub struct ResizeSplit {
     /// Divider movement in the tab's logical cell coordinate space.
     pub delta: isize,
     pub panes: Vec<ResizePane>,
+}
+
+#[derive(Deserialize, Serialize, PartialEq, Debug)]
+pub struct RepositionPane {
+    pub containing_tab_id: TabId,
+    pub pane_id: PaneId,
+    pub target_pane_id: PaneId,
+    pub request: SplitRequest,
 }
 
 #[derive(Deserialize, Serialize, PartialEq, Debug)]

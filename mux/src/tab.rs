@@ -1132,6 +1132,18 @@ impl Tab {
             .swap_active_with_index(pane_index, keep_focus)
     }
 
+    /// Detach a pane from its current branch and insert it beside another pane.
+    pub fn reposition_pane(
+        &self,
+        pane_id: PaneId,
+        target_pane_id: PaneId,
+        request: SplitRequest,
+    ) -> anyhow::Result<()> {
+        self.inner
+            .lock()
+            .reposition_pane(pane_id, target_pane_id, request)
+    }
+
     /// Computes the size of the pane that would result if the specified
     /// pane was split in a particular direction.
     /// The intent is to call this prior to spawning the new pane so that
@@ -2637,6 +2649,47 @@ impl TabInner {
         None
     }
 
+    fn reposition_pane(
+        &mut self,
+        pane_id: PaneId,
+        target_pane_id: PaneId,
+        request: SplitRequest,
+    ) -> anyhow::Result<()> {
+        if pane_id == target_pane_id {
+            return Ok(());
+        }
+        if self.zoomed.is_some() {
+            anyhow::bail!("cannot reposition panes while zoomed");
+        }
+
+        let panes = self.iter_panes_ignoring_zoom();
+        panes
+            .iter()
+            .position(|pos| pos.pane.pane_id() == pane_id)
+            .ok_or_else(|| anyhow::anyhow!("pane {pane_id} is not in this tab"))?;
+        let target_index = panes
+            .iter()
+            .position(|pos| pos.pane.pane_id() == target_pane_id)
+            .ok_or_else(|| anyhow::anyhow!("pane {target_pane_id} is not in this tab"))?;
+
+        // Check that the target can be split before changing the tree.
+        self.compute_split_size(target_index, request)
+            .ok_or_else(|| anyhow::anyhow!("target pane is too small to split"))?;
+        let pane = self
+            .remove_pane(pane_id)
+            .ok_or_else(|| anyhow::anyhow!("failed to detach pane {pane_id}"))?;
+        let target_index = self
+            .iter_panes_ignoring_zoom()
+            .iter()
+            .position(|pos| pos.pane.pane_id() == target_pane_id)
+            .ok_or_else(|| anyhow::anyhow!("target pane disappeared while repositioning"))?;
+        let new_index = self.split_and_insert(target_index, request, pane, false)?;
+        self.active = new_index;
+        self.recency.tag(new_index);
+        Mux::try_get().map(|mux| mux.notify(MuxNotification::TabResized(self.id)));
+        Ok(())
+    }
+
     fn compute_split_size(
         &mut self,
         pane_index: usize,
@@ -3186,15 +3239,16 @@ mod test {
         assert_eq!(80, panes[0].width);
         assert_eq!(24, panes[0].height);
 
-        assert!(tab
-            .compute_split_size(
+        assert!(
+            tab.compute_split_size(
                 1,
                 SplitRequest {
                     direction: SplitDirection::Horizontal,
                     ..Default::default()
                 }
             )
-            .is_none());
+            .is_none()
+        );
 
         let horz_size = tab
             .compute_split_size(
@@ -3795,6 +3849,52 @@ mod test {
         };
         let split_size = tab.compute_split_size(pane_index, request).unwrap();
         tab.split_and_insert(pane_index, request, FakePane::new(id, split_size.second))?;
+        Ok(())
+    }
+
+    #[test]
+    fn reposition_pane_moves_leaf_beside_target() -> anyhow::Result<()> {
+        let size = TerminalSize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 800,
+            pixel_height: 600,
+            dpi: 96,
+        };
+        let tab = Tab::new(&size);
+        tab.assign_pane(&FakePane::new(1, size));
+        split_pane(&tab, 0, 2, SplitDirection::Horizontal)?;
+        split_pane(&tab, 1, 3, SplitDirection::Vertical)?;
+
+        tab.reposition_pane(
+            3,
+            1,
+            SplitRequest {
+                direction: SplitDirection::Horizontal,
+                target_is_second: false,
+                top_level: false,
+                size: SplitSize::Percent(50),
+            },
+        )?;
+
+        let panes = tab.iter_panes();
+        assert_eq!(
+            panes
+                .iter()
+                .map(|pos| pos.pane.pane_id())
+                .collect::<Vec<_>>(),
+            vec![3, 1, 2]
+        );
+        assert_eq!(
+            panes
+                .iter()
+                .find(|pos| pos.is_active)
+                .unwrap()
+                .pane
+                .pane_id(),
+            3
+        );
+        assert_no_pixel_overlap(&panes);
         Ok(())
     }
 
