@@ -1151,6 +1151,44 @@ impl Tab {
             .reposition_pane(pane_id, target_pane_id, request)
     }
 
+    /// Atomically replace the pane topology while retaining the supplied pane
+    /// objects and selecting the requested stable pane as active.
+    ///
+    /// The candidate tree is fully validated before the live tree is changed.
+    #[allow(dead_code)] // Used by the tmux atomic apply phase in the next slice.
+    pub(crate) fn replace_pane_tree(
+        &self,
+        tree: Tree,
+        active_pane_id: PaneId,
+    ) -> anyhow::Result<()> {
+        self.inner.lock().replace_pane_tree(tree, active_pane_id)
+    }
+
+    /// Snapshot the current binary pane tree, retaining Arc identity and the
+    /// exact local split data used for pixel layout.
+    #[allow(dead_code)] // Consumed by tmux subtree ratio reconciliation.
+    pub(crate) fn snapshot_pane_tree(&self) -> Tree {
+        fn clone_tree(tree: &Tree) -> Tree {
+            match tree {
+                Tree::Empty => Tree::Empty,
+                Tree::Leaf(pane) => Tree::Leaf(Arc::clone(pane)),
+                Tree::Node { left, right, data } => Tree::Node {
+                    left: Box::new(clone_tree(left)),
+                    right: Box::new(clone_tree(right)),
+                    data: *data,
+                },
+            }
+        }
+
+        let inner = self.inner.lock();
+        clone_tree(
+            inner
+                .pane
+                .as_ref()
+                .expect("tab pane tree is always present"),
+        )
+    }
+
     /// Computes the size of the pane that would result if the specified
     /// pane was split in a particular direction.
     /// The intent is to call this prior to spawning the new pane so that
@@ -2598,6 +2636,60 @@ impl TabInner {
         }
     }
 
+    #[allow(dead_code)] // Used by Tab::replace_pane_tree.
+    fn replace_pane_tree(&mut self, tree: Tree, active_pane_id: PaneId) -> anyhow::Result<()> {
+        fn collect_panes(
+            tree: &Tree,
+            panes: &mut Vec<PaneId>,
+            seen: &mut std::collections::HashSet<PaneId>,
+        ) -> anyhow::Result<()> {
+            match tree {
+                Tree::Empty => anyhow::bail!("replacement pane tree is empty"),
+                Tree::Leaf(pane) => {
+                    let pane_id = pane.pane_id();
+                    if !seen.insert(pane_id) {
+                        anyhow::bail!("replacement pane tree contains duplicate pane {pane_id}");
+                    }
+                    panes.push(pane_id);
+                }
+                Tree::Node {
+                    left, right, data, ..
+                } => {
+                    if data.is_none() {
+                        anyhow::bail!("replacement pane tree contains an unlabeled split");
+                    }
+                    collect_panes(left, panes, seen)?;
+                    collect_panes(right, panes, seen)?;
+                }
+            }
+            Ok(())
+        }
+
+        let mut pane_ids = vec![];
+        collect_panes(&tree, &mut pane_ids, &mut Default::default())?;
+        let active = pane_ids
+            .iter()
+            .position(|pane_id| *pane_id == active_pane_id)
+            .ok_or_else(|| {
+                anyhow::anyhow!("active pane {active_pane_id} is absent from replacement tree")
+            })?;
+
+        let prior = self.get_active_pane();
+        let zoomed_pane_id = self.zoomed.as_ref().map(|pane| pane.pane_id());
+        self.pane = Some(tree);
+        self.active = active;
+        self.recency.tag(active);
+        if zoomed_pane_id.is_some_and(|pane_id| !pane_ids.contains(&pane_id)) {
+            self.zoomed = None;
+        }
+        apply_sizes_from_splits_preserving_split(self.pane.as_mut().unwrap(), &self.size);
+        if let Some(mux) = Mux::try_get() {
+            self.advise_focus_change(prior, true);
+            mux.notify(MuxNotification::TabResized(self.id));
+        }
+        Ok(())
+    }
+
     fn cell_dimensions(&self) -> TerminalSize {
         cell_dimensions(&self.size)
     }
@@ -3266,15 +3358,16 @@ mod test {
         assert_eq!(80, panes[0].width);
         assert_eq!(24, panes[0].height);
 
-        assert!(tab
-            .compute_split_size(
+        assert!(
+            tab.compute_split_size(
                 1,
                 SplitRequest {
                     direction: SplitDirection::Horizontal,
                     ..Default::default()
                 }
             )
-            .is_none());
+            .is_none()
+        );
 
         let horz_size = tab
             .compute_split_size(
@@ -3948,6 +4041,106 @@ mod test {
             3
         );
         assert_no_pixel_overlap(&panes);
+        Ok(())
+    }
+
+    #[test]
+    fn replace_pane_tree_is_atomic_and_preserves_pane_objects() -> anyhow::Result<()> {
+        let size = TerminalSize {
+            rows: 24,
+            cols: 100,
+            pixel_width: 1000,
+            pixel_height: 600,
+            dpi: 96,
+        };
+        let first = FakePane::new(1, size);
+        let second = FakePane::new(2, size);
+        let tab = Tab::new(&size);
+        tab.assign_pane(&first);
+        tab.split_and_insert(
+            0,
+            SplitRequest {
+                direction: SplitDirection::Horizontal,
+                ..Default::default()
+            },
+            Arc::clone(&second),
+        )?;
+
+        let split = *tab
+            .inner
+            .lock()
+            .pane
+            .as_ref()
+            .and_then(|tree| match tree {
+                Tree::Node { data, .. } => data.as_ref(),
+                _ => None,
+            })
+            .expect("split data");
+        let Tree::Node {
+            left,
+            right,
+            data: snapshot_split,
+        } = tab.snapshot_pane_tree()
+        else {
+            panic!("expected split snapshot");
+        };
+        assert_eq!(snapshot_split, Some(split));
+        assert!(matches!(&*left, Tree::Leaf(pane) if Arc::ptr_eq(pane, &first)));
+        assert!(matches!(&*right, Tree::Leaf(pane) if Arc::ptr_eq(pane, &second)));
+        let replacement = Tree::Node {
+            left: Box::new(Tree::Leaf(Arc::clone(&second))),
+            right: Box::new(Tree::Leaf(Arc::clone(&first))),
+            data: Some(split),
+        };
+        tab.replace_pane_tree(replacement, 1)?;
+
+        let panes = tab.iter_panes_ignoring_zoom();
+        assert_eq!(
+            panes
+                .iter()
+                .map(|pane| pane.pane.pane_id())
+                .collect::<Vec<_>>(),
+            vec![2, 1]
+        );
+        assert!(Arc::ptr_eq(&panes[0].pane, &second));
+        assert!(Arc::ptr_eq(&panes[1].pane, &first));
+        assert_eq!(tab.get_active_pane().unwrap().pane_id(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn replace_pane_tree_rejects_invalid_candidate_without_mutating() -> anyhow::Result<()> {
+        let size = TerminalSize {
+            rows: 24,
+            cols: 100,
+            pixel_width: 1000,
+            pixel_height: 600,
+            dpi: 96,
+        };
+        let pane = FakePane::new(1, size);
+        let tab = Tab::new(&size);
+        tab.assign_pane(&pane);
+        let duplicate = Tree::Node {
+            left: Box::new(Tree::Leaf(Arc::clone(&pane))),
+            right: Box::new(Tree::Leaf(Arc::clone(&pane))),
+            data: Some(SplitDirectionAndSize {
+                direction: SplitDirection::Horizontal,
+                first: size,
+                second: size,
+                divider_pixel_width: 0,
+                divider_pixel_height: 0,
+                preferred_first: 0,
+                preferred_second: 0,
+            }),
+        };
+        assert!(tab.replace_pane_tree(duplicate, 1).is_err());
+        assert_eq!(
+            tab.iter_panes_ignoring_zoom()
+                .iter()
+                .map(|pane| pane.pane.pane_id())
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
         Ok(())
     }
 
