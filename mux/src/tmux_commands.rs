@@ -1,18 +1,20 @@
 use crate::domain::{DomainId, WriterWrapper};
 use crate::localpane::LocalPane;
-use crate::pane::{alloc_pane_id, PaneId};
-use crate::tab::{SplitDirection, SplitRequest, SplitSize, Tab, TabId};
+use crate::pane::{PaneId, alloc_pane_id};
+use crate::tab::{
+    SplitDirection, SplitDirectionAndSize, SplitRequest, SplitSize, Tab, TabId, Tree,
+};
 use crate::tmux::{AttachState, TmuxDomain, TmuxDomainState, TmuxRemotePane, TmuxTab};
 use crate::tmux_pty::{TmuxChild, TmuxPty};
 use crate::{Mux, MuxNotification, Pane};
-use anyhow::{anyhow, Context};
+use anyhow::{Context, anyhow};
 use parking_lot::{Condvar, Mutex};
 use portable_pty::{MasterPty, PtySize};
 use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Write};
 use std::io::Write as _;
 use std::sync::Arc;
-use termwiz::escape::csi::{Cursor, CSI};
+use termwiz::escape::csi::{CSI, Cursor};
 use termwiz::escape::{Action, OneBased};
 use termwiz::tmux_cc::*;
 use wezterm_term::TerminalSize;
@@ -153,6 +155,191 @@ fn plan_topology_reconciliation(
     }
 
     Ok(plan)
+}
+
+fn clone_pane_tree(tree: &Tree) -> Tree {
+    match tree {
+        Tree::Empty => Tree::Empty,
+        Tree::Leaf(pane) => Tree::Leaf(Arc::clone(pane)),
+        Tree::Node { left, right, data } => Tree::Node {
+            left: Box::new(clone_pane_tree(left)),
+            right: Box::new(clone_pane_tree(right)),
+            data: *data,
+        },
+    }
+}
+
+fn local_tree_topology(
+    tree: &Tree,
+    remote_by_local: &HashMap<PaneId, TmuxPaneId>,
+) -> anyhow::Result<LayoutTopology> {
+    match tree {
+        Tree::Empty => anyhow::bail!("local pane tree is empty"),
+        Tree::Leaf(pane) => remote_by_local
+            .get(&pane.pane_id())
+            .copied()
+            .map(LayoutTopology::Pane)
+            .ok_or_else(|| anyhow!("local pane {} has no stable tmux id", pane.pane_id())),
+        Tree::Node { left, right, data } => {
+            let split = data
+                .as_ref()
+                .ok_or_else(|| anyhow!("local pane tree contains an unlabeled split"))?;
+            let children = vec![
+                local_tree_topology(left, remote_by_local)?,
+                local_tree_topology(right, remote_by_local)?,
+            ];
+            Ok(match split.direction {
+                SplitDirection::Horizontal => LayoutTopology::SplitHorizontal(children),
+                SplitDirection::Vertical => LayoutTopology::SplitVertical(children),
+            }
+            .normalized())
+        }
+    }
+}
+
+fn collect_reusable_local_subtrees(
+    tree: &Tree,
+    remote_by_local: &HashMap<PaneId, TmuxPaneId>,
+    subtrees: &mut HashMap<LayoutTopology, Tree>,
+) -> anyhow::Result<LayoutTopology> {
+    let topology = local_tree_topology(tree, remote_by_local)?;
+    if let Tree::Node { left, right, .. } = tree {
+        collect_reusable_local_subtrees(left, remote_by_local, subtrees)?;
+        collect_reusable_local_subtrees(right, remote_by_local, subtrees)?;
+        subtrees.insert(topology.clone(), clone_pane_tree(tree));
+    }
+    Ok(topology)
+}
+
+fn layout_geometry(layout: &LayoutNode) -> LayoutGeometry {
+    match layout {
+        LayoutNode::Pane(pane) => LayoutGeometry {
+            width: pane.pane_width,
+            height: pane.pane_height,
+            left: pane.pane_left,
+            top: pane.pane_top,
+        },
+        LayoutNode::SplitHorizontal { geometry, .. }
+        | LayoutNode::SplitVertical { geometry, .. } => *geometry,
+    }
+}
+
+fn union_layout_geometry(children: &[LayoutNode]) -> anyhow::Result<LayoutGeometry> {
+    let first = children
+        .first()
+        .map(layout_geometry)
+        .ok_or_else(|| anyhow!("tmux split has no children"))?;
+    let mut right = first.left.saturating_add(first.width);
+    let mut bottom = first.top.saturating_add(first.height);
+    let mut left = first.left;
+    let mut top = first.top;
+    for child in &children[1..] {
+        let geometry = layout_geometry(child);
+        left = left.min(geometry.left);
+        top = top.min(geometry.top);
+        right = right.max(geometry.left.saturating_add(geometry.width));
+        bottom = bottom.max(geometry.top.saturating_add(geometry.height));
+    }
+    Ok(LayoutGeometry {
+        width: right.saturating_sub(left),
+        height: bottom.saturating_sub(top),
+        left,
+        top,
+    })
+}
+
+fn terminal_size_for_geometry(
+    geometry: LayoutGeometry,
+    parent_geometry: LayoutGeometry,
+    parent_size: TerminalSize,
+) -> TerminalSize {
+    TerminalSize {
+        cols: geometry.width.max(1) as usize,
+        rows: geometry.height.max(1) as usize,
+        pixel_width: parent_size
+            .pixel_width
+            .saturating_mul(geometry.width as usize)
+            / parent_geometry.width.max(1) as usize,
+        pixel_height: parent_size
+            .pixel_height
+            .saturating_mul(geometry.height as usize)
+            / parent_geometry.height.max(1) as usize,
+        dpi: parent_size.dpi,
+    }
+}
+
+fn build_snapshot_tree(
+    layout: &LayoutNode,
+    panes: &HashMap<TmuxPaneId, Arc<dyn Pane>>,
+    reusable: &HashMap<LayoutTopology, Tree>,
+    size: TerminalSize,
+) -> anyhow::Result<Tree> {
+    let topology = layout.topology().normalized();
+    if let Some(tree) = reusable.get(&topology) {
+        return Ok(clone_pane_tree(tree));
+    }
+
+    match layout {
+        LayoutNode::Pane(pane) => panes
+            .get(&pane.pane_id)
+            .map(|pane| Tree::Leaf(Arc::clone(pane)))
+            .ok_or_else(|| anyhow!("tmux pane %{} has no local pane object", pane.pane_id)),
+        LayoutNode::SplitHorizontal { geometry, children } => build_snapshot_split(
+            children,
+            SplitDirection::Horizontal,
+            *geometry,
+            panes,
+            reusable,
+            size,
+        ),
+        LayoutNode::SplitVertical { geometry, children } => build_snapshot_split(
+            children,
+            SplitDirection::Vertical,
+            *geometry,
+            panes,
+            reusable,
+            size,
+        ),
+    }
+}
+
+fn build_snapshot_split(
+    children: &[LayoutNode],
+    direction: SplitDirection,
+    geometry: LayoutGeometry,
+    panes: &HashMap<TmuxPaneId, Arc<dyn Pane>>,
+    reusable: &HashMap<LayoutTopology, Tree>,
+    size: TerminalSize,
+) -> anyhow::Result<Tree> {
+    if children.len() < 2 {
+        anyhow::bail!("tmux split must contain at least two children");
+    }
+    let first_geometry = layout_geometry(&children[0]);
+    let remaining_geometry = union_layout_geometry(&children[1..])?;
+    let first_size = terminal_size_for_geometry(first_geometry, geometry, size);
+    let remaining_size = terminal_size_for_geometry(remaining_geometry, geometry, size);
+    let left = build_snapshot_tree(&children[0], panes, reusable, first_size)?;
+    let right = if children.len() == 2 {
+        build_snapshot_tree(&children[1], panes, reusable, remaining_size)?
+    } else {
+        build_snapshot_split(
+            &children[1..],
+            direction,
+            remaining_geometry,
+            panes,
+            reusable,
+            remaining_size,
+        )?
+    };
+    Ok(Tree::Node {
+        left: Box::new(left),
+        right: Box::new(right),
+        data: Some(SplitDirectionAndSize::from_snapshot(
+            direction,
+            first_size,
+            remaining_size,
+        )),
+    })
 }
 
 impl TmuxDomainState {
@@ -493,6 +680,93 @@ impl TmuxDomainState {
             .collect();
         let topology_plan = plan_topology_reconciliation(&current_layouts, &snapshot_layouts)?;
         log::debug!("tmux topology reconciliation plan: {topology_plan:#?}");
+
+        let remote_by_local: HashMap<_, _> = self
+            .remote_panes
+            .lock()
+            .iter()
+            .map(|(remote_id, pane)| (pane.lock().local_pane_id, *remote_id))
+            .collect();
+        let mut reusable_subtrees = HashMap::new();
+        for (window_id, attached) in self.gui_tabs.lock().iter() {
+            let Some(tab) = mux.get_tab(attached.tab_id) else {
+                continue;
+            };
+            let mut local_subtrees = HashMap::new();
+            collect_reusable_local_subtrees(
+                &tab.snapshot_pane_tree(),
+                &remote_by_local,
+                &mut local_subtrees,
+            )?;
+            for topology in topology_plan.preserved_subtrees.iter().filter_map(
+                |(preserved_window, topology)| {
+                    (*preserved_window == *window_id).then_some(topology)
+                },
+            ) {
+                if let Some(tree) = local_subtrees.remove(topology) {
+                    reusable_subtrees.insert((*window_id, topology.clone()), tree);
+                }
+            }
+        }
+        log::debug!(
+            "tmux reconciliation retained {} local split subtrees",
+            reusable_subtrees.len()
+        );
+
+        let pane_objects: HashMap<_, _> = self
+            .remote_panes
+            .lock()
+            .iter()
+            .filter_map(|(remote_id, pane)| {
+                mux.get_pane(pane.lock().local_pane_id)
+                    .map(|pane| (*remote_id, pane))
+            })
+            .collect();
+        let mut candidate_trees = HashMap::new();
+        for window in windows
+            .iter()
+            .filter(|window| window.session_id == current_session)
+        {
+            let Some(tab_id) = self
+                .gui_tabs
+                .lock()
+                .get(&window.window_id)
+                .map(|attached| attached.tab_id)
+            else {
+                continue;
+            };
+            let Some(tab) = mux.get_tab(tab_id) else {
+                continue;
+            };
+            let mut pane_ids = vec![];
+            window.layout_tree.pane_ids(&mut pane_ids);
+            if pane_ids
+                .iter()
+                .any(|pane_id| !pane_objects.contains_key(pane_id))
+            {
+                continue;
+            }
+            let reusable = reusable_subtrees
+                .iter()
+                .filter_map(|((reusable_window, topology), tree)| {
+                    (*reusable_window == window.window_id)
+                        .then(|| (topology.clone(), clone_pane_tree(tree)))
+                })
+                .collect();
+            candidate_trees.insert(
+                window.window_id,
+                build_snapshot_tree(
+                    &window.layout_tree,
+                    &pane_objects,
+                    &reusable,
+                    tab.get_size(),
+                )?,
+            );
+        }
+        log::debug!(
+            "tmux reconciliation built {} complete candidate trees",
+            candidate_trees.len()
+        );
 
         self.create_gui_window();
         let mut gui_window = self.gui_window.lock();
@@ -1679,6 +1953,30 @@ mod test {
         ]);
         let error = plan_topology_reconciliation(&HashMap::new(), &snapshot).unwrap_err();
         assert!(error.to_string().contains("appears in both"));
+        Ok(())
+    }
+
+    #[test]
+    fn snapshot_geometry_seeds_pixel_ratio_without_cell_feedback() -> anyhow::Result<()> {
+        let layout = parse_layout_tree("120x40,0,0{29x40,0,0,1,90x40,30,0,2}")?;
+        let LayoutNode::SplitHorizontal { geometry, children } = layout else {
+            panic!("expected horizontal split");
+        };
+        let first = terminal_size_for_geometry(
+            layout_geometry(&children[0]),
+            geometry,
+            TerminalSize {
+                rows: 40,
+                cols: 120,
+                pixel_width: 1200,
+                pixel_height: 800,
+                dpi: 144,
+            },
+        );
+        assert_eq!(first.cols, 29);
+        assert_eq!(first.pixel_width, 290);
+        assert_eq!(first.pixel_height, 800);
+        assert_eq!(first.dpi, 144);
         Ok(())
     }
 

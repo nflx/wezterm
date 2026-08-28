@@ -168,6 +168,28 @@ impl Default for SplitRequest {
 }
 
 impl SplitDirectionAndSize {
+    pub(crate) fn from_snapshot(
+        direction: SplitDirection,
+        first: TerminalSize,
+        second: TerminalSize,
+    ) -> Self {
+        Self {
+            direction,
+            first,
+            second,
+            divider_pixel_width: 0,
+            divider_pixel_height: 0,
+            preferred_first: match direction {
+                SplitDirection::Horizontal => first.cols,
+                SplitDirection::Vertical => first.rows,
+            },
+            preferred_second: match direction {
+                SplitDirection::Horizontal => second.cols,
+                SplitDirection::Vertical => second.rows,
+            },
+        }
+    }
+
     fn first_axis_size(&self) -> usize {
         match self.direction {
             SplitDirection::Horizontal => self.first.cols,
@@ -3358,16 +3380,15 @@ mod test {
         assert_eq!(80, panes[0].width);
         assert_eq!(24, panes[0].height);
 
-        assert!(
-            tab.compute_split_size(
+        assert!(tab
+            .compute_split_size(
                 1,
                 SplitRequest {
                     direction: SplitDirection::Horizontal,
                     ..Default::default()
                 }
             )
-            .is_none()
-        );
+            .is_none());
 
         let horz_size = tab
             .compute_split_size(

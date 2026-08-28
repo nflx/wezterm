@@ -188,7 +188,7 @@ impl LayoutNode {
 
     /// Compare topology and stable pane ownership while ignoring cell geometry.
     pub fn same_topology(&self, other: &Self) -> bool {
-        self.topology() == other.topology()
+        self.topology().normalized() == other.topology().normalized()
     }
 
     pub fn topology(&self) -> LayoutTopology {
@@ -209,10 +209,42 @@ impl LayoutNode {
         match self {
             Self::Pane(_) => {}
             Self::SplitHorizontal { children, .. } | Self::SplitVertical { children, .. } => {
-                topologies.push(self.topology());
+                topologies.push(self.topology().normalized());
                 for child in children {
                     child.split_topologies(topologies);
                 }
+            }
+        }
+    }
+}
+
+impl LayoutTopology {
+    /// Collapse adjacent splits with the same direction. tmux represents these
+    /// as one n-ary node while WezTerm stores them as a binary tree.
+    pub fn normalized(self) -> Self {
+        match self {
+            Self::Pane(_) => self,
+            Self::SplitHorizontal(children) => {
+                let mut normalized = vec![];
+                for child in children.into_iter().map(Self::normalized) {
+                    if let Self::SplitHorizontal(grandchildren) = child {
+                        normalized.extend(grandchildren);
+                    } else {
+                        normalized.push(child);
+                    }
+                }
+                Self::SplitHorizontal(normalized)
+            }
+            Self::SplitVertical(children) => {
+                let mut normalized = vec![];
+                for child in children.into_iter().map(Self::normalized) {
+                    if let Self::SplitVertical(grandchildren) = child {
+                        normalized.extend(grandchildren);
+                    } else {
+                        normalized.push(child);
+                    }
+                }
+                Self::SplitVertical(normalized)
             }
         }
     }
@@ -1324,5 +1356,19 @@ here
         let reordered = parse_layout_tree("120x40,0,0{59x40,0,0,2,60x40,60,0,1}").unwrap();
         assert!(before.same_topology(&resized));
         assert!(!before.same_topology(&reordered));
+    }
+
+    #[test]
+    fn layout_topology_normalizes_binary_same_direction_splits() {
+        let binary = LayoutTopology::SplitHorizontal(vec![
+            LayoutTopology::Pane(1),
+            LayoutTopology::SplitHorizontal(vec![LayoutTopology::Pane(2), LayoutTopology::Pane(3)]),
+        ]);
+        let nary = LayoutTopology::SplitHorizontal(vec![
+            LayoutTopology::Pane(1),
+            LayoutTopology::Pane(2),
+            LayoutTopology::Pane(3),
+        ]);
+        assert_eq!(binary.normalized(), nary);
     }
 }
