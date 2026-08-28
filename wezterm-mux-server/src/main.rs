@@ -425,7 +425,7 @@ async fn async_run(cmd: Option<CommandBuilder>) -> anyhow::Result<()> {
         if cmd.is_none() && !managed_tmux.is_empty() {
             domain.attach(None).await?;
             for tmux in managed_tmux {
-                let domain_name = format!("tmux:{}", tmux.session_name);
+                let session_name = tmux.session_name.clone();
                 let window_id = *mux.new_empty_window(None, None);
                 promise::spawn::spawn(async move {
                     if let Err(err) = supervise_managed_tmux(tmux, window_id).await {
@@ -435,20 +435,21 @@ async fn async_run(cmd: Option<CommandBuilder>) -> anyhow::Result<()> {
                 .detach();
                 let deadline = Instant::now() + Duration::from_secs(10);
                 loop {
-                    let connected = mux
-                        .get_domain_by_name(&domain_name)
-                        .and_then(|domain| {
-                            domain.downcast_ref::<mux::tmux::TmuxDomain>().map(|tmux| {
-                                tmux.connection_state() == mux::tab::TmuxConnectionState::Connected
+                    let connected = mux.iter_domains().into_iter().any(|domain| {
+                        domain
+                            .downcast_ref::<mux::tmux::TmuxDomain>()
+                            .is_some_and(|tmux| {
+                                tmux.managed_session() == Some(session_name.as_str())
+                                    && tmux.connection_state()
+                                        == mux::tab::TmuxConnectionState::Connected
                             })
-                        })
-                        .unwrap_or(false);
+                    });
                     if connected {
                         break;
                     }
                     if Instant::now() >= deadline {
                         anyhow::bail!(
-                            "timed out waiting for managed tmux domain {domain_name} to connect"
+                            "timed out waiting for managed tmux session {session_name:?} to connect"
                         );
                     }
                     smol::Timer::after(Duration::from_millis(50)).await;
