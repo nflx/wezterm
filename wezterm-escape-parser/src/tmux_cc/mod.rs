@@ -1196,6 +1196,7 @@ here
 %message message text
 %unlinked-window-add @40
 %unlinked-window-renamed @41
+%unlinked-window-renamed @42 renamed window
 %paste-buffer-changed just something
 %paste-buffer-deleted just something else
 %pause %3
@@ -1288,6 +1289,7 @@ here
                 },
                 Event::UnlinkedWindowAdd { window: 40 },
                 Event::UnlinkedWindowRenamed { window: 41 },
+                Event::UnlinkedWindowRenamed { window: 42 },
                 Event::PasteBufferChanged {
                     buffer: "just something".to_owned()
                 },

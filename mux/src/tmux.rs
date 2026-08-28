@@ -154,6 +154,8 @@ pub(crate) struct TmuxDomainState {
 
 pub struct TmuxDomain {
     pub(crate) inner: Arc<TmuxDomainState>,
+    name: String,
+    managed_session: Option<String>,
 }
 
 impl TmuxDomainState {
@@ -848,17 +850,42 @@ mod command_queue_tests {
             );
         }
     }
+
+    #[test]
+    fn managed_sessions_have_distinct_stable_domain_names() {
+        let alpha = TmuxDomain::new(1, Some("alpha".to_string()));
+        let beta = TmuxDomain::new(2, Some("beta".to_string()));
+        let manual = TmuxDomain::new(3, None);
+
+        assert_eq!(alpha.domain_name(), "tmux:alpha");
+        assert_eq!(alpha.managed_session(), Some("alpha"));
+        assert_eq!(beta.domain_name(), "tmux:beta");
+        assert_eq!(beta.managed_session(), Some("beta"));
+        assert_eq!(manual.domain_name(), "tmux");
+        assert_eq!(manual.managed_session(), None);
+    }
 }
 
 impl TmuxDomain {
-    pub fn new(pane_id: PaneId) -> Self {
+    pub fn new(pane_id: PaneId, managed_session: Option<String>) -> Self {
         let domain_id = alloc_domain_id();
         let cmd_queue = VecDeque::new();
+        let legacy_session = config::configuration()
+            .tmux_control
+            .as_ref()
+            .map(|tmux| tmux.session_name.as_str().to_string());
+        let name = match managed_session.as_ref() {
+            Some(session) if legacy_session.as_deref() == Some(session.as_str()) => {
+                "tmux".to_string()
+            }
+            Some(session) => format!("tmux:{session}"),
+            None => "tmux".to_string(),
+        };
         let inner = Arc::new(TmuxDomainState {
             domain_id,
             pane_id: Mutex::new(pane_id),
             // parser,
-            managed: config::configuration().tmux_control.is_some(),
+            managed: managed_session.is_some(),
             state: Mutex::new(State::WaitForInitialGuard),
             connection_state: Mutex::new(crate::tab::TmuxConnectionState::Connecting),
             next_operation_id: AtomicU64::new(0),
@@ -889,7 +916,11 @@ impl TmuxDomain {
             backlog: Mutex::new(HashMap::default()),
         });
 
-        Self { inner }
+        Self {
+            inner,
+            name,
+            managed_session,
+        }
     }
 
     fn send_next_command(&self) {
@@ -916,6 +947,10 @@ impl TmuxDomain {
 
     pub fn is_managed(&self) -> bool {
         self.inner.managed
+    }
+
+    pub fn managed_session(&self) -> Option<&str> {
+        self.managed_session.as_deref()
     }
 
     pub(crate) fn reconnect_transport(&self, pane_id: PaneId) {
@@ -1231,7 +1266,7 @@ impl Domain for TmuxDomain {
     }
 
     fn domain_name(&self) -> &str {
-        "tmux"
+        &self.name
     }
 
     async fn attach(&self, _window_id: Option<crate::WindowId>) -> anyhow::Result<()> {
@@ -1245,14 +1280,9 @@ impl Domain for TmuxDomain {
         }
 
         self.request_retry();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while std::time::Instant::now() < deadline {
-            if self.state() == DomainState::Attached {
-                return Ok(());
-            }
-            smol::Timer::after(std::time::Duration::from_millis(50)).await;
-        }
-        anyhow::bail!("timed out waiting for the managed tmux domain to reconnect")
+        anyhow::bail!(
+            "managed tmux reconnect requested; the domain is not attached yet and the operation was not queued"
+        )
     }
 
     fn detachable(&self) -> bool {

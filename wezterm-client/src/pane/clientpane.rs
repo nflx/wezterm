@@ -161,8 +161,13 @@ impl ClientPane {
 
     pub fn request_tmux_reconnect(&self) {
         let client = Arc::clone(&self.client);
+        let pane_id = self.remote_pane_id();
         promise::spawn::spawn(async move {
-            if let Err(err) = client.client.reconnect_tmux(ReconnectTmux {}).await {
+            if let Err(err) = client
+                .client
+                .reconnect_tmux(ReconnectTmux { pane_id })
+                .await
+            {
                 log::error!("failed to request tmux reconnect: {err:#}");
             }
         })

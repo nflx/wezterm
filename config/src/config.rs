@@ -385,6 +385,13 @@ pub struct Config {
     #[dynamic(default)]
     pub tmux_control: Option<TmuxControlConfig>,
 
+    /// Additional named tmux control-mode sessions managed by the standalone
+    /// mux server.  Each session is exposed as its own `tmux:<session_name>`
+    /// mux domain.  `tmux_control` remains the backwards-compatible
+    /// single-session form and may not duplicate a name in this list.
+    #[dynamic(default)]
+    pub tmux_control_sessions: Vec<TmuxControlConfig>,
+
     #[dynamic(default)]
     pub serial_ports: Vec<SerialDomain>,
 

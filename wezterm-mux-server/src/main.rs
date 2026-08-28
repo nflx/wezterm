@@ -274,9 +274,122 @@ fn managed_tmux_command(tmux: &config::TmuxControlConfig) -> anyhow::Result<Comm
         "-s".to_string(),
         tmux.session_name.clone(),
     ]);
-    Ok(CommandBuilder::from_argv(
-        argv.into_iter().map(Into::into).collect(),
-    ))
+    let mut command = CommandBuilder::from_argv(argv.into_iter().map(Into::into).collect());
+    command.env("WEZTERM_TMUX_MANAGED_SESSION", &tmux.session_name);
+    Ok(command)
+}
+
+fn configured_tmux_sessions(
+    config: &config::ConfigHandle,
+) -> anyhow::Result<Vec<config::TmuxControlConfig>> {
+    let mut sessions = Vec::new();
+    if let Some(session) = &config.tmux_control {
+        sessions.push(session.clone());
+    }
+    sessions.extend(config.tmux_control_sessions.iter().cloned());
+
+    validate_tmux_sessions(sessions)
+}
+
+fn validate_tmux_sessions(
+    sessions: Vec<config::TmuxControlConfig>,
+) -> anyhow::Result<Vec<config::TmuxControlConfig>> {
+    let mut names = std::collections::HashSet::new();
+    for session in &sessions {
+        if !names.insert(session.session_name.clone()) {
+            anyhow::bail!(
+                "tmux control session name {:?} is configured more than once",
+                session.session_name
+            );
+        }
+        managed_tmux_command(session)?;
+    }
+    Ok(sessions)
+}
+
+async fn supervise_managed_tmux(
+    tmux: config::TmuxControlConfig,
+    window_id: mux::window::WindowId,
+) -> anyhow::Result<()> {
+    let mux = Mux::get();
+    let config = config::configuration();
+    let tab = mux
+        .default_domain()
+        .spawn(
+            config.initial_size(0, None),
+            Some(managed_tmux_command(&tmux)?),
+            None,
+            window_id,
+        )
+        .await?;
+    let mut transport = tab
+        .get_active_pane()
+        .ok_or_else(|| anyhow::anyhow!("managed tmux transport pane was not created"))?;
+    let initial_retry_delay = std::env::var("WEZTERM_TMUX_TEST_RETRY_DELAY_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or_else(|| Duration::from_millis(250));
+    let mut retry_delay = initial_retry_delay;
+
+    loop {
+        while !transport.is_dead() {
+            smol::Timer::after(Duration::from_millis(100)).await;
+        }
+
+        let old_pane_id = transport.pane_id();
+        for domain in mux.iter_domains() {
+            if let Some(tmux_domain) = domain.downcast_ref::<mux::tmux::TmuxDomain>() {
+                if tmux_domain.managed_session() == Some(tmux.session_name.as_str()) {
+                    tmux_domain.mark_reconnecting();
+                }
+            }
+        }
+        let retry_at = Instant::now() + retry_delay;
+        loop {
+            let retry_now = mux.iter_domains().into_iter().any(|domain| {
+                domain
+                    .downcast_ref::<mux::tmux::TmuxDomain>()
+                    .is_some_and(|domain| {
+                        domain.managed_session() == Some(tmux.session_name.as_str())
+                            && domain.take_retry_request()
+                    })
+            });
+            if retry_now || Instant::now() >= retry_at {
+                break;
+            }
+            smol::Timer::after(Duration::from_millis(100)).await;
+        }
+        retry_delay = (retry_delay * 2).min(Duration::from_secs(10));
+
+        mux.remove_pane_without_pruning(old_pane_id);
+        match mux
+            .default_domain()
+            .spawn(
+                config.initial_size(0, None),
+                Some(managed_tmux_command(&tmux)?),
+                None,
+                window_id,
+            )
+            .await
+        {
+            Ok(new_tab) => {
+                transport = new_tab.get_active_pane().ok_or_else(|| {
+                    anyhow::anyhow!("reconnected tmux transport pane was not created")
+                })?;
+                if let Some(mut window) = mux.get_window_mut(window_id) {
+                    window.remove_by_id(new_tab.tab_id());
+                }
+                retry_delay = initial_retry_delay;
+            }
+            Err(err) => {
+                log::error!(
+                    "failed to restart managed tmux control client for {:?}: {err:#}",
+                    tmux.session_name
+                );
+            }
+        }
+    }
 }
 
 async fn async_run(cmd: Option<CommandBuilder>) -> anyhow::Result<()> {
@@ -308,11 +421,43 @@ async fn async_run(cmd: Option<CommandBuilder>) -> anyhow::Result<()> {
         .any(|p| p.domain_id() == domain.domain_id());
 
     if !have_panes_in_domain {
-        let managed_tmux = config.tmux_control.is_some() && cmd.is_none();
-        let cmd = match (&config.tmux_control, cmd) {
-            (Some(tmux), None) => Some(managed_tmux_command(tmux)?),
-            (_, command) => command,
-        };
+        let managed_tmux = configured_tmux_sessions(&config)?;
+        if cmd.is_none() && !managed_tmux.is_empty() {
+            domain.attach(None).await?;
+            for tmux in managed_tmux {
+                let domain_name = format!("tmux:{}", tmux.session_name);
+                let window_id = *mux.new_empty_window(None, None);
+                promise::spawn::spawn(async move {
+                    if let Err(err) = supervise_managed_tmux(tmux, window_id).await {
+                        log::error!("managed tmux supervisor failed: {err:#}");
+                    }
+                })
+                .detach();
+                let deadline = Instant::now() + Duration::from_secs(10);
+                loop {
+                    let connected = mux
+                        .get_domain_by_name(&domain_name)
+                        .and_then(|domain| {
+                            domain.downcast_ref::<mux::tmux::TmuxDomain>().map(|tmux| {
+                                tmux.connection_state() == mux::tab::TmuxConnectionState::Connected
+                            })
+                        })
+                        .unwrap_or(false);
+                    if connected {
+                        break;
+                    }
+                    if Instant::now() >= deadline {
+                        anyhow::bail!(
+                            "timed out waiting for managed tmux domain {domain_name} to connect"
+                        );
+                    }
+                    smol::Timer::after(Duration::from_millis(50)).await;
+                }
+            }
+            std::future::pending::<()>().await;
+            unreachable!();
+        }
+
         let workspace = None;
         let position = None;
         let window_id = mux.new_empty_window(workspace, position);
@@ -322,74 +467,7 @@ async fn async_run(cmd: Option<CommandBuilder>) -> anyhow::Result<()> {
             .default_domain()
             .spawn(config.initial_size(0, None), cmd, None, *window_id)
             .await?;
-        if managed_tmux {
-            let mut transport = tab
-                .get_active_pane()
-                .ok_or_else(|| anyhow::anyhow!("managed tmux transport pane was not created"))?;
-            let tmux = config
-                .tmux_control
-                .as_ref()
-                .expect("managed_tmux implies tmux_control")
-                .clone();
-            let initial_retry_delay = std::env::var("WEZTERM_TMUX_TEST_RETRY_DELAY_MS")
-                .ok()
-                .and_then(|value| value.parse::<u64>().ok())
-                .map(Duration::from_millis)
-                .unwrap_or_else(|| Duration::from_millis(250));
-            let mut retry_delay = initial_retry_delay;
-            loop {
-                while !transport.is_dead() {
-                    smol::Timer::after(Duration::from_millis(100)).await;
-                }
-
-                let old_pane_id = transport.pane_id();
-                for domain in mux.iter_domains() {
-                    if let Some(tmux_domain) = domain.downcast_ref::<mux::tmux::TmuxDomain>() {
-                        if tmux_domain.is_managed() {
-                            tmux_domain.mark_reconnecting();
-                        }
-                    }
-                }
-                let retry_at = Instant::now() + retry_delay;
-                loop {
-                    let retry_now = mux.iter_domains().into_iter().any(|domain| {
-                        domain
-                            .downcast_ref::<mux::tmux::TmuxDomain>()
-                            .is_some_and(|tmux| tmux.is_managed() && tmux.take_retry_request())
-                    });
-                    if retry_now || Instant::now() >= retry_at {
-                        break;
-                    }
-                    smol::Timer::after(Duration::from_millis(100)).await;
-                }
-                retry_delay = (retry_delay * 2).min(Duration::from_secs(10));
-
-                mux.remove_pane_without_pruning(old_pane_id);
-                match mux
-                    .default_domain()
-                    .spawn(
-                        config.initial_size(0, None),
-                        Some(managed_tmux_command(&tmux)?),
-                        None,
-                        *window_id,
-                    )
-                    .await
-                {
-                    Ok(tab) => {
-                        transport = tab.get_active_pane().ok_or_else(|| {
-                            anyhow::anyhow!("reconnected tmux transport pane was not created")
-                        })?;
-                        if let Some(mut window) = mux.get_window_mut(*window_id) {
-                            window.remove_by_id(tab.tab_id());
-                        }
-                        retry_delay = initial_retry_delay;
-                    }
-                    Err(err) => {
-                        log::error!("failed to restart managed tmux control client: {err:#}");
-                    }
-                }
-            }
-        }
+        let _ = tab;
     }
     Ok(())
 }
@@ -427,6 +505,12 @@ mod tests {
                 "name with spaces"
             ]
         );
+        assert_eq!(
+            command
+                .get_env("WEZTERM_TMUX_MANAGED_SESSION")
+                .and_then(|value| value.to_str()),
+            Some("name with spaces")
+        );
     }
 
     #[test]
@@ -441,6 +525,20 @@ mod tests {
             command: vec!["tmux".to_string()],
         })
         .is_err());
+    }
+
+    #[test]
+    fn managed_tmux_sessions_reject_duplicate_names() {
+        let session = config::TmuxControlConfig {
+            session_name: "duplicate".to_string(),
+            command: vec!["tmux".to_string()],
+        };
+        assert!(validate_tmux_sessions(vec![session.clone(), session]).is_err());
+        assert!(validate_tmux_sessions(vec![config::TmuxControlConfig {
+            session_name: "unique".to_string(),
+            command: vec!["tmux".to_string()],
+        }])
+        .is_ok());
     }
 }
 

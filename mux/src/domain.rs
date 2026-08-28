@@ -606,6 +606,10 @@ impl Domain for LocalDomain {
         let command_line = cmd
             .as_unix_command_line()
             .unwrap_or_else(|err| format!("error rendering command line: {:?}", err));
+        let managed_tmux_session = cmd
+            .get_env("WEZTERM_TMUX_MANAGED_SESSION")
+            .and_then(|value| value.to_str())
+            .map(ToOwned::to_owned);
         let command_description = format!(
             "\"{}\" in domain \"{}\"",
             if command_line.is_empty() {
@@ -638,6 +642,7 @@ impl Domain for LocalDomain {
                 Box::new(writer),
                 self.id,
                 command_description,
+                managed_tmux_session.clone(),
             )),
             Err(err) => {
                 // Show the error to the user in the new pane
@@ -654,6 +659,7 @@ impl Domain for LocalDomain {
                     Box::new(writer),
                     self.id,
                     command_description,
+                    managed_tmux_session,
                 ))
             }
         };

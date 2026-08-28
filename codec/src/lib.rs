@@ -441,7 +441,7 @@ macro_rules! pdu {
 /// The overall version of the codec.
 /// This must be bumped when backwards incompatible changes
 /// are made to the types and protocol.
-pub const CODEC_VERSION: usize = 51;
+pub const CODEC_VERSION: usize = 52;
 
 // Defines the Pdu enum.
 // Each struct has an explicit identifying number.
@@ -710,7 +710,9 @@ pub struct KillPane {
 }
 
 #[derive(Deserialize, Serialize, PartialEq, Debug)]
-pub struct ReconnectTmux {}
+pub struct ReconnectTmux {
+    pub pane_id: PaneId,
+}
 
 #[derive(Deserialize, Serialize, PartialEq, Debug)]
 pub struct CloseTab {
@@ -1328,7 +1330,7 @@ mod test {
     #[test]
     fn tmux_control_pdus_keep_assigned_protocol_ids() {
         let cases = [
-            (Pdu::ReconnectTmux(ReconnectTmux {}), 69),
+            (Pdu::ReconnectTmux(ReconnectTmux { pane_id: 23 }), 69),
             (Pdu::CloseTab(CloseTab { tab_id: 17 }), 70),
         ];
         for (pdu, expected_ident) in cases {

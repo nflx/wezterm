@@ -856,6 +856,7 @@ impl Pane for LocalPane {
 struct LocalPaneDCSHandler {
     pane_id: PaneId,
     tmux_domain: Option<Arc<TmuxDomainState>>,
+    managed_tmux_session: Option<String>,
 }
 
 pub(crate) fn emit_output_for_pane(pane_id: PaneId, message: &str) {
@@ -885,6 +886,7 @@ impl wezterm_term::DeviceControlHandler for LocalPaneDCSHandler {
                     log::info!("tmux -CC mode requested");
 
                     let mux = Mux::get();
+                    let managed_session = self.managed_tmux_session.as_deref();
                     let existing_tmux_domain = mux.iter_domains().into_iter().find_map(|domain| {
                         let tmux = domain.downcast_ref::<TmuxDomain>()?;
                         let state = tmux.connection_state();
@@ -894,7 +896,7 @@ impl wezterm_term::DeviceControlHandler for LocalPaneDCSHandler {
                                 crate::tab::TmuxConnectionState::Disconnected
                                     | crate::tab::TmuxConnectionState::Reconnecting
                             );
-                        if reusable {
+                        if reusable && tmux.managed_session() == managed_session {
                             tmux.reconnect_transport(self.pane_id);
                             Some(Arc::clone(&tmux.inner))
                         } else {
@@ -902,7 +904,8 @@ impl wezterm_term::DeviceControlHandler for LocalPaneDCSHandler {
                         }
                     });
                     let tmux_domain = existing_tmux_domain.unwrap_or_else(|| {
-                        let domain = TmuxDomain::new(self.pane_id);
+                        let domain =
+                            TmuxDomain::new(self.pane_id, self.managed_tmux_session.clone());
                         let tmux_domain = Arc::clone(&domain.inner);
                         let domain: Arc<dyn Domain> = Arc::new(domain);
                         mux.add_domain(&domain);
@@ -1054,12 +1057,14 @@ impl LocalPane {
         writer: Box<dyn Write + Send>,
         domain_id: DomainId,
         command_description: String,
+        managed_tmux_session: Option<String>,
     ) -> Self {
         let (process, signaller, pid) = split_child(process);
 
         terminal.set_device_control_handler(Box::new(LocalPaneDCSHandler {
             pane_id,
             tmux_domain: None,
+            managed_tmux_session,
         }));
         terminal.set_notification_handler(Box::new(LocalPaneNotifHandler { pane_id }));
 

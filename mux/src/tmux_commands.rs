@@ -734,6 +734,7 @@ impl TmuxDomainState {
             Box::new(writer),
             self.domain_id,
             "tmux pane".to_string(),
+            None,
         ));
         Ok(PreparedTmuxPane {
             pane,
@@ -2049,7 +2050,7 @@ pub(crate) struct NewWindow {
 }
 impl TmuxCommand for NewWindow {
     fn get_command(&self, _domain_id: DomainId) -> String {
-        let mut command = "new-window".to_owned();
+        let mut command = "new-window -P -F '#{window_id}'".to_owned();
         if let Some(cwd) = &self.cwd {
             write!(&mut command, " -c {}", shell_words::quote(cwd)).unwrap();
         }
@@ -2080,6 +2081,23 @@ impl TmuxCommand for NewWindow {
             let error = format!("new-window in domain={domain_id} failed: {result:#?}");
             log::error!("{error}");
             anyhow::bail!("{error}");
+        }
+        let window_id = parse_sigil_number(result.output.trim())?;
+        if let Some(domain) = Mux::get().get_domain(domain_id) {
+            if let Some(tmux) = domain.downcast_ref::<TmuxDomain>() {
+                if let Some(session_id) = *tmux.inner.tmux_session.lock() {
+                    let mut queue = tmux.inner.cmd_queue.lock();
+                    if !queue
+                        .iter()
+                        .any(|command| command.is_full_window_snapshot())
+                    {
+                        queue.push_back(Box::new(ListAllWindows {
+                            session_id,
+                            window_id: Some(window_id),
+                        }));
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -2760,6 +2778,9 @@ mod test {
             shell_words::split(encoded.trim()).unwrap(),
             [
                 "new-window",
+                "-P",
+                "-F",
+                "#{window_id}",
                 "-c",
                 "/tmp/work queue's",
                 "printf '%s\\n' 'hello world'"

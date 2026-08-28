@@ -613,23 +613,23 @@ impl SessionHandler {
                 })
                 .detach();
             }
-            Pdu::ReconnectTmux(_) => {
+            Pdu::ReconnectTmux(ReconnectTmux { pane_id }) => {
                 spawn_into_main_thread(async move {
                     catch(
                         move || {
                             let mux = Mux::get();
-                            let tmux = mux
-                                .iter_domains()
-                                .into_iter()
-                                .find(|domain| {
-                                    domain
-                                        .downcast_ref::<mux::tmux::TmuxDomain>()
-                                        .is_some_and(|tmux| tmux.is_managed())
-                                })
-                                .ok_or_else(|| anyhow!("no managed tmux domain"))?;
-                            let tmux = tmux
+                            let (domain_id, _, _) = mux
+                                .resolve_pane_id(pane_id)
+                                .ok_or_else(|| anyhow!("no domain for tmux pane {pane_id}"))?;
+                            let domain = mux
+                                .get_domain(domain_id)
+                                .ok_or_else(|| anyhow!("tmux domain {domain_id} disappeared"))?;
+                            let tmux = domain
                                 .downcast_ref::<mux::tmux::TmuxDomain>()
-                                .expect("filtered to tmux domain");
+                                .ok_or_else(|| anyhow!("pane {pane_id} is not backed by tmux"))?;
+                            if !tmux.is_managed() {
+                                anyhow::bail!("pane {pane_id} is not in a managed tmux domain");
+                            }
                             tmux.request_retry();
                             Ok(Pdu::UnitResponse(UnitResponse {}))
                         },

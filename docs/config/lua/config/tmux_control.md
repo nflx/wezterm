@@ -8,7 +8,9 @@ tags:
 {{since('nightly')}}
 
 `tmux_control` opts the standalone mux server into managing one persistent
-tmux control-mode session. It is disabled when this option is absent.
+tmux control-mode session. It is disabled when this option and
+[`tmux_control_sessions`](tmux_control_sessions.md) are absent. This legacy
+single-session form keeps the domain name `tmux` for compatibility.
 
 ```lua
 config.tmux_control = {
@@ -58,8 +60,6 @@ font sizes to retain their visual layout.
 
 Current limitations:
 
-* one configured managed session is supported
 * half-edge pane relocation is supported; full-pane drop is not
 * Linux with tmux 3.7b is the primary validated platform
-* generic tmux-domain spawn/detach contracts and multiple named managed
-  sessions remain under development
+* moving panes between different tmux sessions/domains is not supported
