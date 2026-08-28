@@ -68,6 +68,16 @@ pub(crate) struct TmuxTab {
 
 pub(crate) type TmuxCmdQueue = VecDeque<Box<dyn TmuxCommand>>;
 
+pub(crate) struct PendingReposition {
+    pub operation_id: u64,
+    pub source: TmuxPaneId,
+    pub target: TmuxPaneId,
+    pub source_window: TmuxWindowId,
+    pub target_window: TmuxWindowId,
+    pub accepted: bool,
+    pub completion: promise::Promise<()>,
+}
+
 fn retain_unsent_commands(
     queue: &mut TmuxCmdQueue,
     command_in_flight: bool,
@@ -87,6 +97,7 @@ pub(crate) struct TmuxDomainState {
     state: Mutex<State>,
     pub(crate) connection_state: Mutex<crate::tab::TmuxConnectionState>,
     next_operation_id: AtomicU64,
+    next_reposition_operation_id: AtomicU64,
     in_flight_operation_id: AtomicU64,
     in_flight_responses_remaining: AtomicUsize,
     retry_requested: AtomicBool,
@@ -101,7 +112,8 @@ pub(crate) struct TmuxDomainState {
     pub(crate) pending_split_pane_ids: Mutex<VecDeque<TmuxPaneId>>,
     pub(crate) pending_new_tabs: Mutex<VecDeque<promise::Promise<Arc<Tab>>>>,
     pub(crate) pending_kills: Mutex<HashMap<TmuxPaneId, promise::Promise<()>>>,
-    pending_reposition_windows: Mutex<HashSet<TmuxWindowId>>,
+    pub(crate) pending_repositions: Mutex<VecDeque<PendingReposition>>,
+    pub(crate) pending_reposition_windows: Mutex<HashSet<TmuxWindowId>>,
     pub backlog: Mutex<HashMap<TmuxPaneId, Vec<u8>>>,
 }
 
@@ -110,6 +122,16 @@ pub struct TmuxDomain {
 }
 
 impl TmuxDomainState {
+    fn fail_pending_repositions(&self, reason: &str) {
+        let operations: Vec<_> = self.pending_repositions.lock().drain(..).collect();
+        self.pending_reposition_windows.lock().clear();
+        for mut operation in operations {
+            operation
+                .completion
+                .err(anyhow::anyhow!(reason.to_string()));
+        }
+    }
+
     pub(crate) fn retain_pending_commands(
         &self,
         mut retain: impl FnMut(&Box<dyn TmuxCommand>) -> bool,
@@ -184,6 +206,7 @@ impl TmuxDomainState {
                     for (_, mut completion) in pending {
                         completion.err(anyhow::anyhow!("tmux control transport disconnected"));
                     }
+                    self.fail_pending_repositions("tmux control transport disconnected");
 
                     // Force to quit the tmux mode
                     let pane_id = *self.pane_id.lock();
@@ -379,6 +402,7 @@ impl TmuxDomainState {
         for (_, mut completion) in pending {
             completion.err(anyhow::anyhow!("tmux command actor timed out"));
         }
+        self.fail_pending_repositions("tmux command actor timed out");
         if let Some(transport) = Mux::get().get_pane(*self.pane_id.lock()) {
             transport.kill();
         }
@@ -468,90 +492,79 @@ impl TmuxDomainState {
         }
     }
 
-    pub fn reposition_tmux_pane(
+    pub async fn reposition_tmux_pane(
         &self,
         pane_id: PaneId,
         target_pane_id: PaneId,
         request: SplitRequest,
     ) -> anyhow::Result<()> {
-        let pane_map = self.remote_panes.lock();
-        let (source, source_window) = pane_map
-            .values()
-            .find(|pane| pane.lock().local_pane_id == pane_id)
-            .map(|pane| {
-                let pane = pane.lock();
-                (pane.pane_id, pane.window_id)
-            })
-            .ok_or_else(|| anyhow::anyhow!("no tmux pane for local pane {pane_id}"))?;
-        let target = pane_map
-            .values()
-            .find(|pane| pane.lock().local_pane_id == target_pane_id)
-            .map(|pane| pane.lock().pane_id)
-            .ok_or_else(|| anyhow::anyhow!("no tmux pane for local target {target_pane_id}"))?;
-        drop(pane_map);
+        let (source, source_window, target, target_window) = {
+            let pane_map = self.remote_panes.lock();
+            let (source, source_window) = pane_map
+                .values()
+                .find(|pane| pane.lock().local_pane_id == pane_id)
+                .map(|pane| {
+                    let pane = pane.lock();
+                    (pane.pane_id, pane.window_id)
+                })
+                .ok_or_else(|| anyhow::anyhow!("no tmux pane for local pane {pane_id}"))?;
+            let (target, target_window) = pane_map
+                .values()
+                .find(|pane| pane.lock().local_pane_id == target_pane_id)
+                .map(|pane| {
+                    let pane = pane.lock();
+                    (pane.pane_id, pane.window_id)
+                })
+                .ok_or_else(|| anyhow::anyhow!("no tmux pane for local target {target_pane_id}"))?;
+            (source, source_window, target, target_window)
+        };
 
+        let mut completion = promise::Promise::new();
+        let future = completion
+            .get_future()
+            .ok_or_else(|| anyhow::anyhow!("failed to create tmux reposition completion"))?;
+        let operation_id = self
+            .next_reposition_operation_id
+            .fetch_add(1, Ordering::Relaxed)
+            + 1;
         self.pending_reposition_windows.lock().insert(source_window);
+        self.pending_repositions
+            .lock()
+            .push_back(PendingReposition {
+                operation_id,
+                source,
+                target,
+                source_window,
+                target_window,
+                accepted: false,
+                completion,
+            });
         self.cmd_queue.lock().push_back(Box::new(JoinPane {
-            pane_id,
-            target_pane_id,
+            operation_id,
             source,
             source_window,
             target,
             request,
         }));
         TmuxDomainState::schedule_send_next_command(self.domain_id);
-        Ok(())
+        future.await
     }
 
-    pub(crate) fn pane_repositioned(
-        &self,
-        pane_id: PaneId,
-        target_pane_id: PaneId,
-        request: SplitRequest,
-        source_window: TmuxWindowId,
-    ) -> anyhow::Result<()> {
+    pub(crate) fn pane_reposition_failed(&self, operation_id: u64, source_window: TmuxWindowId) {
         self.pending_reposition_windows
             .lock()
             .remove(&source_window);
-        let mux = Mux::get();
-        mux.reposition_pane_locally(pane_id, target_pane_id, request)?;
-
-        let (_, _, target_tab_id) = mux
-            .resolve_pane_id(target_pane_id)
-            .ok_or_else(|| anyhow::anyhow!("target pane disappeared after tmux move"))?;
-        let target_window_id = self
-            .gui_tabs
-            .lock()
-            .values()
-            .find(|tab| tab.tab_id == target_tab_id)
-            .map(|tab| tab.tmux_window_id)
-            .ok_or_else(|| anyhow::anyhow!("target tmux window disappeared after move"))?;
-
-        let pane_map = self.remote_panes.lock();
-        let remote_pane_id = pane_map
-            .values()
-            .find(|pane| pane.lock().local_pane_id == pane_id)
-            .map(|pane| pane.lock().pane_id)
-            .ok_or_else(|| anyhow::anyhow!("moved tmux pane mapping disappeared"))?;
-        if let Some(pane) = pane_map.get(&remote_pane_id) {
-            pane.lock().window_id = target_window_id;
+        let completion = {
+            let mut pending = self.pending_repositions.lock();
+            pending
+                .iter()
+                .position(|operation| operation.operation_id == operation_id)
+                .and_then(|index| pending.remove(index))
+                .map(|operation| operation.completion)
+        };
+        if let Some(mut completion) = completion {
+            completion.err(anyhow::anyhow!("tmux pane reposition failed"));
         }
-        drop(pane_map);
-
-        let mut tabs = self.gui_tabs.lock();
-        for tab in tabs.values_mut() {
-            tab.panes.remove(&remote_pane_id);
-        }
-        if let Some(tab) = tabs.get_mut(&target_window_id) {
-            tab.panes.insert(remote_pane_id);
-        }
-        Ok(())
-    }
-
-    pub(crate) fn pane_reposition_failed(&self, source_window: TmuxWindowId) {
-        self.pending_reposition_windows
-            .lock()
-            .remove(&source_window);
     }
 }
 
@@ -609,6 +622,7 @@ impl TmuxDomain {
             state: Mutex::new(State::WaitForInitialGuard),
             connection_state: Mutex::new(crate::tab::TmuxConnectionState::Connecting),
             next_operation_id: AtomicU64::new(0),
+            next_reposition_operation_id: AtomicU64::new(0),
             in_flight_operation_id: AtomicU64::new(0),
             in_flight_responses_remaining: AtomicUsize::new(0),
             retry_requested: AtomicBool::new(false),
@@ -623,6 +637,7 @@ impl TmuxDomain {
             pending_split_pane_ids: Mutex::new(VecDeque::default()),
             pending_new_tabs: Mutex::new(VecDeque::default()),
             pending_kills: Mutex::new(HashMap::default()),
+            pending_repositions: Mutex::new(VecDeque::default()),
             pending_reposition_windows: Mutex::new(HashSet::default()),
             backlog: Mutex::new(HashMap::default()),
         });
@@ -658,6 +673,8 @@ impl TmuxDomain {
         for (_, mut completion) in pending {
             completion.err(anyhow::anyhow!("tmux control transport reconnected"));
         }
+        self.inner
+            .fail_pending_repositions("tmux control transport reconnected");
     }
 
     pub(crate) fn transport_disconnected(&self) {
@@ -669,6 +686,8 @@ impl TmuxDomain {
         self.inner
             .in_flight_responses_remaining
             .store(0, Ordering::Release);
+        self.inner
+            .fail_pending_repositions("tmux control transport disconnected");
     }
 
     pub fn mark_reconnecting(&self) {

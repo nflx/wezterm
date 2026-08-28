@@ -153,6 +153,10 @@ impl super::TermWindow {
             None => return,
         };
         let source_pane_id = drag.source_pane_id;
+        log::debug!(
+            "finishing pane drag source={source_pane_id} target={:?}",
+            drag.target
+        );
         let target = match drag.target {
             Some(target) => target,
             None => return,
@@ -204,9 +208,16 @@ impl super::TermWindow {
                 }
             }
 
-            if let Err(err) = Mux::get().reposition_pane(source_pane_id, target.pane_id, request) {
-                log::error!("failed to reposition pane: {err:#}");
-            }
+            let target_pane_id = target.pane_id;
+            promise::spawn::spawn_into_main_thread(async move {
+                if let Err(err) = Mux::get()
+                    .reposition_pane(source_pane_id, target_pane_id, request)
+                    .await
+                {
+                    log::error!("failed to reposition pane: {err:#}");
+                }
+            })
+            .detach();
         }
     }
 
@@ -324,6 +335,7 @@ impl super::TermWindow {
         if event.kind == WMEK::Press(MousePress::Left)
             && event.modifiers.contains(::window::Modifiers::ALT)
         {
+            log::debug!("starting Alt pane drag at {:?}", event.coords);
             if let Some(tab) = Mux::get().get_active_tab_for_window(self.mux_window_id) {
                 if tab.get_zoomed_pane().is_none() {
                     if let Some(pos) = tab

@@ -1038,25 +1038,25 @@ impl SessionHandler {
                 request,
             }) => {
                 spawn_into_main_thread(async move {
-                    catch(
-                        move || {
-                            let mux = Mux::get();
-                            let (_, _, actual_source_tab) = mux
-                                .resolve_pane_id(pane_id)
-                                .ok_or_else(|| anyhow!("no such pane {}", pane_id))?;
-                            if actual_source_tab != containing_tab_id {
-                                return Err(anyhow!(
-                                    "pane {} is in tab {}, not requested tab {}",
-                                    pane_id,
-                                    actual_source_tab,
-                                    containing_tab_id
-                                ));
-                            }
-                            mux.reposition_pane(pane_id, target_pane_id, request)?;
-                            Ok(Pdu::UnitResponse(UnitResponse {}))
-                        },
-                        send_response,
-                    )
+                    let result = async {
+                        let mux = Mux::get();
+                        let (_, _, actual_source_tab) = mux
+                            .resolve_pane_id(pane_id)
+                            .ok_or_else(|| anyhow!("no such pane {}", pane_id))?;
+                        if actual_source_tab != containing_tab_id {
+                            return Err(anyhow!(
+                                "pane {} is in tab {}, not requested tab {}",
+                                pane_id,
+                                actual_source_tab,
+                                containing_tab_id
+                            ));
+                        }
+                        mux.reposition_pane(pane_id, target_pane_id, request)
+                            .await?;
+                        Ok(Pdu::UnitResponse(UnitResponse {}))
+                    }
+                    .await;
+                    send_response(result);
                 })
                 .detach();
             }

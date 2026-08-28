@@ -136,6 +136,18 @@ fn pane_ownership(
     Ok(ownership)
 }
 
+fn reposition_is_reconciled(
+    accepted: bool,
+    source: TmuxPaneId,
+    target: TmuxPaneId,
+    target_window: TmuxWindowId,
+    snapshot_ownership: &HashMap<TmuxPaneId, TmuxWindowId>,
+) -> bool {
+    accepted
+        && snapshot_ownership.get(&source) == Some(&target_window)
+        && snapshot_ownership.get(&target) == Some(&target_window)
+}
+
 fn plan_topology_reconciliation(
     current: &HashMap<TmuxWindowId, LayoutNode>,
     snapshot: &HashMap<TmuxWindowId, LayoutNode>,
@@ -931,10 +943,21 @@ impl TmuxDomainState {
                     &retained,
                     tab.get_size(),
                 )?;
-                let current_active = tab
-                    .get_active_pane()
-                    .and_then(|pane| remote_by_local.get(&pane.pane_id()).copied())
-                    .filter(|pane_id| pane_ids.contains(pane_id))
+                let repositioned_active = self
+                    .pending_repositions
+                    .lock()
+                    .iter()
+                    .find(|operation| {
+                        operation.accepted && operation.target_window == window.window_id
+                    })
+                    .map(|operation| operation.source)
+                    .filter(|pane_id| pane_ids.contains(pane_id));
+                let current_active = repositioned_active
+                    .or_else(|| {
+                        tab.get_active_pane()
+                            .and_then(|pane| remote_by_local.get(&pane.pane_id()).copied())
+                            .filter(|pane_id| pane_ids.contains(pane_id))
+                    })
                     .or_else(|| pane_ids.first().copied())
                     .ok_or_else(|| anyhow!("snapshot window @{} has no panes", window.window_id))?;
                 let active_local = pane_objects
@@ -1037,9 +1060,48 @@ impl TmuxDomainState {
                     completion.ok(());
                 }
             }
+            let snapshot_ownership = windows
+                .iter()
+                .filter(|window| window.session_id == current_session)
+                .flat_map(|window| {
+                    let mut pane_ids = vec![];
+                    window.layout_tree.pane_ids(&mut pane_ids);
+                    pane_ids
+                        .into_iter()
+                        .map(move |pane_id| (pane_id, window.window_id))
+                })
+                .collect::<HashMap<_, _>>();
+            let mut completed_repositions = vec![];
+            {
+                let mut pending = self.pending_repositions.lock();
+                let mut index = 0;
+                while index < pending.len() {
+                    let operation = &pending[index];
+                    let reconciled = reposition_is_reconciled(
+                        operation.accepted,
+                        operation.source,
+                        operation.target,
+                        operation.target_window,
+                        &snapshot_ownership,
+                    );
+                    if reconciled {
+                        if let Some(operation) = pending.remove(index) {
+                            self.pending_reposition_windows
+                                .lock()
+                                .remove(&operation.source_window);
+                            completed_repositions.push(operation.completion);
+                        }
+                    } else {
+                        index += 1;
+                    }
+                }
+            }
             for (_, tab, _, active_local, _, _, _) in candidates {
                 mux.notify(MuxNotification::TabResized(tab.tab_id()));
                 mux.notify(MuxNotification::PaneFocused(active_local));
+            }
+            for mut completion in completed_repositions {
+                completion.ok(());
             }
         }
 
@@ -1978,8 +2040,7 @@ impl TmuxCommand for KillPane {
 
 #[derive(Debug)]
 pub(crate) struct JoinPane {
-    pub pane_id: PaneId,
-    pub target_pane_id: PaneId,
+    pub operation_id: u64,
     pub source: TmuxPaneId,
     pub source_window: TmuxWindowId,
     pub target: TmuxPaneId,
@@ -2012,21 +2073,37 @@ impl TmuxCommand for JoinPane {
             .downcast_ref::<TmuxDomain>()
             .ok_or_else(|| anyhow!("tmux domain lost"))?;
         if result.error {
-            tmux.inner.pane_reposition_failed(self.source_window);
+            tmux.inner
+                .pane_reposition_failed(self.operation_id, self.source_window);
             anyhow::bail!("join-pane in domain={domain_id} failed: {result:#?}");
         }
-        tmux.inner.pane_repositioned(
-            self.pane_id,
-            self.target_pane_id,
-            self.request,
-            self.source_window,
-        )
+        if let Some(pending) = tmux
+            .inner
+            .pending_repositions
+            .lock()
+            .iter_mut()
+            .find(|pending| pending.operation_id == self.operation_id)
+        {
+            pending.accepted = true;
+        }
+        if let Some(session_id) = *tmux.inner.tmux_session.lock() {
+            tmux.inner
+                .cmd_queue
+                .lock()
+                .push_back(Box::new(ListAllWindows {
+                    session_id,
+                    window_id: None,
+                }));
+            TmuxDomainState::schedule_send_next_command(domain_id);
+        }
+        Ok(())
     }
 
     fn process_timeout(&self, domain_id: DomainId) -> anyhow::Result<()> {
         if let Some(domain) = Mux::get().get_domain(domain_id) {
             if let Some(tmux) = domain.downcast_ref::<TmuxDomain>() {
-                tmux.inner.pane_reposition_failed(self.source_window);
+                tmux.inner
+                    .pane_reposition_failed(self.operation_id, self.source_window);
             }
         }
         anyhow::bail!("join-pane timed out in domain {domain_id}")
@@ -2280,8 +2357,7 @@ mod test {
 
         for (direction, target_is_second, expected) in cases {
             let command = JoinPane {
-                pane_id: 1,
-                target_pane_id: 2,
+                operation_id: 9,
                 source: 11,
                 source_window: 3,
                 target: 22,
@@ -2294,6 +2370,33 @@ mod test {
             };
             assert_eq!(command.get_command(0), expected);
         }
+    }
+
+    #[test]
+    fn reposition_completes_only_after_accepted_target_ownership_snapshot() {
+        let target_ownership = HashMap::from([(11, 4), (22, 4)]);
+        assert!(reposition_is_reconciled(true, 11, 22, 4, &target_ownership));
+        assert!(!reposition_is_reconciled(
+            false,
+            11,
+            22,
+            4,
+            &target_ownership
+        ));
+        assert!(!reposition_is_reconciled(
+            true,
+            11,
+            22,
+            5,
+            &target_ownership
+        ));
+        assert!(!reposition_is_reconciled(
+            true,
+            11,
+            33,
+            4,
+            &target_ownership
+        ));
     }
 
     #[test]

@@ -1350,7 +1350,7 @@ impl Mux {
 
     /// Move a pane beside a target pane, either within one tab or across two
     /// existing tabs. The target tab owns the resulting split geometry.
-    pub fn reposition_pane(
+    pub async fn reposition_pane(
         &self,
         pane_id: PaneId,
         target_pane_id: PaneId,
@@ -1373,7 +1373,8 @@ impl Mux {
             if let Some(tmux) = domain.downcast_ref::<crate::tmux::TmuxDomain>() {
                 return tmux
                     .inner
-                    .reposition_tmux_pane(pane_id, target_pane_id, request);
+                    .reposition_tmux_pane(pane_id, target_pane_id, request)
+                    .await;
             }
         }
 
