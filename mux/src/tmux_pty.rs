@@ -196,10 +196,9 @@ impl MasterPty for TmuxPty {
             _ => ensure_connected(self.domain_id)?,
         }
         let mut cmd_queue = self.cmd_queue.lock();
-        cmd_queue.push_back(Box::new(Resize {
-            size,
-            pane_id: self.master_pane.lock().pane_id,
-        }));
+        let pane_id = self.master_pane.lock().pane_id;
+        cmd_queue.retain(|command| command.resize_pane_id() != Some(pane_id));
+        cmd_queue.push_back(Box::new(Resize { size, pane_id }));
         TmuxDomainState::schedule_send_next_command(self.domain_id);
         Ok(())
     }

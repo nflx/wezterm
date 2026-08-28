@@ -3,8 +3,8 @@ use crate::domain::{alloc_domain_id, Domain, DomainId, DomainState, SplitSource}
 use crate::pane::{Pane, PaneId};
 use crate::tab::{SplitRequest, Tab, TabId};
 use crate::tmux_commands::{
-    JoinPane, KillWindow, ListAllPanes, ListAllWindows, ListCommands, NewWindow, RenameWindow,
-    SplitPane, TmuxCommand,
+    JoinPane, KillWindow, ListAllWindows, ListCommands, NewWindow, RenameWindow, SplitPane,
+    TmuxCommand,
 };
 use crate::window::WindowId;
 use crate::{Mux, MuxWindowBuilder};
@@ -84,6 +84,7 @@ pub(crate) struct TmuxDomainState {
     pub support_commands: Mutex<HashMap<String, String>>,
     pub attach_state: Mutex<AttachState>,
     pub(crate) pending_splits: Mutex<VecDeque<promise::Promise<TmuxPaneId>>>,
+    pub(crate) pending_split_pane_ids: Mutex<VecDeque<TmuxPaneId>>,
     pub(crate) pending_new_tabs: Mutex<VecDeque<promise::Promise<Arc<Tab>>>>,
     pending_reposition_windows: Mutex<HashSet<TmuxWindowId>>,
     pub backlog: Mutex<HashMap<TmuxPaneId, Vec<u8>>>,
@@ -157,21 +158,23 @@ impl TmuxDomainState {
                     return;
                 }
                 Event::LayoutChange {
-                    window,
-                    layout,
+                    window: _,
+                    layout: _,
                     visible_layout: _,
                     raw_flags: _,
                 } => {
-                    let mut cmd_queue = self.cmd_queue.as_ref().lock();
-                    cmd_queue.push_back(Box::new(ListAllPanes {
-                        window_id: *window,
-                        prune: true,
-                        layout_csum: if let Some(l) = layout.get(0..4) {
-                            l.to_string()
-                        } else {
-                            "".to_string()
-                        },
-                    }));
+                    if let Some(session_id) = *self.tmux_session.lock() {
+                        let mut cmd_queue = self.cmd_queue.lock();
+                        if !cmd_queue
+                            .iter()
+                            .any(|command| command.is_full_window_snapshot())
+                        {
+                            cmd_queue.push_back(Box::new(ListAllWindows {
+                                session_id,
+                                window_id: None,
+                            }));
+                        }
+                    }
                 }
                 Event::Output { pane, text } => {
                     let pane_map = self.remote_panes.lock();
@@ -223,9 +226,24 @@ impl TmuxDomainState {
 
                     // Split pane
                     if !self.check_pane_attached(*window, *pane) {
-                        let mut pending_splits = self.pending_splits.lock();
-                        if let Some(mut promise) = pending_splits.pop_front() {
-                            promise.ok(*pane);
+                        if !self.pending_splits.lock().is_empty() {
+                            let mut pending_ids = self.pending_split_pane_ids.lock();
+                            if !pending_ids.contains(pane) {
+                                pending_ids.push_back(*pane);
+                            }
+                            drop(pending_ids);
+                            if let Some(session_id) = *self.tmux_session.lock() {
+                                let mut cmd_queue = self.cmd_queue.lock();
+                                if !cmd_queue
+                                    .iter()
+                                    .any(|command| command.is_full_window_snapshot())
+                                {
+                                    cmd_queue.push_back(Box::new(ListAllWindows {
+                                        session_id,
+                                        window_id: None,
+                                    }));
+                                }
+                            }
                         }
                     }
                     log::info!("tmux window pane changed: {}:{}", window, pane);
@@ -512,6 +530,7 @@ impl TmuxDomain {
             support_commands: Mutex::new(HashMap::default()),
             attach_state: Mutex::new(AttachState::Init),
             pending_splits: Mutex::new(VecDeque::default()),
+            pending_split_pane_ids: Mutex::new(VecDeque::default()),
             pending_new_tabs: Mutex::new(VecDeque::default()),
             pending_reposition_windows: Mutex::new(HashSet::default()),
             backlog: Mutex::new(HashMap::default()),
@@ -632,8 +651,16 @@ impl Domain for TmuxDomain {
             }
 
             if let Ok(id) = future.await {
-                let pane = self.inner.split_pane(tab, pane_id, id, split_request);
-                return pane;
+                let local_pane_id = self
+                    .inner
+                    .remote_panes
+                    .lock()
+                    .get(&id)
+                    .map(|pane| pane.lock().local_pane_id)
+                    .ok_or_else(|| anyhow::anyhow!("reconciled tmux pane %{id} disappeared"))?;
+                return Mux::get().get_pane(local_pane_id).ok_or_else(|| {
+                    anyhow::anyhow!("reconciled local pane {local_pane_id} disappeared")
+                });
             }
         }
 

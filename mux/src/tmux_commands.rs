@@ -1,20 +1,20 @@
 use crate::domain::{DomainId, WriterWrapper};
 use crate::localpane::LocalPane;
-use crate::pane::{PaneId, alloc_pane_id};
+use crate::pane::{alloc_pane_id, PaneId};
 use crate::tab::{
     SplitDirection, SplitDirectionAndSize, SplitRequest, SplitSize, Tab, TabId, Tree,
 };
 use crate::tmux::{AttachState, TmuxDomain, TmuxDomainState, TmuxRemotePane, TmuxTab};
 use crate::tmux_pty::{TmuxChild, TmuxPty};
 use crate::{Mux, MuxNotification, Pane};
-use anyhow::{Context, anyhow};
+use anyhow::{anyhow, Context};
 use parking_lot::{Condvar, Mutex};
 use portable_pty::{MasterPty, PtySize};
 use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Write};
 use std::io::Write as _;
 use std::sync::Arc;
-use termwiz::escape::csi::{CSI, Cursor};
+use termwiz::escape::csi::{Cursor, CSI};
 use termwiz::escape::{Action, OneBased};
 use termwiz::tmux_cc::*;
 use wezterm_term::TerminalSize;
@@ -25,6 +25,14 @@ pub(crate) trait TmuxCommand: Send + Debug {
 
     fn process_timeout(&self, domain_id: DomainId) -> anyhow::Result<()> {
         anyhow::bail!("tmux command timed out in domain {domain_id}: {self:?}")
+    }
+
+    fn resize_pane_id(&self) -> Option<TmuxPaneId> {
+        None
+    }
+
+    fn is_full_window_snapshot(&self) -> bool {
+        false
     }
 }
 
@@ -55,6 +63,31 @@ struct WindowItem {
     layout_tree: LayoutNode,
     layout_csum: String,
     history_limit: isize,
+}
+
+struct PreparedTmuxPane {
+    pane: Arc<dyn Pane>,
+    remote: crate::tmux::RefTmuxRemotePane,
+    committed: bool,
+}
+
+impl PreparedTmuxPane {
+    fn commit(mut self) -> (Arc<dyn Pane>, crate::tmux::RefTmuxRemotePane) {
+        self.committed = true;
+        (Arc::clone(&self.pane), Arc::clone(&self.remote))
+    }
+}
+
+impl Drop for PreparedTmuxPane {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        let active_lock = Arc::clone(&self.remote.lock().active_lock);
+        let (released, condvar) = &*active_lock;
+        *released.lock() = true;
+        condvar.notify_all();
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -211,6 +244,38 @@ fn collect_reusable_local_subtrees(
     Ok(topology)
 }
 
+fn project_local_tree(
+    tree: &Tree,
+    remote_by_local: &HashMap<PaneId, TmuxPaneId>,
+    retained: &HashSet<TmuxPaneId>,
+) -> anyhow::Result<Option<Tree>> {
+    match tree {
+        Tree::Empty => Ok(None),
+        Tree::Leaf(pane) => {
+            let remote_id = remote_by_local
+                .get(&pane.pane_id())
+                .copied()
+                .ok_or_else(|| anyhow!("local tmux pane {} has no remote id", pane.pane_id()))?;
+            Ok(retained
+                .contains(&remote_id)
+                .then(|| Tree::Leaf(Arc::clone(pane))))
+        }
+        Tree::Node { left, right, data } => {
+            let left = project_local_tree(left, remote_by_local, retained)?;
+            let right = project_local_tree(right, remote_by_local, retained)?;
+            Ok(match (left, right) {
+                (Some(left), Some(right)) => Some(Tree::Node {
+                    left: Box::new(left),
+                    right: Box::new(right),
+                    data: *data,
+                }),
+                (Some(tree), None) | (None, Some(tree)) => Some(tree),
+                (None, None) => None,
+            })
+        }
+    }
+}
+
 fn layout_geometry(layout: &LayoutNode) -> LayoutGeometry {
     match layout {
         LayoutNode::Pane(pane) => LayoutGeometry {
@@ -221,6 +286,18 @@ fn layout_geometry(layout: &LayoutNode) -> LayoutGeometry {
         },
         LayoutNode::SplitHorizontal { geometry, .. }
         | LayoutNode::SplitVertical { geometry, .. } => *geometry,
+    }
+}
+
+fn collect_layout_panes(layout: &LayoutNode, panes: &mut Vec<PaneLayout>) {
+    match layout {
+        LayoutNode::Pane(pane) => panes.push(*pane),
+        LayoutNode::SplitHorizontal { children, .. }
+        | LayoutNode::SplitVertical { children, .. } => {
+            for child in children {
+                collect_layout_panes(child, panes);
+            }
+        }
     }
 }
 
@@ -470,6 +547,13 @@ impl TmuxDomainState {
     }
 
     fn create_pane(&self, pane: &PaneItem) -> anyhow::Result<Arc<dyn Pane>> {
+        let (pane, ref_pane) = self.prepare_pane(pane)?.commit();
+        let remote_id = ref_pane.lock().pane_id;
+        self.remote_panes.lock().insert(remote_id, ref_pane);
+        Ok(pane)
+    }
+
+    fn prepare_pane(&self, pane: &PaneItem) -> anyhow::Result<PreparedTmuxPane> {
         let local_pane_id = alloc_pane_id();
         let active_lock = Arc::new((Mutex::new(false), Condvar::new()));
         let (output_read, output_write) = filedescriptor::socketpair()?;
@@ -488,16 +572,11 @@ impl TmuxDomainState {
             pane_top: pane.pane_top,
         }));
 
-        {
-            let mut pane_map = self.remote_panes.lock();
-            pane_map.insert(pane.pane_id, ref_pane.clone());
-        }
-
         let pane_pty = TmuxPty {
             domain_id: self.domain_id,
             reader: output_read,
             cmd_queue: self.cmd_queue.clone(),
-            master_pane: ref_pane,
+            master_pane: Arc::clone(&ref_pane),
         };
 
         let writer = WriterWrapper::new(pane_pty.take_writer()?);
@@ -525,7 +604,7 @@ impl TmuxDomainState {
             Box::new(writer.clone()),
         );
 
-        Ok(Arc::new(LocalPane::new(
+        let pane: Arc<dyn Pane> = Arc::new(LocalPane::new(
             local_pane_id,
             terminal,
             Box::new(child),
@@ -533,63 +612,12 @@ impl TmuxDomainState {
             Box::new(writer),
             self.domain_id,
             "tmux pane".to_string(),
-        )))
-    }
-
-    pub fn split_pane(
-        &self,
-        tab_id: TabId,
-        pane_id: PaneId,
-        remote_id: TmuxPaneId,
-        split_request: SplitRequest,
-    ) -> anyhow::Result<Arc<dyn Pane>> {
-        let mux = Mux::get();
-        let tab = match mux.get_tab(tab_id) {
-            Some(t) => t,
-            None => anyhow::bail!("Invalid tab id {}", tab_id),
-        };
-
-        let pane_index = match tab
-            .iter_panes_ignoring_zoom()
-            .iter()
-            .find(|p| p.pane.pane_id() == pane_id)
-        {
-            Some(p) => p.index,
-            None => anyhow::bail!("invalid pane id {}", pane_id),
-        };
-
-        let split_size = match tab.compute_split_size(pane_index, split_request) {
-            Some(s) => s,
-            None => anyhow::bail!("invalid pane index {}", pane_index),
-        };
-
-        let window_id = match self.gui_tabs.lock().iter().find(|t| t.1.tab_id == tab_id) {
-            Some((_, tab)) => tab.tmux_window_id,
-            None => anyhow::bail!("No tab {}", tab_id),
-        };
-
-        let p = PaneItem {
-            session_id: 0,
-            window_id: window_id,
-            pane_id: remote_id,
-            _pane_index: 0,
-            cursor_x: 0,
-            cursor_y: 0,
-            pane_width: split_size.second.cols as u64,
-            pane_height: split_size.second.rows as u64,
-            pane_left: 0,
-            pane_top: 0,
-            pane_active: false,
-        };
-
-        let pane = self.create_pane(&p).context("failed to create pane")?;
-        tab.split_and_insert(pane_index, split_request, Arc::clone(&pane))?;
-
-        self.add_attached_pane(window_id, remote_id)?;
-
-        let _ = mux.add_pane(&pane);
-
-        return Ok(pane);
+        ));
+        Ok(PreparedTmuxPane {
+            pane,
+            remote: ref_pane,
+            committed: false,
+        })
     }
 
     fn sync_pane_state(&self, panes: &[PaneItem]) -> anyhow::Result<()> {
@@ -647,8 +675,7 @@ impl TmuxDomainState {
 
                     match mux.get_tab(local_tab.tab_id) {
                         Some(tab) => {
-                            tab.set_active_pane(&local_pane);
-                            mux.notify(MuxNotification::PaneFocused(local_pane.pane_id()));
+                            tab.reconcile_active_pane(&local_pane);
                         }
                         None => {}
                     }
@@ -698,13 +725,28 @@ impl TmuxDomainState {
                 &remote_by_local,
                 &mut local_subtrees,
             )?;
-            for topology in topology_plan.preserved_subtrees.iter().filter_map(
-                |(preserved_window, topology)| {
-                    (*preserved_window == *window_id).then_some(topology)
-                },
-            ) {
-                if let Some(tree) = local_subtrees.remove(topology) {
-                    reusable_subtrees.insert((*window_id, topology.clone()), tree);
+            if let Some(snapshot) = snapshot_layouts.get(window_id) {
+                let mut retained = vec![];
+                snapshot.pane_ids(&mut retained);
+                if let Some(projected) = project_local_tree(
+                    &tab.snapshot_pane_tree(),
+                    &remote_by_local,
+                    &retained.into_iter().collect(),
+                )? {
+                    collect_reusable_local_subtrees(
+                        &projected,
+                        &remote_by_local,
+                        &mut local_subtrees,
+                    )?;
+                }
+            }
+            if let Some(snapshot) = snapshot_layouts.get(window_id) {
+                let mut snapshot_subtrees = vec![];
+                snapshot.split_topologies(&mut snapshot_subtrees);
+                for topology in snapshot_subtrees {
+                    if let Some(tree) = local_subtrees.remove(&topology) {
+                        reusable_subtrees.insert((*window_id, topology), tree);
+                    }
                 }
             }
         }
@@ -713,7 +755,7 @@ impl TmuxDomainState {
             reusable_subtrees.len()
         );
 
-        let pane_objects: HashMap<_, _> = self
+        let mut pane_objects: HashMap<_, _> = self
             .remote_panes
             .lock()
             .iter()
@@ -722,51 +764,181 @@ impl TmuxDomainState {
                     .map(|pane| (*remote_id, pane))
             })
             .collect();
-        let mut candidate_trees = HashMap::new();
-        for window in windows
-            .iter()
-            .filter(|window| window.session_id == current_session)
-        {
-            let Some(tab_id) = self
-                .gui_tabs
-                .lock()
-                .get(&window.window_id)
-                .map(|attached| attached.tab_id)
-            else {
-                continue;
-            };
-            let Some(tab) = mux.get_tab(tab_id) else {
-                continue;
-            };
-            let mut pane_ids = vec![];
-            window.layout_tree.pane_ids(&mut pane_ids);
-            if pane_ids
-                .iter()
-                .any(|pane_id| !pane_objects.contains_key(pane_id))
-            {
-                continue;
+        if !new_window {
+            let attached_windows: HashSet<_> = self.gui_tabs.lock().keys().copied().collect();
+            let mut staged = vec![];
+            for ownership in &topology_plan.created {
+                if !attached_windows.contains(&ownership.window_id) {
+                    continue;
+                }
+                let window = windows
+                    .iter()
+                    .find(|window| window.window_id == ownership.window_id)
+                    .ok_or_else(|| anyhow!("missing snapshot window @{}", ownership.window_id))?;
+                let mut layouts = vec![];
+                collect_layout_panes(&window.layout_tree, &mut layouts);
+                let layout = layouts
+                    .iter()
+                    .find(|pane| pane.pane_id == ownership.pane_id)
+                    .ok_or_else(|| anyhow!("missing snapshot pane %{}", ownership.pane_id))?;
+                let prepared = self.prepare_pane(&PaneItem {
+                    session_id: window.session_id,
+                    window_id: window.window_id,
+                    pane_id: layout.pane_id,
+                    _pane_index: 0,
+                    cursor_x: 0,
+                    cursor_y: 0,
+                    pane_width: layout.pane_width,
+                    pane_height: layout.pane_height,
+                    pane_left: layout.pane_left,
+                    pane_top: layout.pane_top,
+                    pane_active: false,
+                })?;
+                pane_objects.insert(ownership.pane_id, Arc::clone(&prepared.pane));
+                staged.push(prepared);
             }
-            let reusable = reusable_subtrees
+
+            let mut candidates = vec![];
+            for window in windows
                 .iter()
-                .filter_map(|((reusable_window, topology), tree)| {
-                    (*reusable_window == window.window_id)
-                        .then(|| (topology.clone(), clone_pane_tree(tree)))
-                })
-                .collect();
-            candidate_trees.insert(
-                window.window_id,
-                build_snapshot_tree(
+                .filter(|window| window.session_id == current_session)
+            {
+                if topology_plan.unchanged_windows.contains(&window.window_id) {
+                    continue;
+                }
+                let Some(tab_id) = self
+                    .gui_tabs
+                    .lock()
+                    .get(&window.window_id)
+                    .map(|attached| attached.tab_id)
+                else {
+                    continue;
+                };
+                let Some(tab) = mux.get_tab(tab_id) else {
+                    continue;
+                };
+                let mut pane_ids = vec![];
+                window.layout_tree.pane_ids(&mut pane_ids);
+                let reusable = reusable_subtrees
+                    .iter()
+                    .filter_map(|((reusable_window, topology), tree)| {
+                        (*reusable_window == window.window_id)
+                            .then(|| (topology.clone(), clone_pane_tree(tree)))
+                    })
+                    .collect();
+                let tree = build_snapshot_tree(
                     &window.layout_tree,
                     &pane_objects,
                     &reusable,
                     tab.get_size(),
-                )?,
+                )?;
+                let current_active = tab
+                    .get_active_pane()
+                    .and_then(|pane| remote_by_local.get(&pane.pane_id()).copied())
+                    .filter(|pane_id| pane_ids.contains(pane_id))
+                    .or_else(|| pane_ids.first().copied())
+                    .ok_or_else(|| anyhow!("snapshot window @{} has no panes", window.window_id))?;
+                let active_local = pane_objects
+                    .get(&current_active)
+                    .map(|pane| pane.pane_id())
+                    .ok_or_else(|| {
+                        anyhow!("snapshot active pane %{current_active} is unavailable")
+                    })?;
+                Tab::validate_pane_tree(&tree, active_local)?;
+                candidates.push((
+                    window.window_id,
+                    Arc::clone(&tab),
+                    tree,
+                    active_local,
+                    window.layout_tree.clone(),
+                    window.layout_csum.clone(),
+                    pane_ids.into_iter().collect::<HashSet<_>>(),
+                ));
+            }
+            log::debug!(
+                "tmux reconciliation validated {} complete candidate trees and {} staged panes",
+                candidates.len(),
+                staged.len()
             );
+
+            for prepared in staged {
+                let (pane, remote) = prepared.commit();
+                let remote_id = remote.lock().pane_id;
+                self.remote_panes
+                    .lock()
+                    .insert(remote_id, Arc::clone(&remote));
+                if let Err(err) = mux.add_pane(&pane) {
+                    self.remote_panes.lock().remove(&remote_id);
+                    let active_lock = Arc::clone(&remote.lock().active_lock);
+                    let (released, condvar) = &*active_lock;
+                    *released.lock() = true;
+                    condvar.notify_all();
+                    return Err(err).context("registering staged tmux pane");
+                }
+            }
+            for (_, tab, tree, active_local, _, _, _) in &mut candidates {
+                tab.replace_pane_tree_silently(
+                    std::mem::replace(tree, Tree::Empty),
+                    *active_local,
+                )?;
+            }
+
+            {
+                let mut tabs = self.gui_tabs.lock();
+                for (window_id, _, _, _, layout, checksum, panes) in &candidates {
+                    if let Some(attached) = tabs.get_mut(window_id) {
+                        attached.layout_tree = layout.clone();
+                        attached.layout_csum = checksum.clone();
+                        attached.panes = panes.clone();
+                    }
+                }
+            }
+            {
+                let pane_map = self.remote_panes.lock();
+                for window in windows
+                    .iter()
+                    .filter(|window| window.session_id == current_session)
+                {
+                    let mut layouts = vec![];
+                    collect_layout_panes(&window.layout_tree, &mut layouts);
+                    for layout in layouts {
+                        if let Some(pane) = pane_map.get(&layout.pane_id) {
+                            pane.lock().window_id = window.window_id;
+                        }
+                    }
+                }
+            }
+            let snapshot_window_ids: HashSet<_> = windows
+                .iter()
+                .filter(|window| window.session_id == current_session)
+                .map(|window| window.window_id)
+                .collect();
+            let detached_windows: Vec<_> = self
+                .gui_tabs
+                .lock()
+                .keys()
+                .filter(|window_id| !snapshot_window_ids.contains(window_id))
+                .copied()
+                .collect();
+            for window_id in detached_windows {
+                self.remove_detached_window(window_id)?;
+            }
+            for removed in &topology_plan.removed {
+                if let Some(remote) = self.remote_panes.lock().remove(&removed.pane_id) {
+                    let remote = remote.lock();
+                    let local_pane_id = remote.local_pane_id;
+                    let (released, condvar) = &*remote.active_lock;
+                    *released.lock() = true;
+                    condvar.notify_all();
+                    drop(remote);
+                    mux.remove_pane(local_pane_id);
+                }
+            }
+            for (_, tab, _, active_local, _, _, _) in candidates {
+                mux.notify(MuxNotification::TabResized(tab.tab_id()));
+                mux.notify(MuxNotification::PaneFocused(active_local));
+            }
         }
-        log::debug!(
-            "tmux reconciliation built {} complete candidate trees",
-            candidate_trees.len()
-        );
 
         self.create_gui_window();
         let mut gui_window = self.gui_window.lock();
@@ -980,6 +1152,26 @@ impl TmuxDomainState {
 
         if *self.attach_state.lock() == AttachState::Init {
             self.cmd_queue.lock().push_back(Box::new(AttachDone));
+        }
+
+        loop {
+            let Some(remote_id) = self.pending_split_pane_ids.lock().front().copied() else {
+                break;
+            };
+            let reconciled = self
+                .remote_panes
+                .lock()
+                .get(&remote_id)
+                .map(|pane| pane.lock().local_pane_id)
+                .and_then(|local_id| mux.get_pane(local_id))
+                .is_some();
+            if !reconciled {
+                break;
+            }
+            self.pending_split_pane_ids.lock().pop_front();
+            if let Some(mut completion) = self.pending_splits.lock().pop_front() {
+                completion.ok(remote_id);
+            }
         }
 
         TmuxDomainState::schedule_send_next_command(self.domain_id);
@@ -1209,6 +1401,10 @@ pub(crate) struct ListAllWindows {
 }
 
 impl TmuxCommand for ListAllWindows {
+    fn is_full_window_snapshot(&self) -> bool {
+        self.window_id.is_none()
+    }
+
     fn get_command(&self, _domain_id: DomainId) -> String {
         format!(
             "list-windows -F \
@@ -1320,6 +1516,10 @@ pub(crate) struct Resize {
 }
 
 impl TmuxCommand for Resize {
+    fn resize_pane_id(&self) -> Option<TmuxPaneId> {
+        Some(self.pane_id)
+    }
+
     fn get_command(&self, domain_id: DomainId) -> String {
         let mux = Mux::get();
         let domain = match mux.get_domain(domain_id) {
@@ -1675,6 +1875,7 @@ impl TmuxCommand for SplitPane {
                     if let Some(mut pending) = tmux.inner.pending_splits.lock().pop_front() {
                         pending.err(anyhow!("tmux rejected split-window"));
                     }
+                    tmux.inner.pending_split_pane_ids.lock().pop_front();
                 }
             }
             let error = format!("split-window in domain={domain_id} failed: {result:#?}");
@@ -1690,6 +1891,7 @@ impl TmuxCommand for SplitPane {
                 if let Some(mut pending) = tmux.inner.pending_splits.lock().pop_front() {
                     pending.err(anyhow!("tmux split-window timed out"));
                 }
+                tmux.inner.pending_split_pane_ids.lock().pop_front();
             }
         }
         anyhow::bail!("split-window timed out in domain {domain_id}")

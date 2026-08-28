@@ -1183,7 +1183,23 @@ impl Tab {
         tree: Tree,
         active_pane_id: PaneId,
     ) -> anyhow::Result<()> {
-        self.inner.lock().replace_pane_tree(tree, active_pane_id)
+        self.inner
+            .lock()
+            .replace_pane_tree(tree, active_pane_id, true)
+    }
+
+    pub(crate) fn validate_pane_tree(tree: &Tree, active_pane_id: PaneId) -> anyhow::Result<()> {
+        TabInner::validate_pane_tree(tree, active_pane_id).map(|_| ())
+    }
+
+    pub(crate) fn replace_pane_tree_silently(
+        &self,
+        tree: Tree,
+        active_pane_id: PaneId,
+    ) -> anyhow::Result<()> {
+        self.inner
+            .lock()
+            .replace_pane_tree(tree, active_pane_id, false)
     }
 
     /// Snapshot the current binary pane tree, retaining Arc identity and the
@@ -2659,7 +2675,7 @@ impl TabInner {
     }
 
     #[allow(dead_code)] // Used by Tab::replace_pane_tree.
-    fn replace_pane_tree(&mut self, tree: Tree, active_pane_id: PaneId) -> anyhow::Result<()> {
+    fn validate_pane_tree(tree: &Tree, active_pane_id: PaneId) -> anyhow::Result<Vec<PaneId>> {
         fn collect_panes(
             tree: &Tree,
             panes: &mut Vec<PaneId>,
@@ -2688,13 +2704,24 @@ impl TabInner {
         }
 
         let mut pane_ids = vec![];
-        collect_panes(&tree, &mut pane_ids, &mut Default::default())?;
+        collect_panes(tree, &mut pane_ids, &mut Default::default())?;
+        if !pane_ids.contains(&active_pane_id) {
+            anyhow::bail!("active pane {active_pane_id} is absent from replacement tree");
+        }
+        Ok(pane_ids)
+    }
+
+    fn replace_pane_tree(
+        &mut self,
+        tree: Tree,
+        active_pane_id: PaneId,
+        notify: bool,
+    ) -> anyhow::Result<()> {
+        let pane_ids = Self::validate_pane_tree(&tree, active_pane_id)?;
         let active = pane_ids
             .iter()
             .position(|pane_id| *pane_id == active_pane_id)
-            .ok_or_else(|| {
-                anyhow::anyhow!("active pane {active_pane_id} is absent from replacement tree")
-            })?;
+            .expect("validated active pane must be present");
 
         let prior = self.get_active_pane();
         let zoomed_pane_id = self.zoomed.as_ref().map(|pane| pane.pane_id());
@@ -2706,8 +2733,10 @@ impl TabInner {
         }
         apply_sizes_from_splits_preserving_split(self.pane.as_mut().unwrap(), &self.size);
         if let Some(mux) = Mux::try_get() {
-            self.advise_focus_change(prior, true);
-            mux.notify(MuxNotification::TabResized(self.id));
+            self.advise_focus_change(prior, notify);
+            if notify {
+                mux.notify(MuxNotification::TabResized(self.id));
+            }
         }
         Ok(())
     }
