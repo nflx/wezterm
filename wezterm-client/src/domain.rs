@@ -741,13 +741,21 @@ impl ClientDomain {
         if !remote_tabs_to_forget.is_empty() {
             let mut tabs = inner.remote_to_local_tab.lock().unwrap();
             for t in remote_tabs_to_forget {
-                tabs.remove(&t);
+                if let Some(local_tab_id) = tabs.remove(&t) {
+                    // A remote tab can disappear because its final pane moved
+                    // into another tab.  The pane objects were already reused
+                    // while applying the new trees above, so remove only the
+                    // stale tab registration here.
+                    mux.remove_tab_preserving_panes(local_tab_id);
+                }
             }
         }
         if !remote_panes_to_forget.is_empty() {
             let mut panes = inner.remote_to_local_pane.lock().unwrap();
             for p in remote_panes_to_forget {
-                panes.remove(&p);
+                if let Some(local_pane_id) = panes.remove(&p) {
+                    mux.remove_pane_without_pruning(local_pane_id);
+                }
             }
         }
 

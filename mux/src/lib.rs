@@ -925,6 +925,29 @@ impl Mux {
         tab
     }
 
+    /// Remove a domain-owned tab registration without deregistering its pane
+    /// objects.  Snapshot-driven domains use this while atomically rebinding a
+    /// stable pane into another tab; their reconciliation removes panes that
+    /// are genuinely absent from the authoritative snapshot separately.
+    pub fn remove_tab_preserving_panes(&self, tab_id: TabId) -> Option<Arc<Tab>> {
+        log::debug!("remove_tab_preserving_panes tab {}", tab_id);
+        let tab = self.tabs.write().remove(&tab_id)?;
+        let mut affected_windows = vec![];
+        let mut windows = self.windows.write();
+        for (window_id, window) in windows.iter_mut() {
+            if window.idx_by_id(tab_id).is_some() {
+                affected_windows.push(*window_id);
+                window.remove_by_id(tab_id);
+            }
+        }
+        drop(windows);
+        self.recompute_pane_count();
+        for window_id in affected_windows {
+            self.notify(MuxNotification::WindowInvalidated(window_id));
+        }
+        Some(tab)
+    }
+
     pub fn prune_dead_windows(&self) {
         self.prune_dead_windows_impl(false);
     }

@@ -647,8 +647,10 @@ impl TmuxDomainState {
             }
         };
 
-        let mux = Mux::get();
-        mux.remove_tab(tab.tab_id);
+        // The snapshot diff below separately deregisters panes that are truly
+        // absent.  Preserve all pane objects here so panes moved out of this
+        // disappearing window retain their local identity and render state.
+        Mux::get().remove_tab_preserving_panes(tab.tab_id);
         gui_tabs.remove(&window_id);
 
         Ok(())
@@ -672,6 +674,12 @@ impl TmuxDomainState {
 
     fn prepare_pane(&self, pane: &PaneItem) -> anyhow::Result<PreparedTmuxPane> {
         let local_pane_id = alloc_pane_id();
+        log::debug!(
+            "preparing tmux pane %{} as local pane {} in window @{}",
+            pane.pane_id,
+            local_pane_id,
+            pane.window_id
+        );
         let active_lock = Arc::new((Mutex::new(false), Condvar::new()));
         let (output_read, output_write) = filedescriptor::socketpair()?;
         let ref_pane = Arc::new(Mutex::new(TmuxRemotePane {
@@ -799,6 +807,30 @@ impl TmuxDomainState {
             log::info!("new pane synced, id: {}", pane.pane_id);
         }
 
+        let completed_focus: Vec<_> = {
+            let mut pending = self.pending_focus.lock();
+            let mut completed = vec![];
+            let mut index = 0;
+            while index < pending.len() {
+                let focus = &pending[index];
+                let reconciled = focus.accepted
+                    && panes
+                        .iter()
+                        .any(|pane| pane.pane_id == focus.pane_id && pane.pane_active);
+                if reconciled {
+                    if let Some(focus) = pending.remove(index) {
+                        completed.push(focus.completion);
+                    }
+                } else {
+                    index += 1;
+                }
+            }
+            completed
+        };
+        for mut completion in completed_focus {
+            completion.ok(());
+        }
+
         Ok(())
     }
 
@@ -890,6 +922,14 @@ impl TmuxDomainState {
             let attached_windows: HashSet<_> = self.gui_tabs.lock().keys().copied().collect();
             let mut staged = vec![];
             for ownership in &topology_plan.created {
+                // A pane can be temporarily absent from attached topology
+                // after its source window is removed while its stable remote
+                // transport and local pane object remain alive.  Reuse that
+                // object when the next complete snapshot establishes its new
+                // owner; only allocate for a genuinely unseen tmux pane id.
+                if pane_objects.contains_key(&ownership.pane_id) {
+                    continue;
+                }
                 if !attached_windows.contains(&ownership.window_id) {
                     continue;
                 }
@@ -1084,6 +1124,11 @@ impl TmuxDomainState {
                     .collect()
             };
             for removed in &topology_plan.removed {
+                log::debug!(
+                    "authoritative snapshot removing tmux pane %{} from window @{}",
+                    removed.pane_id,
+                    removed.window_id
+                );
                 if let Some(remote) = self.remote_panes.lock().remove(&removed.pane_id) {
                     let remote = remote.lock();
                     let local_pane_id = remote.local_pane_id;
@@ -1410,6 +1455,30 @@ impl TmuxDomainState {
             }
         }
 
+        let completed_renames: Vec<_> = {
+            let mut pending = self.pending_renames.lock();
+            let mut completed = vec![];
+            let mut index = 0;
+            while index < pending.len() {
+                let rename = &pending[index];
+                let reconciled = rename.accepted
+                    && windows.iter().any(|window| {
+                        window.window_id == rename.window_id && window.window_name == rename.title
+                    });
+                if reconciled {
+                    if let Some(rename) = pending.remove(index) {
+                        completed.push(rename.completion);
+                    }
+                } else {
+                    index += 1;
+                }
+            }
+            completed
+        };
+        for mut completion in completed_renames {
+            completion.ok(());
+        }
+
         TmuxDomainState::schedule_send_next_command(self.domain_id);
 
         Ok(())
@@ -1647,7 +1716,7 @@ pub(crate) struct ListAllWindows {
 
 impl TmuxCommand for ListAllWindows {
     fn is_full_window_snapshot(&self) -> bool {
-        self.window_id.is_none()
+        true
     }
 
     fn get_command(&self, _domain_id: DomainId) -> String {
@@ -1707,12 +1776,6 @@ impl TmuxCommand for ListAllWindows {
                 .parse::<isize>()?;
 
             let window_active = window_active == 1;
-
-            if let Some(x) = self.window_id {
-                if x != window_id {
-                    continue;
-                }
-            }
 
             let layout_csum = window_layout
                 .get(0..4)
@@ -2071,7 +2134,7 @@ impl TmuxCommand for KillWindow {
                     tmux.inner
                         .cmd_queue
                         .lock()
-                        .push_back(Box::new(ListAllWindows {
+                        .push_front(Box::new(ListAllWindows {
                             session_id,
                             window_id: None,
                         }));
@@ -2125,7 +2188,7 @@ impl TmuxCommand for KillPane {
                     tmux.inner
                         .cmd_queue
                         .lock()
-                        .push_back(Box::new(ListAllWindows {
+                        .push_front(Box::new(ListAllWindows {
                             session_id,
                             window_id: None,
                         }));
@@ -2355,7 +2418,89 @@ pub(crate) struct SelectWindow {
 }
 
 #[derive(Debug)]
+pub(crate) struct FocusPane {
+    pub operation_id: u64,
+    pub pane_id: TmuxPaneId,
+    pub window_id: TmuxWindowId,
+}
+
+impl TmuxCommand for FocusPane {
+    fn guarded_response_count(&self) -> usize {
+        2
+    }
+
+    fn get_command(&self, _domain_id: DomainId) -> String {
+        format!(
+            "select-window -t @{} ; select-pane -t %{}\n",
+            self.window_id, self.pane_id
+        )
+    }
+
+    fn process_result(&self, domain_id: DomainId, result: &Guarded) -> anyhow::Result<()> {
+        let domain = Mux::get()
+            .get_domain(domain_id)
+            .ok_or_else(|| anyhow!("tmux domain lost"))?;
+        let tmux = domain
+            .downcast_ref::<TmuxDomain>()
+            .ok_or_else(|| anyhow!("tmux domain lost"))?;
+        if result.error {
+            let completion = {
+                let mut pending = tmux.inner.pending_focus.lock();
+                pending
+                    .iter()
+                    .position(|focus| focus.operation_id == self.operation_id)
+                    .and_then(|index| pending.remove(index))
+                    .map(|focus| focus.completion)
+            };
+            if let Some(mut completion) = completion {
+                completion.err(anyhow!("tmux rejected pane focus"));
+            }
+            anyhow::bail!("tmux pane focus in domain={domain_id} failed: {result:#?}");
+        }
+        if let Some(focus) = tmux
+            .inner
+            .pending_focus
+            .lock()
+            .iter_mut()
+            .find(|focus| focus.operation_id == self.operation_id)
+        {
+            focus.accepted = true;
+        }
+        tmux.inner
+            .cmd_queue
+            .lock()
+            .push_front(Box::new(ListAllPanes {
+                window_id: self.window_id,
+                prune: false,
+                layout_csum: String::new(),
+            }));
+        TmuxDomainState::schedule_send_next_command(domain_id);
+        Ok(())
+    }
+
+    fn process_timeout(&self, domain_id: DomainId) -> anyhow::Result<()> {
+        if let Some(domain) = Mux::get().get_domain(domain_id) {
+            if let Some(tmux) = domain.downcast_ref::<TmuxDomain>() {
+                let completion = {
+                    let mut pending = tmux.inner.pending_focus.lock();
+                    pending
+                        .iter()
+                        .position(|focus| focus.operation_id == self.operation_id)
+                        .and_then(|index| pending.remove(index))
+                        .map(|focus| focus.completion)
+                };
+                if let Some(mut completion) = completion {
+                    completion.err(anyhow!("tmux pane focus timed out"));
+                }
+            }
+        }
+        anyhow::bail!("tmux pane focus timed out in domain {domain_id}")
+    }
+}
+
+#[derive(Debug)]
 pub(crate) struct RenameWindow {
+    pub operation_id: u64,
     pub window_id: TmuxWindowId,
     pub title: String,
 }
@@ -2372,9 +2517,66 @@ impl TmuxCommand for RenameWindow {
 
     fn process_result(&self, domain_id: DomainId, result: &Guarded) -> anyhow::Result<()> {
         if result.error {
+            if let Some(domain) = Mux::get().get_domain(domain_id) {
+                if let Some(tmux) = domain.downcast_ref::<TmuxDomain>() {
+                    let completion = {
+                        let mut pending = tmux.inner.pending_renames.lock();
+                        pending
+                            .iter()
+                            .position(|rename| rename.operation_id == self.operation_id)
+                            .and_then(|index| pending.remove(index))
+                            .map(|rename| rename.completion)
+                    };
+                    if let Some(mut completion) = completion {
+                        completion.err(anyhow!("tmux rejected rename-window"));
+                    }
+                }
+            }
             anyhow::bail!("rename-window in domain={domain_id} failed: {result:#?}");
         }
+        if let Some(domain) = Mux::get().get_domain(domain_id) {
+            if let Some(tmux) = domain.downcast_ref::<TmuxDomain>() {
+                if let Some(rename) = tmux
+                    .inner
+                    .pending_renames
+                    .lock()
+                    .iter_mut()
+                    .find(|rename| rename.operation_id == self.operation_id)
+                {
+                    rename.accepted = true;
+                }
+                if let Some(session_id) = *tmux.inner.tmux_session.lock() {
+                    tmux.inner
+                        .cmd_queue
+                        .lock()
+                        .push_front(Box::new(ListAllWindows {
+                            session_id,
+                            window_id: None,
+                        }));
+                    TmuxDomainState::schedule_send_next_command(domain_id);
+                }
+            }
+        }
         Ok(())
+    }
+
+    fn process_timeout(&self, domain_id: DomainId) -> anyhow::Result<()> {
+        if let Some(domain) = Mux::get().get_domain(domain_id) {
+            if let Some(tmux) = domain.downcast_ref::<TmuxDomain>() {
+                let completion = {
+                    let mut pending = tmux.inner.pending_renames.lock();
+                    pending
+                        .iter()
+                        .position(|rename| rename.operation_id == self.operation_id)
+                        .and_then(|index| pending.remove(index))
+                        .map(|rename| rename.completion)
+                };
+                if let Some(mut completion) = completion {
+                    completion.err(anyhow!("tmux rename-window timed out"));
+                }
+            }
+        }
+        anyhow::bail!("rename-window timed out in domain {domain_id}")
     }
 }
 
@@ -2552,6 +2754,20 @@ mod test {
     }
 
     #[test]
+    fn focus_pane_is_one_write_with_two_guarded_responses() {
+        let command = FocusPane {
+            operation_id: 4,
+            pane_id: 11,
+            window_id: 7,
+        };
+        assert_eq!(
+            command.get_command(0),
+            "select-window -t @7 ; select-pane -t %11\n"
+        );
+        assert_eq!(command.guarded_response_count(), 2);
+    }
+
+    #[test]
     fn reposition_completes_only_after_accepted_target_ownership_snapshot() {
         let target_ownership = HashMap::from([(11, 4), (22, 4)]);
         assert!(reposition_is_reconciled(true, 11, 22, 4, &target_ownership));
@@ -2721,6 +2937,7 @@ mod test {
     #[test]
     fn rename_window_quotes_title() {
         let command = RenameWindow {
+            operation_id: 1,
             window_id: 7,
             title: "work's\nqueue".to_string(),
         };

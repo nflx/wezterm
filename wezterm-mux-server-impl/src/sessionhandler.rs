@@ -427,42 +427,39 @@ impl SessionHandler {
             Pdu::SetFocusedPane(SetFocusedPane { pane_id }) => {
                 let client_id = self.client_id.clone();
                 spawn_into_main_thread(async move {
-                    catch(
-                        move || {
-                            let mux = Mux::get();
-                            let _identity = mux.with_identity(client_id);
-
-                            let pane = mux
-                                .get_pane(pane_id)
-                                .ok_or_else(|| anyhow::anyhow!("pane {pane_id} not found"))?;
-
-                            let (_domain_id, window_id, tab_id) = mux
-                                .resolve_pane_id(pane_id)
-                                .ok_or_else(|| anyhow::anyhow!("pane {pane_id} not found"))?;
-                            {
-                                let mut window =
-                                    mux.get_window_mut(window_id).ok_or_else(|| {
-                                        anyhow::anyhow!("window {window_id} not found")
-                                    })?;
-                                let tab_idx = window.idx_by_id(tab_id).ok_or_else(|| {
-                                    anyhow::anyhow!(
-                                        "tab {tab_id} isn't really in window {window_id}!?"
-                                    )
-                                })?;
-                                window.save_and_then_set_active(tab_idx);
+                    let result = async {
+                        let mux = Mux::get();
+                        let _identity = mux.with_identity(client_id);
+                        let pane = mux
+                            .get_pane(pane_id)
+                            .ok_or_else(|| anyhow::anyhow!("pane {pane_id} not found"))?;
+                        if let Some(domain) = mux.get_domain(pane.domain_id()) {
+                            if let Some(tmux) = domain.downcast_ref::<mux::tmux::TmuxDomain>() {
+                                tmux.focus_pane(pane_id).await?;
                             }
-                            let tab = mux
-                                .get_tab(tab_id)
-                                .ok_or_else(|| anyhow::anyhow!("tab {tab_id} not found"))?;
-                            tab.set_active_pane(&pane);
-
-                            mux.record_focus_for_current_identity(pane_id);
-                            mux.notify(mux::MuxNotification::PaneFocused(pane_id));
-
-                            Ok(Pdu::UnitResponse(UnitResponse {}))
-                        },
-                        send_response,
-                    )
+                        }
+                        let (_domain_id, window_id, tab_id) = mux
+                            .resolve_pane_id(pane_id)
+                            .ok_or_else(|| anyhow::anyhow!("pane {pane_id} not found"))?;
+                        {
+                            let mut window = mux
+                                .get_window_mut(window_id)
+                                .ok_or_else(|| anyhow::anyhow!("window {window_id} not found"))?;
+                            let tab_idx = window.idx_by_id(tab_id).ok_or_else(|| {
+                                anyhow::anyhow!("tab {tab_id} isn't really in window {window_id}!?")
+                            })?;
+                            window.save_and_then_set_active(tab_idx);
+                        }
+                        let tab = mux
+                            .get_tab(tab_id)
+                            .ok_or_else(|| anyhow::anyhow!("tab {tab_id} not found"))?;
+                        tab.set_active_pane(&pane);
+                        mux.record_focus_for_current_identity(pane_id);
+                        mux.notify(mux::MuxNotification::PaneFocused(pane_id));
+                        Ok(Pdu::UnitResponse(UnitResponse {}))
+                    }
+                    .await;
+                    send_response(result);
                 })
                 .detach();
             }
@@ -1345,28 +1342,24 @@ impl SessionHandler {
             }
             Pdu::TabTitleChanged(TabTitleChanged { tab_id, title }) => {
                 spawn_into_main_thread(async move {
-                    catch(
-                        move || {
-                            let mux = Mux::get();
-                            let tab = mux
-                                .get_tab(tab_id)
-                                .ok_or_else(|| anyhow!("no such tab {tab_id}"))?;
-
-                            tab.set_title(&title);
-                            if let Some(pane) = tab.get_active_pane() {
-                                if let Some(domain) = mux.get_domain(pane.domain_id()) {
-                                    if let Some(tmux) =
-                                        domain.downcast_ref::<mux::tmux::TmuxDomain>()
-                                    {
-                                        tmux.rename_tab(tab_id, title)?;
-                                    }
+                    let result = async {
+                        let mux = Mux::get();
+                        let tab = mux
+                            .get_tab(tab_id)
+                            .ok_or_else(|| anyhow!("no such tab {tab_id}"))?;
+                        if let Some(pane) = tab.get_active_pane() {
+                            if let Some(domain) = mux.get_domain(pane.domain_id()) {
+                                if let Some(tmux) = domain.downcast_ref::<mux::tmux::TmuxDomain>() {
+                                    tmux.rename_tab(tab_id, title).await?;
+                                    return Ok(Pdu::UnitResponse(UnitResponse {}));
                                 }
                             }
-
-                            Ok(Pdu::UnitResponse(UnitResponse {}))
-                        },
-                        send_response,
-                    )
+                        }
+                        tab.set_title(&title);
+                        Ok(Pdu::UnitResponse(UnitResponse {}))
+                    }
+                    .await;
+                    send_response(result);
                 })
                 .detach();
             }

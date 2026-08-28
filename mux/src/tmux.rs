@@ -3,8 +3,8 @@ use crate::domain::{alloc_domain_id, Domain, DomainId, DomainState, SplitSource}
 use crate::pane::{Pane, PaneId};
 use crate::tab::{SplitRequest, Tab, TabId};
 use crate::tmux_commands::{
-    BreakPane, JoinPane, KillWindow, ListAllWindows, ListCommands, NewWindow, RenameWindow,
-    SplitPane, TmuxCommand,
+    BreakPane, FocusPane, JoinPane, KillWindow, ListAllWindows, ListCommands, NewWindow,
+    RenameWindow, SplitPane, TmuxCommand,
 };
 use crate::window::WindowId;
 use crate::{Mux, MuxWindowBuilder};
@@ -85,6 +85,21 @@ pub(crate) struct PendingBreakPane {
     pub completion: promise::Promise<TmuxWindowId>,
 }
 
+pub(crate) struct PendingRename {
+    pub operation_id: u64,
+    pub window_id: TmuxWindowId,
+    pub title: String,
+    pub accepted: bool,
+    pub completion: promise::Promise<()>,
+}
+
+pub(crate) struct PendingFocus {
+    pub operation_id: u64,
+    pub pane_id: TmuxPaneId,
+    pub accepted: bool,
+    pub completion: promise::Promise<()>,
+}
+
 fn retain_unsent_commands(
     queue: &mut TmuxCmdQueue,
     command_in_flight: bool,
@@ -106,6 +121,8 @@ pub(crate) struct TmuxDomainState {
     next_operation_id: AtomicU64,
     next_reposition_operation_id: AtomicU64,
     next_break_operation_id: AtomicU64,
+    next_rename_operation_id: AtomicU64,
+    next_focus_operation_id: AtomicU64,
     in_flight_operation_id: AtomicU64,
     in_flight_responses_remaining: AtomicUsize,
     retry_requested: AtomicBool,
@@ -123,6 +140,8 @@ pub(crate) struct TmuxDomainState {
     pub(crate) pending_window_kills: Mutex<HashMap<TmuxWindowId, promise::Promise<()>>>,
     pub(crate) pending_repositions: Mutex<VecDeque<PendingReposition>>,
     pub(crate) pending_breaks: Mutex<VecDeque<PendingBreakPane>>,
+    pub(crate) pending_renames: Mutex<VecDeque<PendingRename>>,
+    pub(crate) pending_focus: Mutex<VecDeque<PendingFocus>>,
     pub(crate) pending_reposition_windows: Mutex<HashSet<TmuxWindowId>>,
     pub backlog: Mutex<HashMap<TmuxPaneId, Vec<u8>>>,
 }
@@ -155,6 +174,24 @@ impl TmuxDomainState {
         let operations: Vec<_> = self.pending_window_kills.lock().drain().collect();
         for (_, mut completion) in operations {
             completion.err(anyhow::anyhow!(reason.to_string()));
+        }
+    }
+
+    fn fail_pending_renames(&self, reason: &str) {
+        let operations: Vec<_> = self.pending_renames.lock().drain(..).collect();
+        for mut operation in operations {
+            operation
+                .completion
+                .err(anyhow::anyhow!(reason.to_string()));
+        }
+    }
+
+    fn fail_pending_focus(&self, reason: &str) {
+        let operations: Vec<_> = self.pending_focus.lock().drain(..).collect();
+        for mut operation in operations {
+            operation
+                .completion
+                .err(anyhow::anyhow!(reason.to_string()));
         }
     }
 
@@ -235,6 +272,8 @@ impl TmuxDomainState {
                     self.fail_pending_repositions("tmux control transport disconnected");
                     self.fail_pending_breaks("tmux control transport disconnected");
                     self.fail_pending_window_kills("tmux control transport disconnected");
+                    self.fail_pending_renames("tmux control transport disconnected");
+                    self.fail_pending_focus("tmux control transport disconnected");
 
                     // Force to quit the tmux mode
                     let pane_id = *self.pane_id.lock();
@@ -301,20 +340,24 @@ impl TmuxDomainState {
                         }
                     }
                 }
-                Event::WindowClose { window } => {
-                    if self.pending_reposition_windows.lock().contains(window) {
-                        continue;
-                    }
-                    if self.pending_window_kills.lock().contains_key(window) {
-                        if let Some(session_id) = *self.tmux_session.lock() {
-                            self.cmd_queue.lock().push_back(Box::new(ListAllWindows {
+                Event::WindowClose { window: _ } => {
+                    // A window can disappear because its final pane moved to a
+                    // surviving window.  Removing it directly from this early
+                    // notification deregisters that still-live pane before we
+                    // know its new owner.  Let the complete snapshot perform
+                    // the atomic ownership rebind and detached-window removal.
+                    if let Some(session_id) = *self.tmux_session.lock() {
+                        let mut queue = self.cmd_queue.lock();
+                        if !queue
+                            .iter()
+                            .any(|command| command.is_full_window_snapshot())
+                        {
+                            queue.push_front(Box::new(ListAllWindows {
                                 session_id,
                                 window_id: None,
                             }));
                         }
-                        continue;
                     }
-                    let _ = self.remove_detached_window(*window);
                 }
                 Event::WindowPaneChanged { window, pane } => {
                     // The tmux 2.7 WindowPaneChanged event comes early than WindowAdd, we need to
@@ -442,6 +485,8 @@ impl TmuxDomainState {
         self.fail_pending_repositions("tmux command actor timed out");
         self.fail_pending_breaks("tmux command actor timed out");
         self.fail_pending_window_kills("tmux command actor timed out");
+        self.fail_pending_renames("tmux command actor timed out");
+        self.fail_pending_focus("tmux command actor timed out");
         if let Some(transport) = Mux::get().get_pane(*self.pane_id.lock()) {
             transport.kill();
         }
@@ -705,6 +750,8 @@ impl TmuxDomain {
             next_operation_id: AtomicU64::new(0),
             next_reposition_operation_id: AtomicU64::new(0),
             next_break_operation_id: AtomicU64::new(0),
+            next_rename_operation_id: AtomicU64::new(0),
+            next_focus_operation_id: AtomicU64::new(0),
             in_flight_operation_id: AtomicU64::new(0),
             in_flight_responses_remaining: AtomicUsize::new(0),
             retry_requested: AtomicBool::new(false),
@@ -722,6 +769,8 @@ impl TmuxDomain {
             pending_window_kills: Mutex::new(HashMap::default()),
             pending_repositions: Mutex::new(VecDeque::default()),
             pending_breaks: Mutex::new(VecDeque::default()),
+            pending_renames: Mutex::new(VecDeque::default()),
+            pending_focus: Mutex::new(VecDeque::default()),
             pending_reposition_windows: Mutex::new(HashSet::default()),
             backlog: Mutex::new(HashMap::default()),
         });
@@ -763,6 +812,10 @@ impl TmuxDomain {
             .fail_pending_breaks("tmux control transport reconnected");
         self.inner
             .fail_pending_window_kills("tmux control transport reconnected");
+        self.inner
+            .fail_pending_renames("tmux control transport reconnected");
+        self.inner
+            .fail_pending_focus("tmux control transport reconnected");
     }
 
     pub(crate) fn transport_disconnected(&self) {
@@ -780,6 +833,10 @@ impl TmuxDomain {
             .fail_pending_breaks("tmux control transport disconnected");
         self.inner
             .fail_pending_window_kills("tmux control transport disconnected");
+        self.inner
+            .fail_pending_renames("tmux control transport disconnected");
+        self.inner
+            .fail_pending_focus("tmux control transport disconnected");
     }
 
     pub fn mark_reconnecting(&self) {
@@ -794,7 +851,7 @@ impl TmuxDomain {
         self.inner.retry_requested.swap(false, Ordering::AcqRel)
     }
 
-    pub fn rename_tab(&self, tab_id: TabId, title: String) -> anyhow::Result<()> {
+    pub async fn rename_tab(&self, tab_id: TabId, title: String) -> anyhow::Result<()> {
         let window_id = self
             .inner
             .gui_tabs
@@ -803,12 +860,68 @@ impl TmuxDomain {
             .find(|tab| tab.tab_id == tab_id)
             .map(|tab| tab.tmux_window_id)
             .ok_or_else(|| anyhow::anyhow!("no tmux window for tab {tab_id}"))?;
+        let mut completion = promise::Promise::new();
+        let future = completion
+            .get_future()
+            .ok_or_else(|| anyhow::anyhow!("failed to create tmux rename completion"))?;
+        let operation_id = self
+            .inner
+            .next_rename_operation_id
+            .fetch_add(1, Ordering::Relaxed)
+            + 1;
+        self.inner.pending_renames.lock().push_back(PendingRename {
+            operation_id,
+            window_id,
+            title: title.clone(),
+            accepted: false,
+            completion,
+        });
         self.inner
             .cmd_queue
             .lock()
-            .push_back(Box::new(RenameWindow { window_id, title }));
+            .push_back(Box::new(RenameWindow {
+                operation_id,
+                window_id,
+                title,
+            }));
         TmuxDomainState::schedule_send_next_command(self.inner.domain_id);
-        Ok(())
+        future.await
+    }
+
+    pub async fn focus_pane(&self, local_pane_id: PaneId) -> anyhow::Result<()> {
+        let (pane_id, window_id) = {
+            let panes = self.inner.remote_panes.lock();
+            panes
+                .values()
+                .find(|pane| pane.lock().local_pane_id == local_pane_id)
+                .map(|pane| {
+                    let pane = pane.lock();
+                    (pane.pane_id, pane.window_id)
+                })
+                .ok_or_else(|| anyhow::anyhow!("no tmux pane for local pane {local_pane_id}"))?
+        };
+        let mut completion = promise::Promise::new();
+        let future = completion
+            .get_future()
+            .ok_or_else(|| anyhow::anyhow!("failed to create tmux focus completion"))?;
+        let operation_id = self
+            .inner
+            .next_focus_operation_id
+            .fetch_add(1, Ordering::Relaxed)
+            + 1;
+        self.inner.pending_focus.lock().push_back(PendingFocus {
+            operation_id,
+            pane_id,
+            accepted: false,
+            completion,
+        });
+        self.inner.cmd_queue.lock().push_back(Box::new(FocusPane {
+            operation_id,
+            pane_id,
+            window_id,
+        }));
+        TmuxDomainState::schedule_send_next_command(self.inner.domain_id);
+        future.await
     }
 
     pub async fn close_tab(&self, tab_id: TabId) -> anyhow::Result<()> {
