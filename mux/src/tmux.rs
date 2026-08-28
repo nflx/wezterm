@@ -431,15 +431,36 @@ impl TmuxDomainState {
             let mux = Mux::get();
             if let Some(pane) = mux.get_pane(*self.pane_id.lock()) {
                 let mut writer = pane.writer();
-                let _ = write!(writer, "{}", cmd);
+                let fault_match = std::env::var("WEZTERM_TMUX_TEST_FAULT_MATCH").ok();
+                let fault_mode = std::env::var("WEZTERM_TMUX_TEST_FAULT_MODE").ok();
+                let inject = fault_match
+                    .as_deref()
+                    .is_some_and(|needle| !needle.is_empty() && cmd.contains(needle));
+                match (inject, fault_mode.as_deref()) {
+                    (true, Some("timeout")) => {
+                        log::warn!("injecting tmux command timeout for {cmd:?}");
+                    }
+                    (true, Some("reject")) => {
+                        log::warn!("injecting tmux command rejection for {cmd:?}");
+                        let _ = writeln!(writer, "__wezterm_injected_command_failure__");
+                    }
+                    _ => {
+                        let _ = write!(writer, "{}", cmd);
+                    }
+                }
             }
             *self.state.lock() = State::WaitingForResponse;
             let operation_id = self.next_operation_id.fetch_add(1, Ordering::Relaxed) + 1;
             self.in_flight_operation_id
                 .store(operation_id, Ordering::Release);
             let domain_id = self.domain_id;
+            let timeout = std::env::var("WEZTERM_TMUX_TEST_TIMEOUT_MS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .map(Duration::from_millis)
+                .unwrap_or_else(|| Duration::from_secs(10));
             std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_secs(10));
+                std::thread::sleep(timeout);
                 promise::spawn::spawn_into_main_thread(async move {
                     let mux = Mux::get();
                     let Some(domain) = mux.get_domain(domain_id) else {
