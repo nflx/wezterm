@@ -1260,18 +1260,24 @@ impl Domain for TmuxDomain {
     }
 
     fn detach(&self) -> anyhow::Result<()> {
+        log::info!(
+            "tmux domain detach requested: managed={}, state={:?}",
+            self.is_managed(),
+            self.connection_state()
+        );
         if self.is_managed() {
             anyhow::bail!(
                 "the managed tmux domain is supervised and cannot be detached explicitly"
             );
         }
-        if self.state() == DomainState::Detached {
+        if self.connection_state() == crate::tab::TmuxConnectionState::Disconnected {
             return Ok(());
         }
         let pane_id = *self.inner.pane_id.lock();
         let transport = Mux::get()
             .get_pane(pane_id)
             .ok_or_else(|| anyhow::anyhow!("tmux control transport pane {pane_id} disappeared"))?;
+        log::info!("sending detach-client through tmux transport pane {pane_id}");
         write!(transport.writer(), "detach-client\n")?;
         Ok(())
     }
