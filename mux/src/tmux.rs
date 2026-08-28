@@ -877,6 +877,10 @@ impl TmuxDomain {
 
     pub fn mark_reconnecting(&self) {
         *self.inner.connection_state.lock() = crate::tab::TmuxConnectionState::Reconnecting;
+        let mux = Mux::get();
+        for tab_id in self.inner.gui_tabs.lock().values().map(|tab| tab.tab_id) {
+            mux.notify(crate::MuxNotification::TabResized(tab_id));
+        }
     }
 
     pub fn request_retry(&self) {

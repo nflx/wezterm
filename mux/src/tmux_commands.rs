@@ -2652,6 +2652,15 @@ impl TmuxCommand for AttachDone {
         // Do nothing, just change the state.
         *tmux_domain.inner.attach_state.lock() = AttachState::Done;
         *tmux_domain.inner.connection_state.lock() = crate::tab::TmuxConnectionState::Connected;
+        for tab_id in tmux_domain
+            .inner
+            .gui_tabs
+            .lock()
+            .values()
+            .map(|tab| tab.tab_id)
+        {
+            mux.notify(MuxNotification::TabResized(tab_id));
+        }
         Ok(())
     }
 }

@@ -88,6 +88,10 @@ impl crate::TermWindow {
             .to_linear()
             .into(),
         };
+        let tmux_state = self.get_active_pane_or_overlay().and_then(|pane| {
+            pane.downcast_ref::<wezterm_client::pane::ClientPane>()
+                .and_then(|pane| pane.tmux_connection_state())
+        });
 
         let item_to_elem = |item: &TabEntry| -> Element {
             let element = Element::with_line(&font, &item.title, palette);
@@ -131,13 +135,17 @@ impl crate::TermWindow {
                     .colors(bar_colors.clone()),
                 TabBarItem::NewTabButton => Element::new(
                     &font,
-                    ElementContent::Poly {
-                        line_width: metrics.underline_height.max(2),
-                        poly: SizedPoly {
-                            poly: PLUS_BUTTON,
-                            width: Dimension::Pixels(metrics.cell_size.height as f32 / 2.),
-                            height: Dimension::Pixels(metrics.cell_size.height as f32 / 2.),
-                        },
+                    if tmux_state.is_some() {
+                        ElementContent::Text("●".to_string())
+                    } else {
+                        ElementContent::Poly {
+                            line_width: metrics.underline_height.max(2),
+                            poly: SizedPoly {
+                                poly: PLUS_BUTTON,
+                                width: Dimension::Pixels(metrics.cell_size.height as f32 / 2.),
+                                height: Dimension::Pixels(metrics.cell_size.height as f32 / 2.),
+                            },
+                        }
                     },
                 )
                 .vertical_align(VerticalAlign::Middle)
@@ -158,7 +166,20 @@ impl crate::TermWindow {
                 .colors(ElementColors {
                     border: BorderColor::default(),
                     bg: new_tab.bg_color.to_linear().into(),
-                    text: new_tab.fg_color.to_linear().into(),
+                    text: match tmux_state {
+                        Some(mux::tab::TmuxConnectionState::Connected) => {
+                            window::color::LinearRgba::with_components(0.2, 0.8, 0.3, 1.0).into()
+                        }
+                        Some(mux::tab::TmuxConnectionState::Connecting)
+                        | Some(mux::tab::TmuxConnectionState::Syncing)
+                        | Some(mux::tab::TmuxConnectionState::Reconnecting) => {
+                            window::color::LinearRgba::with_components(1.0, 0.65, 0.1, 1.0).into()
+                        }
+                        Some(mux::tab::TmuxConnectionState::Disconnected) => {
+                            window::color::LinearRgba::with_components(1.0, 0.2, 0.2, 1.0).into()
+                        }
+                        None => new_tab.fg_color.to_linear().into(),
+                    },
                 })
                 .hover_colors(Some(ElementColors {
                     border: BorderColor::default(),

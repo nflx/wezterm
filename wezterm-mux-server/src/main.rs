@@ -331,7 +331,12 @@ async fn async_run(cmd: Option<CommandBuilder>) -> anyhow::Result<()> {
                 .as_ref()
                 .expect("managed_tmux implies tmux_control")
                 .clone();
-            let mut retry_delay = Duration::from_millis(250);
+            let initial_retry_delay = std::env::var("WEZTERM_TMUX_TEST_RETRY_DELAY_MS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .map(Duration::from_millis)
+                .unwrap_or_else(|| Duration::from_millis(250));
+            let mut retry_delay = initial_retry_delay;
             loop {
                 while !transport.is_dead() {
                     smol::Timer::after(Duration::from_millis(100)).await;
@@ -377,7 +382,7 @@ async fn async_run(cmd: Option<CommandBuilder>) -> anyhow::Result<()> {
                         if let Some(mut window) = mux.get_window_mut(*window_id) {
                             window.remove_by_id(tab.tab_id());
                         }
-                        retry_delay = Duration::from_millis(250);
+                        retry_delay = initial_retry_delay;
                     }
                     Err(err) => {
                         log::error!("failed to restart managed tmux control client: {err:#}");

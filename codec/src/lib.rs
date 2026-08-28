@@ -1326,6 +1326,52 @@ mod test {
     }
 
     #[test]
+    fn tmux_control_pdus_keep_assigned_protocol_ids() {
+        let cases = [
+            (Pdu::ReconnectTmux(ReconnectTmux {}), 69),
+            (Pdu::CloseTab(CloseTab { tab_id: 17 }), 70),
+        ];
+        for (pdu, expected_ident) in cases {
+            let mut encoded = vec![];
+            pdu.encode(&mut encoded, 9).unwrap();
+            let frame = decode_raw(encoded.as_slice()).unwrap();
+            assert_eq!(frame.ident, expected_ident);
+            assert_eq!(Pdu::decode(encoded.as_slice()).unwrap().pdu, pdu);
+        }
+    }
+
+    #[test]
+    fn pane_entry_round_trips_tmux_connection_state() {
+        let response = Pdu::ListPanesResponse(ListPanesResponse {
+            tabs: vec![PaneNode::Leaf(mux::tab::PaneEntry {
+                window_id: 1,
+                tab_id: 2,
+                pane_id: 3,
+                title: "managed".to_string(),
+                size: TerminalSize::default(),
+                working_dir: None,
+                is_active_pane: true,
+                is_zoomed_pane: false,
+                workspace: "default".to_string(),
+                cursor_pos: StableCursorPosition::default(),
+                physical_top: 0,
+                top_row: 0,
+                left_col: 0,
+                top_px: 0,
+                left_px: 0,
+                font_scale: Some(1.25),
+                tty_name: None,
+                tmux_connection_state: Some(mux::tab::TmuxConnectionState::Reconnecting),
+            })],
+            tab_titles: vec!["managed".to_string()],
+            window_titles: HashMap::from([(1, "window".to_string())]),
+        });
+        let mut encoded = vec![];
+        response.encode(&mut encoded, 11).unwrap();
+        assert_eq!(Pdu::decode(encoded.as_slice()).unwrap().pdu, response);
+    }
+
+    #[test]
     fn test_bogus_pdu() {
         let mut encoded = Vec::new();
         encode_raw(0xdeadbeef, 0x42, b"hello", false, &mut encoded).unwrap();
