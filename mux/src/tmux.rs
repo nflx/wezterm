@@ -100,6 +100,12 @@ pub(crate) struct PendingFocus {
     pub completion: promise::Promise<()>,
 }
 
+pub(crate) struct PendingSplit {
+    pub operation_id: u64,
+    pub remote_id: Option<TmuxPaneId>,
+    pub completion: promise::Promise<TmuxPaneId>,
+}
+
 fn retain_unsent_commands(
     queue: &mut TmuxCmdQueue,
     command_in_flight: bool,
@@ -123,6 +129,7 @@ pub(crate) struct TmuxDomainState {
     next_break_operation_id: AtomicU64,
     next_rename_operation_id: AtomicU64,
     next_focus_operation_id: AtomicU64,
+    next_split_operation_id: AtomicU64,
     in_flight_operation_id: AtomicU64,
     in_flight_responses_remaining: AtomicUsize,
     retry_requested: AtomicBool,
@@ -133,8 +140,7 @@ pub(crate) struct TmuxDomainState {
     pub tmux_session: Mutex<Option<TmuxSessionId>>,
     pub support_commands: Mutex<HashMap<String, String>>,
     pub attach_state: Mutex<AttachState>,
-    pub(crate) pending_splits: Mutex<VecDeque<promise::Promise<TmuxPaneId>>>,
-    pub(crate) pending_split_pane_ids: Mutex<VecDeque<TmuxPaneId>>,
+    pub(crate) pending_splits: Mutex<VecDeque<PendingSplit>>,
     pub(crate) pending_new_tabs: Mutex<VecDeque<promise::Promise<Arc<Tab>>>>,
     pub(crate) pending_kills: Mutex<HashMap<TmuxPaneId, promise::Promise<()>>>,
     pub(crate) pending_window_kills: Mutex<HashMap<TmuxWindowId, promise::Promise<()>>>,
@@ -588,7 +594,7 @@ impl TmuxDomainState {
         _tab: TabId,
         pane_id: PaneId,
         split_request: SplitRequest,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<u64> {
         self.ensure_connected()?;
         let tmux_pane_id = self
             .remote_panes
@@ -598,13 +604,15 @@ impl TmuxDomainState {
             .map(|p| p.1.lock().pane_id);
 
         if let Some(id) = tmux_pane_id {
+            let operation_id = self.next_split_operation_id.fetch_add(1, Ordering::Relaxed) + 1;
             let mut cmd_queue = self.cmd_queue.as_ref().lock();
             cmd_queue.push_back(Box::new(SplitPane {
+                operation_id,
                 pane_id: id,
                 direction: split_request.direction,
             }));
             TmuxDomainState::schedule_send_next_command(self.domain_id);
-            return Ok(());
+            return Ok(operation_id);
         } else {
             anyhow::bail!("Could not find the tmux pane peer for local pane: {pane_id}");
         }
@@ -788,6 +796,7 @@ impl TmuxDomain {
             next_break_operation_id: AtomicU64::new(0),
             next_rename_operation_id: AtomicU64::new(0),
             next_focus_operation_id: AtomicU64::new(0),
+            next_split_operation_id: AtomicU64::new(0),
             in_flight_operation_id: AtomicU64::new(0),
             in_flight_responses_remaining: AtomicUsize::new(0),
             retry_requested: AtomicBool::new(false),
@@ -799,7 +808,6 @@ impl TmuxDomain {
             support_commands: Mutex::new(HashMap::default()),
             attach_state: Mutex::new(AttachState::Init),
             pending_splits: Mutex::new(VecDeque::default()),
-            pending_split_pane_ids: Mutex::new(VecDeque::default()),
             pending_new_tabs: Mutex::new(VecDeque::default()),
             pending_kills: Mutex::new(HashMap::default()),
             pending_window_kills: Mutex::new(HashMap::default()),
@@ -1072,8 +1080,12 @@ impl Domain for TmuxDomain {
         if let Some(future) = promise.get_future() {
             {
                 let mut pending_splits = self.inner.pending_splits.lock();
-                let _ = self.inner.split_tmux_pane(tab, pane_id, split_request)?;
-                pending_splits.push_back(promise);
+                let operation_id = self.inner.split_tmux_pane(tab, pane_id, split_request)?;
+                pending_splits.push_back(PendingSplit {
+                    operation_id,
+                    remote_id: None,
+                    completion: promise,
+                });
             }
 
             if let Ok(id) = future.await {

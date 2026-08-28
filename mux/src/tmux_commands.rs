@@ -1434,25 +1434,30 @@ impl TmuxDomainState {
             self.cmd_queue.lock().push_back(Box::new(AttachDone));
         }
 
-        loop {
-            let Some(remote_id) = self.pending_split_pane_ids.lock().front().copied() else {
-                break;
-            };
-            let reconciled = self
-                .remote_panes
-                .lock()
-                .get(&remote_id)
-                .map(|pane| pane.lock().local_pane_id)
-                .and_then(|local_id| mux.get_pane(local_id))
-                .is_some();
-            if !reconciled {
-                break;
+        let completed_splits: Vec<_> = {
+            let remote_panes = self.remote_panes.lock();
+            let mut pending = self.pending_splits.lock();
+            let mut completed = vec![];
+            let mut index = 0;
+            while index < pending.len() {
+                let remote_id = pending[index].remote_id;
+                let reconciled = remote_id
+                    .and_then(|remote_id| remote_panes.get(&remote_id))
+                    .map(|pane| pane.lock().local_pane_id)
+                    .and_then(|local_id| mux.get_pane(local_id))
+                    .is_some();
+                if reconciled {
+                    completed.push(pending.remove(index).expect("pending split index"));
+                } else {
+                    index += 1;
+                }
             }
-            self.pending_split_pane_ids.lock().pop_front();
-            let completion = self.pending_splits.lock().pop_front();
-            if let Some(mut completion) = completion {
-                completion.ok(remote_id);
-            }
+            completed
+        };
+        for mut split in completed_splits {
+            split
+                .completion
+                .ok(split.remote_id.expect("reconciled split remote id"));
         }
 
         let completed_renames: Vec<_> = {
@@ -2093,6 +2098,7 @@ impl TmuxCommand for ListCommands {
 
 #[derive(Debug)]
 pub(crate) struct SplitPane {
+    pub operation_id: u64,
     pub pane_id: TmuxPaneId,
     pub direction: SplitDirection,
 }
@@ -2359,11 +2365,17 @@ impl TmuxCommand for SplitPane {
         if result.error {
             if let Some(domain) = Mux::get().get_domain(domain_id) {
                 if let Some(tmux) = domain.downcast_ref::<TmuxDomain>() {
-                    let pending = tmux.inner.pending_splits.lock().pop_front();
-                    if let Some(mut pending) = pending {
-                        pending.err(anyhow!("tmux rejected split-window"));
+                    let completion = {
+                        let mut pending = tmux.inner.pending_splits.lock();
+                        pending
+                            .iter()
+                            .position(|operation| operation.operation_id == self.operation_id)
+                            .and_then(|index| pending.remove(index))
+                            .map(|operation| operation.completion)
+                    };
+                    if let Some(mut completion) = completion {
+                        completion.err(anyhow!("tmux rejected split-window"));
                     }
-                    tmux.inner.pending_split_pane_ids.lock().pop_front();
                 }
             }
             let error = format!("split-window in domain={domain_id} failed: {result:#?}");
@@ -2374,11 +2386,14 @@ impl TmuxCommand for SplitPane {
             .context("split-window did not return the new pane id")?;
         if let Some(domain) = Mux::get().get_domain(domain_id) {
             if let Some(tmux) = domain.downcast_ref::<TmuxDomain>() {
-                let mut pending_ids = tmux.inner.pending_split_pane_ids.lock();
-                if !pending_ids.contains(&remote_id) {
-                    pending_ids.push_back(remote_id);
+                let mut pending = tmux.inner.pending_splits.lock();
+                if let Some(split) = pending
+                    .iter_mut()
+                    .find(|operation| operation.operation_id == self.operation_id)
+                {
+                    split.remote_id = Some(remote_id);
                 }
-                drop(pending_ids);
+                drop(pending);
                 if let Some(session_id) = *tmux.inner.tmux_session.lock() {
                     let mut queue = tmux.inner.cmd_queue.lock();
                     if !queue
@@ -2401,11 +2416,17 @@ impl TmuxCommand for SplitPane {
     fn process_timeout(&self, domain_id: DomainId) -> anyhow::Result<()> {
         if let Some(domain) = Mux::get().get_domain(domain_id) {
             if let Some(tmux) = domain.downcast_ref::<TmuxDomain>() {
-                let pending = tmux.inner.pending_splits.lock().pop_front();
-                if let Some(mut pending) = pending {
-                    pending.err(anyhow!("tmux split-window timed out"));
+                let completion = {
+                    let mut pending = tmux.inner.pending_splits.lock();
+                    pending
+                        .iter()
+                        .position(|operation| operation.operation_id == self.operation_id)
+                        .and_then(|index| pending.remove(index))
+                        .map(|operation| operation.completion)
+                };
+                if let Some(mut completion) = completion {
+                    completion.err(anyhow!("tmux split-window timed out"));
                 }
-                tmux.inner.pending_split_pane_ids.lock().pop_front();
             }
         }
         anyhow::bail!("split-window timed out in domain {domain_id}")
@@ -2701,6 +2722,7 @@ mod test {
     #[test]
     fn split_requests_stable_remote_pane_id() {
         let command = SplitPane {
+            operation_id: 1,
             pane_id: 7,
             direction: SplitDirection::Horizontal,
         }
