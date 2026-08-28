@@ -19,6 +19,16 @@ pub fn confirm_close_pane(
                 Some(tab) => tab,
                 None => return,
             };
+            if let Some(pane) = mux.get_pane(pane_id) {
+                if let Some(domain) = mux.get_domain(pane.domain_id()) {
+                    if let Some(tmux) = domain.downcast_ref::<mux::tmux::TmuxDomain>() {
+                        if let Err(err) = tmux.kill_pane(pane_id).await {
+                            log::error!("failed to close local tmux pane {pane_id}: {err:#}");
+                        }
+                        return;
+                    }
+                }
+            }
             tab.kill_pane(pane_id);
         })
         .detach();
@@ -47,6 +57,14 @@ pub fn confirm_close_tab(
                     {
                         if client_pane.tmux_connection_state().is_some() {
                             client_pane.request_close_remote_tab();
+                            return;
+                        }
+                    }
+                    if let Some(domain) = mux.get_domain(pane.domain_id()) {
+                        if let Some(tmux) = domain.downcast_ref::<mux::tmux::TmuxDomain>() {
+                            if let Err(err) = tmux.close_tab(tab_id).await {
+                                log::error!("failed to close local tmux tab {tab_id}: {err:#}");
+                            }
                             return;
                         }
                     }

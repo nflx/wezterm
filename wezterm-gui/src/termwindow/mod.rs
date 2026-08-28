@@ -3454,6 +3454,20 @@ impl TermWindow {
             self.assign_overlay_for_pane(pane_id, overlay);
             promise::spawn::spawn(future).detach();
         } else {
+            if let Some(domain) = mux.get_domain(pane.domain_id()) {
+                if domain.is::<mux::tmux::TmuxDomain>() {
+                    promise::spawn::spawn(async move {
+                        let tmux = domain
+                            .downcast_ref::<mux::tmux::TmuxDomain>()
+                            .expect("checked tmux domain type");
+                        if let Err(err) = tmux.kill_pane(pane_id).await {
+                            log::error!("failed to close local tmux pane {pane_id}: {err:#}");
+                        }
+                    })
+                    .detach();
+                    return;
+                }
+            }
             mux.remove_pane(pane_id);
         }
     }
@@ -3492,6 +3506,20 @@ impl TermWindow {
                         return;
                     }
                 }
+                if let Some(domain) = mux.get_domain(pane.domain_id()) {
+                    if domain.is::<mux::tmux::TmuxDomain>() {
+                        promise::spawn::spawn(async move {
+                            let tmux = domain
+                                .downcast_ref::<mux::tmux::TmuxDomain>()
+                                .expect("checked tmux domain type");
+                            if let Err(err) = tmux.close_tab(tab_id).await {
+                                log::error!("failed to close local tmux tab {tab_id}: {err:#}");
+                            }
+                        })
+                        .detach();
+                        return;
+                    }
+                }
             }
             mux.remove_tab(tab_id);
         }
@@ -3517,6 +3545,20 @@ impl TermWindow {
                 if let Some(client_pane) = pane.downcast_ref::<wezterm_client::pane::ClientPane>() {
                     if client_pane.tmux_connection_state().is_some() {
                         client_pane.request_close_remote_tab();
+                        return;
+                    }
+                }
+                if let Some(domain) = mux.get_domain(pane.domain_id()) {
+                    if domain.is::<mux::tmux::TmuxDomain>() {
+                        promise::spawn::spawn(async move {
+                            let tmux = domain
+                                .downcast_ref::<mux::tmux::TmuxDomain>()
+                                .expect("checked tmux domain type");
+                            if let Err(err) = tmux.close_tab(tab_id).await {
+                                log::error!("failed to close local tmux tab {tab_id}: {err:#}");
+                            }
+                        })
+                        .detach();
                         return;
                     }
                 }
