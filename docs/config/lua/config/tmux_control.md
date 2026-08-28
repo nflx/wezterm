@@ -15,11 +15,13 @@ single-session form keeps the domain name `tmux` for compatibility.
 ```lua
 config.tmux_control = {
   session_name = 'wezterm',
-  command = { '/snap/bin/tmux' },
+  command = { 'tmux' },
 }
 ```
 
 The mux server appends `-CC new-session -A -s <session_name>` to `command`.
+The executable is resolved using the mux server's environment. An absolute
+path can be used when tmux is installed outside that environment's `PATH`.
 Extra command elements are preserved, so tmux socket arguments can be supplied
 before the appended arguments:
 
@@ -52,6 +54,16 @@ An ordinary client can attach at the same time for remote or emergency access:
 ```console
 tmux attach-session -t wezterm
 ```
+
+For remote access, SSH to the host running the mux server and run that command
+there. If `command` includes `-L <socket-name>` or `-S <socket-path>`, use the
+same option when attaching the ordinary client.
+
+Stopping or restarting the mux server terminates only its hidden control
+client. It does not issue `kill-session`, `kill-window`, or `kill-pane`; the
+tmux server and shell processes remain available for the next supervised or
+ordinary attachment. Explicit native pane and tab close actions are the paths
+that intentionally destroy tmux panes and windows.
 
 External tmux split, join, move, rename, focus, and close operations reconcile
 back into all connected WezTerm GUIs. Cell-only tmux resize notifications do
