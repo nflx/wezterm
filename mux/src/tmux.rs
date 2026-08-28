@@ -441,16 +441,20 @@ impl TmuxDomainState {
                 let mut writer = pane.writer();
                 let fault_match = std::env::var("WEZTERM_TMUX_TEST_FAULT_MATCH").ok();
                 let fault_mode = std::env::var("WEZTERM_TMUX_TEST_FAULT_MODE").ok();
-                let inject = fault_match
-                    .as_deref()
-                    .is_some_and(|needle| !needle.is_empty() && cmd.contains(needle));
+                let fault_armed = std::env::var_os("WEZTERM_TMUX_TEST_FAULT_ARM_FILE")
+                    .is_none_or(|path| std::path::Path::new(&path).exists());
+                let inject = fault_match.as_deref().is_some_and(|needle| {
+                    fault_armed && !needle.is_empty() && cmd.contains(needle)
+                });
                 match (inject, fault_mode.as_deref()) {
                     (true, Some("timeout")) => {
                         log::warn!("injecting tmux command timeout for {cmd:?}");
                     }
                     (true, Some("reject")) => {
                         log::warn!("injecting tmux command rejection for {cmd:?}");
-                        let _ = writeln!(writer, "__wezterm_injected_command_failure__");
+                        for _ in 0..first.guarded_response_count() {
+                            let _ = writeln!(writer, "__wezterm_injected_command_failure__");
+                        }
                     }
                     _ => {
                         let _ = write!(writer, "{}", cmd);
@@ -1051,11 +1055,19 @@ impl Domain for TmuxDomain {
 
     async fn split_pane(
         &self,
-        _source: SplitSource,
+        source: SplitSource,
         tab: TabId,
         pane_id: PaneId,
         split_request: SplitRequest,
     ) -> anyhow::Result<Arc<dyn Pane>> {
+        if let SplitSource::MovePane(source_pane_id) = source {
+            self.inner
+                .reposition_tmux_pane(source_pane_id, pane_id, split_request)
+                .await?;
+            return Mux::get()
+                .get_pane(source_pane_id)
+                .ok_or_else(|| anyhow::anyhow!("moved pane {source_pane_id} disappeared"));
+        }
         let mut promise = promise::Promise::new();
         if let Some(future) = promise.get_future() {
             {
