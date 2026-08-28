@@ -3,8 +3,8 @@ use crate::domain::{alloc_domain_id, Domain, DomainId, DomainState, SplitSource}
 use crate::pane::{Pane, PaneId};
 use crate::tab::{SplitRequest, Tab, TabId};
 use crate::tmux_commands::{
-    JoinPane, KillWindow, ListAllWindows, ListCommands, NewWindow, RenameWindow, SplitPane,
-    TmuxCommand,
+    BreakPane, JoinPane, KillWindow, ListAllWindows, ListCommands, NewWindow, RenameWindow,
+    SplitPane, TmuxCommand,
 };
 use crate::window::WindowId;
 use crate::{Mux, MuxWindowBuilder};
@@ -78,6 +78,13 @@ pub(crate) struct PendingReposition {
     pub completion: promise::Promise<()>,
 }
 
+pub(crate) struct PendingBreakPane {
+    pub operation_id: u64,
+    pub source: TmuxPaneId,
+    pub accepted_window: Option<TmuxWindowId>,
+    pub completion: promise::Promise<TmuxWindowId>,
+}
+
 fn retain_unsent_commands(
     queue: &mut TmuxCmdQueue,
     command_in_flight: bool,
@@ -98,6 +105,7 @@ pub(crate) struct TmuxDomainState {
     pub(crate) connection_state: Mutex<crate::tab::TmuxConnectionState>,
     next_operation_id: AtomicU64,
     next_reposition_operation_id: AtomicU64,
+    next_break_operation_id: AtomicU64,
     in_flight_operation_id: AtomicU64,
     in_flight_responses_remaining: AtomicUsize,
     retry_requested: AtomicBool,
@@ -113,6 +121,7 @@ pub(crate) struct TmuxDomainState {
     pub(crate) pending_new_tabs: Mutex<VecDeque<promise::Promise<Arc<Tab>>>>,
     pub(crate) pending_kills: Mutex<HashMap<TmuxPaneId, promise::Promise<()>>>,
     pub(crate) pending_repositions: Mutex<VecDeque<PendingReposition>>,
+    pub(crate) pending_breaks: Mutex<VecDeque<PendingBreakPane>>,
     pub(crate) pending_reposition_windows: Mutex<HashSet<TmuxWindowId>>,
     pub backlog: Mutex<HashMap<TmuxPaneId, Vec<u8>>>,
 }
@@ -125,6 +134,15 @@ impl TmuxDomainState {
     fn fail_pending_repositions(&self, reason: &str) {
         let operations: Vec<_> = self.pending_repositions.lock().drain(..).collect();
         self.pending_reposition_windows.lock().clear();
+        for mut operation in operations {
+            operation
+                .completion
+                .err(anyhow::anyhow!(reason.to_string()));
+        }
+    }
+
+    fn fail_pending_breaks(&self, reason: &str) {
+        let operations: Vec<_> = self.pending_breaks.lock().drain(..).collect();
         for mut operation in operations {
             operation
                 .completion
@@ -207,6 +225,7 @@ impl TmuxDomainState {
                         completion.err(anyhow::anyhow!("tmux control transport disconnected"));
                     }
                     self.fail_pending_repositions("tmux control transport disconnected");
+                    self.fail_pending_breaks("tmux control transport disconnected");
 
                     // Force to quit the tmux mode
                     let pane_id = *self.pane_id.lock();
@@ -403,6 +422,7 @@ impl TmuxDomainState {
             completion.err(anyhow::anyhow!("tmux command actor timed out"));
         }
         self.fail_pending_repositions("tmux command actor timed out");
+        self.fail_pending_breaks("tmux command actor timed out");
         if let Some(transport) = Mux::get().get_pane(*self.pane_id.lock()) {
             transport.kill();
         }
@@ -566,6 +586,48 @@ impl TmuxDomainState {
             completion.err(anyhow::anyhow!("tmux pane reposition failed"));
         }
     }
+
+    async fn break_pane_to_new_tab(&self, local_pane_id: PaneId) -> anyhow::Result<TmuxWindowId> {
+        let source = self
+            .remote_panes
+            .lock()
+            .iter()
+            .find_map(|(remote_id, pane)| {
+                (pane.lock().local_pane_id == local_pane_id).then_some(*remote_id)
+            })
+            .ok_or_else(|| anyhow::anyhow!("no tmux pane for local pane {local_pane_id}"))?;
+        let mut completion = promise::Promise::new();
+        let future = completion
+            .get_future()
+            .ok_or_else(|| anyhow::anyhow!("failed to create tmux break-pane completion"))?;
+        let operation_id = self.next_break_operation_id.fetch_add(1, Ordering::Relaxed) + 1;
+        self.pending_breaks.lock().push_back(PendingBreakPane {
+            operation_id,
+            source,
+            accepted_window: None,
+            completion,
+        });
+        self.cmd_queue.lock().push_back(Box::new(BreakPane {
+            operation_id,
+            source,
+        }));
+        TmuxDomainState::schedule_send_next_command(self.domain_id);
+        future.await
+    }
+
+    pub(crate) fn break_pane_failed(&self, operation_id: u64) {
+        let completion = {
+            let mut pending = self.pending_breaks.lock();
+            pending
+                .iter()
+                .position(|operation| operation.operation_id == operation_id)
+                .and_then(|index| pending.remove(index))
+                .map(|operation| operation.completion)
+        };
+        if let Some(mut completion) = completion {
+            completion.err(anyhow::anyhow!("tmux break-pane failed"));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -623,6 +685,7 @@ impl TmuxDomain {
             connection_state: Mutex::new(crate::tab::TmuxConnectionState::Connecting),
             next_operation_id: AtomicU64::new(0),
             next_reposition_operation_id: AtomicU64::new(0),
+            next_break_operation_id: AtomicU64::new(0),
             in_flight_operation_id: AtomicU64::new(0),
             in_flight_responses_remaining: AtomicUsize::new(0),
             retry_requested: AtomicBool::new(false),
@@ -638,6 +701,7 @@ impl TmuxDomain {
             pending_new_tabs: Mutex::new(VecDeque::default()),
             pending_kills: Mutex::new(HashMap::default()),
             pending_repositions: Mutex::new(VecDeque::default()),
+            pending_breaks: Mutex::new(VecDeque::default()),
             pending_reposition_windows: Mutex::new(HashSet::default()),
             backlog: Mutex::new(HashMap::default()),
         });
@@ -675,6 +739,8 @@ impl TmuxDomain {
         }
         self.inner
             .fail_pending_repositions("tmux control transport reconnected");
+        self.inner
+            .fail_pending_breaks("tmux control transport reconnected");
     }
 
     pub(crate) fn transport_disconnected(&self) {
@@ -688,6 +754,8 @@ impl TmuxDomain {
             .store(0, Ordering::Release);
         self.inner
             .fail_pending_repositions("tmux control transport disconnected");
+        self.inner
+            .fail_pending_breaks("tmux control transport disconnected");
     }
 
     pub fn mark_reconnecting(&self) {
@@ -833,6 +901,41 @@ impl Domain for TmuxDomain {
         _command_dir: Option<String>,
     ) -> anyhow::Result<Arc<dyn Pane>> {
         anyhow::bail!("Spawn_pane not yet implemented for TmuxDomain");
+    }
+
+    async fn move_pane_to_new_tab(
+        &self,
+        pane_id: PaneId,
+        window_id: Option<WindowId>,
+        workspace_for_new_window: Option<String>,
+    ) -> anyhow::Result<Option<(Arc<Tab>, WindowId)>> {
+        if workspace_for_new_window.is_some() {
+            anyhow::bail!("moving a tmux pane to a separate workspace is not supported");
+        }
+        let managed_window = self
+            .inner
+            .gui_window
+            .lock()
+            .as_ref()
+            .map(|window| window.window_id)
+            .ok_or_else(|| anyhow::anyhow!("managed tmux mux window is unavailable"))?;
+        if window_id.is_some_and(|requested| requested != managed_window) {
+            anyhow::bail!("moving a tmux pane to a separate GUI window is not supported");
+        }
+        let tmux_window_id = self.inner.break_pane_to_new_tab(pane_id).await?;
+        let tab_id = self
+            .inner
+            .gui_tabs
+            .lock()
+            .get(&tmux_window_id)
+            .map(|tab| tab.tab_id)
+            .ok_or_else(|| {
+                anyhow::anyhow!("reconciled tmux window @{tmux_window_id} disappeared")
+            })?;
+        let tab = Mux::get()
+            .get_tab(tab_id)
+            .ok_or_else(|| anyhow::anyhow!("reconciled mux tab {tab_id} disappeared"))?;
+        Ok(Some((tab, managed_window)))
     }
 
     fn domain_id(&self) -> DomainId {

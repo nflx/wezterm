@@ -559,6 +559,24 @@ impl TmuxDomainState {
         }
     }
 
+    fn pane_for_new_window(&self, pane: &PaneItem) -> anyhow::Result<(Arc<dyn Pane>, bool)> {
+        if let Some(remote) = self.remote_panes.lock().get(&pane.pane_id).cloned() {
+            let local_pane_id = remote.lock().local_pane_id;
+            let local_pane = Mux::get()
+                .get_pane(local_pane_id)
+                .ok_or_else(|| anyhow!("local pane {local_pane_id} disappeared"))?;
+            remote.lock().window_id = pane.window_id;
+            for attached in self.gui_tabs.lock().values_mut() {
+                attached.panes.remove(&pane.pane_id);
+            }
+            return Ok((local_pane, false));
+        }
+        Ok((
+            self.create_pane(pane).context("failed to create pane")?,
+            true,
+        ))
+    }
+
     fn add_attached_window(&self, target: &WindowItem, tab_id: &TabId) -> anyhow::Result<()> {
         let mut gui_tabs = self.gui_tabs.lock();
         if !gui_tabs.contains_key(&target.window_id) {
@@ -952,7 +970,15 @@ impl TmuxDomainState {
                     })
                     .map(|operation| operation.source)
                     .filter(|pane_id| pane_ids.contains(pane_id));
+                let broken_active = self
+                    .pending_breaks
+                    .lock()
+                    .iter()
+                    .find(|operation| operation.accepted_window == Some(window.window_id))
+                    .map(|operation| operation.source)
+                    .filter(|pane_id| pane_ids.contains(pane_id));
                 let current_active = repositioned_active
+                    .or(broken_active)
                     .or_else(|| {
                         tab.get_active_pane()
                             .and_then(|pane| remote_by_local.get(&pane.pane_id()).copied())
@@ -1072,6 +1098,7 @@ impl TmuxDomainState {
                 })
                 .collect::<HashMap<_, _>>();
             let mut completed_repositions = vec![];
+            let mut completed_breaks = vec![];
             {
                 let mut pending = self.pending_repositions.lock();
                 let mut index = 0;
@@ -1096,12 +1123,34 @@ impl TmuxDomainState {
                     }
                 }
             }
+            {
+                let mut pending = self.pending_breaks.lock();
+                let mut index = 0;
+                while index < pending.len() {
+                    let operation = &pending[index];
+                    let reconciled = operation.accepted_window.is_some_and(|window_id| {
+                        snapshot_ownership.get(&operation.source) == Some(&window_id)
+                            && self.gui_tabs.lock().contains_key(&window_id)
+                    });
+                    if reconciled {
+                        if let Some(operation) = pending.remove(index) {
+                            completed_breaks
+                                .push((operation.completion, operation.accepted_window.unwrap()));
+                        }
+                    } else {
+                        index += 1;
+                    }
+                }
+            }
             for (_, tab, _, active_local, _, _, _) in candidates {
                 mux.notify(MuxNotification::TabResized(tab.tab_id()));
                 mux.notify(MuxNotification::PaneFocused(active_local));
             }
             for mut completion in completed_repositions {
                 completion.ok(());
+            }
+            for (mut completion, window_id) in completed_breaks {
+                completion.ok(window_id);
             }
         }
 
@@ -1171,11 +1220,13 @@ impl TmuxDomainState {
                             pane_left: x.pane_left,
                             pane_top: x.pane_top,
                         };
-                        let local_pane = self.create_pane(&p).context("failed to create pane")?;
+                        let (local_pane, created) = self.pane_for_new_window(&p)?;
                         tab.assign_pane(&local_pane);
                         local_pane.resize(size)?;
                         self.add_attached_pane(p.window_id, p.pane_id)?;
-                        let _ = mux.add_pane(&local_pane);
+                        if created {
+                            let _ = mux.add_pane(&local_pane);
+                        }
                         break;
                     }
 
@@ -1206,9 +1257,12 @@ impl TmuxDomainState {
                     };
                     let local_pane;
                     if !self.check_pane_attached(p.window_id, p.pane_id) {
-                        local_pane = self.create_pane(&p).context("failed to create pane")?;
+                        let created;
+                        (local_pane, created) = self.pane_for_new_window(&p)?;
                         self.add_attached_pane(p.window_id, p.pane_id)?;
-                        let _ = mux.add_pane(&local_pane);
+                        if created {
+                            let _ = mux.add_pane(&local_pane);
+                        }
                         if let None = tab.get_active_pane() {
                             tab.assign_pane(&local_pane);
                             local_pane.resize(size)?;
@@ -2039,6 +2093,62 @@ impl TmuxCommand for KillPane {
 }
 
 #[derive(Debug)]
+pub(crate) struct BreakPane {
+    pub operation_id: u64,
+    pub source: TmuxPaneId,
+}
+
+impl TmuxCommand for BreakPane {
+    fn get_command(&self, _domain_id: DomainId) -> String {
+        format!("break-pane -d -P -F '#{{window_id}}' -s %{}\n", self.source)
+    }
+
+    fn process_result(&self, domain_id: DomainId, result: &Guarded) -> anyhow::Result<()> {
+        let domain = Mux::get()
+            .get_domain(domain_id)
+            .ok_or_else(|| anyhow!("tmux domain lost"))?;
+        let tmux = domain
+            .downcast_ref::<TmuxDomain>()
+            .ok_or_else(|| anyhow!("tmux domain lost"))?;
+        if result.error {
+            tmux.inner.break_pane_failed(self.operation_id);
+            anyhow::bail!("break-pane in domain={domain_id} failed: {result:#?}");
+        }
+        let window_id = parse_sigil_number(result.output.trim())
+            .context("break-pane did not return the new window id")?;
+        if let Some(pending) = tmux
+            .inner
+            .pending_breaks
+            .lock()
+            .iter_mut()
+            .find(|pending| pending.operation_id == self.operation_id)
+        {
+            pending.accepted_window = Some(window_id);
+        }
+        if let Some(session_id) = *tmux.inner.tmux_session.lock() {
+            tmux.inner
+                .cmd_queue
+                .lock()
+                .push_back(Box::new(ListAllWindows {
+                    session_id,
+                    window_id: None,
+                }));
+            TmuxDomainState::schedule_send_next_command(domain_id);
+        }
+        Ok(())
+    }
+
+    fn process_timeout(&self, domain_id: DomainId) -> anyhow::Result<()> {
+        if let Some(domain) = Mux::get().get_domain(domain_id) {
+            if let Some(tmux) = domain.downcast_ref::<TmuxDomain>() {
+                tmux.inner.break_pane_failed(self.operation_id);
+            }
+        }
+        anyhow::bail!("break-pane timed out in domain {domain_id}")
+    }
+}
+
+#[derive(Debug)]
 pub(crate) struct JoinPane {
     pub operation_id: u64,
     pub source: TmuxPaneId,
@@ -2370,6 +2480,18 @@ mod test {
             };
             assert_eq!(command.get_command(0), expected);
         }
+    }
+
+    #[test]
+    fn break_pane_requests_the_new_stable_window_id() {
+        let command = BreakPane {
+            operation_id: 3,
+            source: 11,
+        };
+        assert_eq!(
+            command.get_command(0),
+            "break-pane -d -P -F '#{window_id}' -s %11\n"
+        );
     }
 
     #[test]
