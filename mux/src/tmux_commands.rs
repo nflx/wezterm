@@ -68,6 +68,7 @@ struct TopologyReconciliationPlan {
     removed: HashSet<PaneOwnership>,
     moved: HashSet<(PaneOwnership, PaneOwnership)>,
     unchanged_windows: HashSet<TmuxWindowId>,
+    preserved_subtrees: HashSet<(TmuxWindowId, LayoutTopology)>,
 }
 
 fn pane_ownership(
@@ -135,6 +136,19 @@ fn plan_topology_reconciliation(
             .is_some_and(|layout| layout.same_topology(snapshot_layout))
         {
             plan.unchanged_windows.insert(*window_id);
+        }
+
+        if let Some(current_layout) = current.get(window_id) {
+            let mut current_subtrees = vec![];
+            current_layout.split_topologies(&mut current_subtrees);
+            let current_subtrees: HashSet<_> = current_subtrees.into_iter().collect();
+            let mut snapshot_subtrees = vec![];
+            snapshot_layout.split_topologies(&mut snapshot_subtrees);
+            for subtree in snapshot_subtrees {
+                if current_subtrees.contains(&subtree) {
+                    plan.preserved_subtrees.insert((*window_id, subtree));
+                }
+            }
         }
     }
 
@@ -1635,6 +1649,25 @@ mod test {
         let plan = plan_topology_reconciliation(&current, &snapshot)?;
         assert_eq!(plan.retained.len(), 2);
         assert_eq!(plan.unchanged_windows, HashSet::from([1]));
+        Ok(())
+    }
+
+    #[test]
+    fn topology_plan_matches_surviving_nested_subtree() -> anyhow::Result<()> {
+        let current = HashMap::from([(
+            1,
+            parse_layout_tree("120x40,0,0{59x40,0,0[59x19,0,0,10,59x20,0,20,11],60x40,60,0,12}")?,
+        )]);
+        let snapshot = HashMap::from([(
+            1,
+            parse_layout_tree(
+                "180x40,0,0{39x40,0,0,13,59x40,40,0[59x19,40,0,10,59x20,40,20,11],80x40,100,0,12}",
+            )?,
+        )]);
+        let plan = plan_topology_reconciliation(&current, &snapshot)?;
+        let preserved = parse_layout_tree("59x40,40,0[59x19,40,0,10,59x20,40,20,11]")?.topology();
+        assert!(plan.preserved_subtrees.contains(&(1, preserved)));
+        assert!(!plan.unchanged_windows.contains(&1));
         Ok(())
     }
 

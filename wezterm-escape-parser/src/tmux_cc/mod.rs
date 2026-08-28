@@ -165,6 +165,14 @@ pub enum LayoutNode {
     },
 }
 
+/// Cell-geometry-independent identity for a layout subtree.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum LayoutTopology {
+    Pane(TmuxPaneId),
+    SplitHorizontal(Vec<LayoutTopology>),
+    SplitVertical(Vec<LayoutTopology>),
+}
+
 impl LayoutNode {
     /// Return pane ids in tmux layout order.
     pub fn pane_ids(&self, pane_ids: &mut Vec<TmuxPaneId>) {
@@ -180,16 +188,32 @@ impl LayoutNode {
 
     /// Compare topology and stable pane ownership while ignoring cell geometry.
     pub fn same_topology(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::Pane(a), Self::Pane(b)) => a.pane_id == b.pane_id,
-            (
-                Self::SplitHorizontal { children: a, .. },
-                Self::SplitHorizontal { children: b, .. },
-            )
-            | (Self::SplitVertical { children: a, .. }, Self::SplitVertical { children: b, .. }) => {
-                a.len() == b.len() && a.iter().zip(b.iter()).all(|(a, b)| a.same_topology(b))
+        self.topology() == other.topology()
+    }
+
+    pub fn topology(&self) -> LayoutTopology {
+        match self {
+            Self::Pane(pane) => LayoutTopology::Pane(pane.pane_id),
+            Self::SplitHorizontal { children, .. } => {
+                LayoutTopology::SplitHorizontal(children.iter().map(Self::topology).collect())
             }
-            _ => false,
+            Self::SplitVertical { children, .. } => {
+                LayoutTopology::SplitVertical(children.iter().map(Self::topology).collect())
+            }
+        }
+    }
+
+    /// Collect split subtree identities. Pane leaves are excluded because they
+    /// do not carry a reusable split ratio.
+    pub fn split_topologies(&self, topologies: &mut Vec<LayoutTopology>) {
+        match self {
+            Self::Pane(_) => {}
+            Self::SplitHorizontal { children, .. } | Self::SplitVertical { children, .. } => {
+                topologies.push(self.topology());
+                for child in children {
+                    child.split_topologies(topologies);
+                }
+            }
         }
     }
 }
