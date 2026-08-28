@@ -151,6 +151,14 @@ pub struct TmuxDomain {
 }
 
 impl TmuxDomainState {
+    fn ensure_connected(&self) -> anyhow::Result<()> {
+        if *self.connection_state.lock() == crate::tab::TmuxConnectionState::Connected {
+            Ok(())
+        } else {
+            anyhow::bail!("tmux control connection is not ready; operation was not queued")
+        }
+    }
+
     fn fail_pending_repositions(&self, reason: &str) {
         let operations: Vec<_> = self.pending_repositions.lock().drain(..).collect();
         self.pending_reposition_windows.lock().clear();
@@ -577,6 +585,7 @@ impl TmuxDomainState {
         pane_id: PaneId,
         split_request: SplitRequest,
     ) -> anyhow::Result<()> {
+        self.ensure_connected()?;
         let tmux_pane_id = self
             .remote_panes
             .lock()
@@ -603,6 +612,7 @@ impl TmuxDomainState {
         target_pane_id: PaneId,
         request: SplitRequest,
     ) -> anyhow::Result<()> {
+        self.ensure_connected()?;
         let (source, source_window, target, target_window) = {
             let pane_map = self.remote_panes.lock();
             let (source, source_window) = pane_map
@@ -673,6 +683,7 @@ impl TmuxDomainState {
     }
 
     async fn break_pane_to_new_tab(&self, local_pane_id: PaneId) -> anyhow::Result<TmuxWindowId> {
+        self.ensure_connected()?;
         let source = self
             .remote_panes
             .lock()
@@ -807,6 +818,10 @@ impl TmuxDomain {
         *self.inner.connection_state.lock()
     }
 
+    fn ensure_connected(&self) -> anyhow::Result<()> {
+        self.inner.ensure_connected()
+    }
+
     pub fn is_managed(&self) -> bool {
         self.inner.managed
     }
@@ -873,6 +888,7 @@ impl TmuxDomain {
     }
 
     pub async fn rename_tab(&self, tab_id: TabId, title: String) -> anyhow::Result<()> {
+        self.ensure_connected()?;
         let window_id = self
             .inner
             .gui_tabs
@@ -910,6 +926,7 @@ impl TmuxDomain {
     }
 
     pub async fn focus_pane(&self, local_pane_id: PaneId) -> anyhow::Result<()> {
+        self.ensure_connected()?;
         let (pane_id, window_id) = {
             let panes = self.inner.remote_panes.lock();
             panes
@@ -946,6 +963,7 @@ impl TmuxDomain {
     }
 
     pub async fn close_tab(&self, tab_id: TabId) -> anyhow::Result<()> {
+        self.ensure_connected()?;
         let window_id = self
             .inner
             .gui_tabs
@@ -972,9 +990,7 @@ impl TmuxDomain {
 
     pub async fn kill_pane(&self, local_pane_id: PaneId) -> anyhow::Result<()> {
         log::info!("tmux transactional close requested for local pane {local_pane_id}");
-        if self.connection_state() != crate::tab::TmuxConnectionState::Connected {
-            anyhow::bail!("tmux control connection is not ready");
-        }
+        self.ensure_connected()?;
         let remote_pane_id = {
             self.inner
                 .remote_panes
@@ -1019,6 +1035,7 @@ impl Domain for TmuxDomain {
         _command_dir: Option<String>,
         _window: WindowId,
     ) -> anyhow::Result<Arc<Tab>> {
+        self.ensure_connected()?;
         let mut completion = promise::Promise::new();
         let future = completion
             .get_future()
