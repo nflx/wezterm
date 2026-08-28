@@ -832,6 +832,22 @@ mod command_queue_tests {
             .collect();
         assert_eq!(pane_ids, vec![1, 2]);
     }
+
+    #[test]
+    fn domain_state_tracks_only_a_completed_connection() {
+        use crate::tab::TmuxConnectionState::*;
+
+        assert_eq!(
+            TmuxDomain::domain_state_for_connection(Connected),
+            DomainState::Attached
+        );
+        for state in [Connecting, Syncing, Reconnecting, Disconnected] {
+            assert_eq!(
+                TmuxDomain::domain_state_for_connection(state),
+                DomainState::Detached
+            );
+        }
+    }
 }
 
 impl TmuxDomain {
@@ -882,6 +898,16 @@ impl TmuxDomain {
 
     pub fn connection_state(&self) -> crate::tab::TmuxConnectionState {
         *self.inner.connection_state.lock()
+    }
+
+    fn domain_state_for_connection(
+        connection_state: crate::tab::TmuxConnectionState,
+    ) -> DomainState {
+        if connection_state == crate::tab::TmuxConnectionState::Connected {
+            DomainState::Attached
+        } else {
+            DomainState::Detached
+        }
     }
 
     fn ensure_connected(&self) -> anyhow::Result<()> {
@@ -1209,18 +1235,48 @@ impl Domain for TmuxDomain {
     }
 
     async fn attach(&self, _window_id: Option<crate::WindowId>) -> anyhow::Result<()> {
-        Ok(())
+        if self.state() == DomainState::Attached {
+            return Ok(());
+        }
+        if !self.is_managed() {
+            anyhow::bail!(
+                "a manually launched tmux control domain cannot be reattached without a new tmux -CC transport"
+            );
+        }
+
+        self.request_retry();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            if self.state() == DomainState::Attached {
+                return Ok(());
+            }
+            smol::Timer::after(std::time::Duration::from_millis(50)).await;
+        }
+        anyhow::bail!("timed out waiting for the managed tmux domain to reconnect")
     }
 
     fn detachable(&self) -> bool {
-        false
+        !self.is_managed()
     }
 
     fn detach(&self) -> anyhow::Result<()> {
-        anyhow::bail!("detach not implemented for TmuxDomain");
+        if self.is_managed() {
+            anyhow::bail!(
+                "the managed tmux domain is supervised and cannot be detached explicitly"
+            );
+        }
+        if self.state() == DomainState::Detached {
+            return Ok(());
+        }
+        let pane_id = *self.inner.pane_id.lock();
+        let transport = Mux::get()
+            .get_pane(pane_id)
+            .ok_or_else(|| anyhow::anyhow!("tmux control transport pane {pane_id} disappeared"))?;
+        write!(transport.writer(), "detach-client\n")?;
+        Ok(())
     }
 
     fn state(&self) -> DomainState {
-        DomainState::Attached
+        Self::domain_state_for_connection(self.connection_state())
     }
 }
