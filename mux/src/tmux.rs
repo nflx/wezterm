@@ -120,6 +120,7 @@ pub(crate) struct TmuxDomainState {
     pub(crate) pending_split_pane_ids: Mutex<VecDeque<TmuxPaneId>>,
     pub(crate) pending_new_tabs: Mutex<VecDeque<promise::Promise<Arc<Tab>>>>,
     pub(crate) pending_kills: Mutex<HashMap<TmuxPaneId, promise::Promise<()>>>,
+    pub(crate) pending_window_kills: Mutex<HashMap<TmuxWindowId, promise::Promise<()>>>,
     pub(crate) pending_repositions: Mutex<VecDeque<PendingReposition>>,
     pub(crate) pending_breaks: Mutex<VecDeque<PendingBreakPane>>,
     pub(crate) pending_reposition_windows: Mutex<HashSet<TmuxWindowId>>,
@@ -147,6 +148,13 @@ impl TmuxDomainState {
             operation
                 .completion
                 .err(anyhow::anyhow!(reason.to_string()));
+        }
+    }
+
+    fn fail_pending_window_kills(&self, reason: &str) {
+        let operations: Vec<_> = self.pending_window_kills.lock().drain().collect();
+        for (_, mut completion) in operations {
+            completion.err(anyhow::anyhow!(reason.to_string()));
         }
     }
 
@@ -226,6 +234,7 @@ impl TmuxDomainState {
                     }
                     self.fail_pending_repositions("tmux control transport disconnected");
                     self.fail_pending_breaks("tmux control transport disconnected");
+                    self.fail_pending_window_kills("tmux control transport disconnected");
 
                     // Force to quit the tmux mode
                     let pane_id = *self.pane_id.lock();
@@ -294,6 +303,15 @@ impl TmuxDomainState {
                 }
                 Event::WindowClose { window } => {
                     if self.pending_reposition_windows.lock().contains(window) {
+                        continue;
+                    }
+                    if self.pending_window_kills.lock().contains_key(window) {
+                        if let Some(session_id) = *self.tmux_session.lock() {
+                            self.cmd_queue.lock().push_back(Box::new(ListAllWindows {
+                                session_id,
+                                window_id: None,
+                            }));
+                        }
                         continue;
                     }
                     let _ = self.remove_detached_window(*window);
@@ -423,6 +441,7 @@ impl TmuxDomainState {
         }
         self.fail_pending_repositions("tmux command actor timed out");
         self.fail_pending_breaks("tmux command actor timed out");
+        self.fail_pending_window_kills("tmux command actor timed out");
         if let Some(transport) = Mux::get().get_pane(*self.pane_id.lock()) {
             transport.kill();
         }
@@ -700,6 +719,7 @@ impl TmuxDomain {
             pending_split_pane_ids: Mutex::new(VecDeque::default()),
             pending_new_tabs: Mutex::new(VecDeque::default()),
             pending_kills: Mutex::new(HashMap::default()),
+            pending_window_kills: Mutex::new(HashMap::default()),
             pending_repositions: Mutex::new(VecDeque::default()),
             pending_breaks: Mutex::new(VecDeque::default()),
             pending_reposition_windows: Mutex::new(HashSet::default()),
@@ -741,6 +761,8 @@ impl TmuxDomain {
             .fail_pending_repositions("tmux control transport reconnected");
         self.inner
             .fail_pending_breaks("tmux control transport reconnected");
+        self.inner
+            .fail_pending_window_kills("tmux control transport reconnected");
     }
 
     pub(crate) fn transport_disconnected(&self) {
@@ -756,6 +778,8 @@ impl TmuxDomain {
             .fail_pending_repositions("tmux control transport disconnected");
         self.inner
             .fail_pending_breaks("tmux control transport disconnected");
+        self.inner
+            .fail_pending_window_kills("tmux control transport disconnected");
     }
 
     pub fn mark_reconnecting(&self) {
@@ -787,7 +811,7 @@ impl TmuxDomain {
         Ok(())
     }
 
-    pub fn close_tab(&self, tab_id: TabId) -> anyhow::Result<()> {
+    pub async fn close_tab(&self, tab_id: TabId) -> anyhow::Result<()> {
         let window_id = self
             .inner
             .gui_tabs
@@ -796,12 +820,20 @@ impl TmuxDomain {
             .find(|tab| tab.tab_id == tab_id)
             .map(|tab| tab.tmux_window_id)
             .ok_or_else(|| anyhow::anyhow!("no tmux window for tab {tab_id}"))?;
+        let mut completion = promise::Promise::new();
+        let future = completion
+            .get_future()
+            .ok_or_else(|| anyhow::anyhow!("failed to create tmux window-close completion"))?;
+        self.inner
+            .pending_window_kills
+            .lock()
+            .insert(window_id, completion);
         self.inner
             .cmd_queue
             .lock()
             .push_back(Box::new(KillWindow { window_id }));
         TmuxDomainState::schedule_send_next_command(self.inner.domain_id);
-        Ok(())
+        future.await
     }
 
     pub async fn kill_pane(&self, local_pane_id: PaneId) -> anyhow::Result<()> {

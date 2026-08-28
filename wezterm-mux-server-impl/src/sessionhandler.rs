@@ -594,26 +594,25 @@ impl SessionHandler {
             }
             Pdu::CloseTab(CloseTab { tab_id }) => {
                 spawn_into_main_thread(async move {
-                    catch(
-                        move || {
-                            let mux = Mux::get();
-                            let tab = mux
-                                .get_tab(tab_id)
-                                .ok_or_else(|| anyhow!("no such tab {tab_id}"))?;
-                            let pane = tab
-                                .get_active_pane()
-                                .ok_or_else(|| anyhow!("tab {tab_id} has no active pane"))?;
-                            let domain = mux
-                                .get_domain(pane.domain_id())
-                                .ok_or_else(|| anyhow!("domain for tab {tab_id} disappeared"))?;
-                            let tmux = domain
-                                .downcast_ref::<mux::tmux::TmuxDomain>()
-                                .ok_or_else(|| anyhow!("tab {tab_id} is not backed by tmux"))?;
-                            tmux.close_tab(tab_id)?;
-                            Ok(Pdu::UnitResponse(UnitResponse {}))
-                        },
-                        send_response,
-                    );
+                    let result = async {
+                        let mux = Mux::get();
+                        let tab = mux
+                            .get_tab(tab_id)
+                            .ok_or_else(|| anyhow!("no such tab {tab_id}"))?;
+                        let pane = tab
+                            .get_active_pane()
+                            .ok_or_else(|| anyhow!("tab {tab_id} has no active pane"))?;
+                        let domain = mux
+                            .get_domain(pane.domain_id())
+                            .ok_or_else(|| anyhow!("domain for tab {tab_id} disappeared"))?;
+                        let tmux = domain
+                            .downcast_ref::<mux::tmux::TmuxDomain>()
+                            .ok_or_else(|| anyhow!("tab {tab_id} is not backed by tmux"))?;
+                        tmux.close_tab(tab_id).await?;
+                        Ok(Pdu::UnitResponse(UnitResponse {}))
+                    }
+                    .await;
+                    send_response(result);
                 })
                 .detach();
             }

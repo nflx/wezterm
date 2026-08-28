@@ -1071,6 +1071,18 @@ impl TmuxDomainState {
             for window_id in detached_windows {
                 self.remove_detached_window(window_id)?;
             }
+            let completed_window_kills: Vec<_> = {
+                let mut pending = self.pending_window_kills.lock();
+                let completed: Vec<_> = pending
+                    .keys()
+                    .filter(|window_id| !snapshot_window_ids.contains(window_id))
+                    .copied()
+                    .collect();
+                completed
+                    .into_iter()
+                    .filter_map(|window_id| pending.remove(&window_id))
+                    .collect()
+            };
             for removed in &topology_plan.removed {
                 if let Some(remote) = self.remote_panes.lock().remove(&removed.pane_id) {
                     let remote = remote.lock();
@@ -1147,6 +1159,9 @@ impl TmuxDomainState {
                 mux.notify(MuxNotification::PaneFocused(active_local));
             }
             for mut completion in completed_repositions {
+                completion.ok(());
+            }
+            for mut completion in completed_window_kills {
                 completion.ok(());
             }
             for (mut completion, window_id) in completed_breaks {
@@ -2036,9 +2051,51 @@ impl TmuxCommand for KillWindow {
 
     fn process_result(&self, domain_id: DomainId, result: &Guarded) -> anyhow::Result<()> {
         if result.error {
+            if let Some(domain) = Mux::get().get_domain(domain_id) {
+                if let Some(tmux) = domain.downcast_ref::<TmuxDomain>() {
+                    let completion = tmux
+                        .inner
+                        .pending_window_kills
+                        .lock()
+                        .remove(&self.window_id);
+                    if let Some(mut completion) = completion {
+                        completion.err(anyhow!("tmux rejected kill-window"));
+                    }
+                }
+            }
             anyhow::bail!("kill-window in domain={domain_id} failed: {result:#?}");
         }
+        if let Some(domain) = Mux::get().get_domain(domain_id) {
+            if let Some(tmux) = domain.downcast_ref::<TmuxDomain>() {
+                if let Some(session_id) = *tmux.inner.tmux_session.lock() {
+                    tmux.inner
+                        .cmd_queue
+                        .lock()
+                        .push_back(Box::new(ListAllWindows {
+                            session_id,
+                            window_id: None,
+                        }));
+                    TmuxDomainState::schedule_send_next_command(domain_id);
+                }
+            }
+        }
         Ok(())
+    }
+
+    fn process_timeout(&self, domain_id: DomainId) -> anyhow::Result<()> {
+        if let Some(domain) = Mux::get().get_domain(domain_id) {
+            if let Some(tmux) = domain.downcast_ref::<TmuxDomain>() {
+                let completion = tmux
+                    .inner
+                    .pending_window_kills
+                    .lock()
+                    .remove(&self.window_id);
+                if let Some(mut completion) = completion {
+                    completion.err(anyhow!("tmux kill-window timed out"));
+                }
+            }
+        }
+        anyhow::bail!("kill-window timed out in domain {domain_id}")
     }
 }
 
