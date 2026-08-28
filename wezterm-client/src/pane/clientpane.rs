@@ -20,7 +20,7 @@ use ratelim::RateLimiter;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::ops::Range;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use termwiz::input::KeyEvent;
@@ -38,6 +38,7 @@ pub struct ClientPane {
     local_pane_id: PaneId,
     pub remote_pane_id: PaneId,
     remote_tab_id: AtomicUsize,
+    tmux_connection_state: AtomicU8,
     pub renderable: Mutex<RenderableState>,
     configured_palette: Mutex<ColorPalette>,
     palette: Mutex<ColorPalette>,
@@ -124,6 +125,50 @@ impl ClientPane {
         self.remote_tab_id.store(remote_tab_id, Ordering::Relaxed);
     }
 
+    pub fn tmux_connection_state(&self) -> Option<mux::tab::TmuxConnectionState> {
+        match self.tmux_connection_state.load(Ordering::Relaxed) {
+            1 => Some(mux::tab::TmuxConnectionState::Connecting),
+            2 => Some(mux::tab::TmuxConnectionState::Syncing),
+            3 => Some(mux::tab::TmuxConnectionState::Connected),
+            4 => Some(mux::tab::TmuxConnectionState::Reconnecting),
+            5 => Some(mux::tab::TmuxConnectionState::Disconnected),
+            _ => None,
+        }
+    }
+
+    pub fn set_tmux_connection_state(&self, state: Option<mux::tab::TmuxConnectionState>) {
+        let value = match state {
+            None => 0,
+            Some(mux::tab::TmuxConnectionState::Connecting) => 1,
+            Some(mux::tab::TmuxConnectionState::Syncing) => 2,
+            Some(mux::tab::TmuxConnectionState::Connected) => 3,
+            Some(mux::tab::TmuxConnectionState::Reconnecting) => 4,
+            Some(mux::tab::TmuxConnectionState::Disconnected) => 5,
+        };
+        self.tmux_connection_state.store(value, Ordering::Relaxed);
+    }
+
+    pub fn request_close_remote_tab(&self) {
+        let client = Arc::clone(&self.client);
+        let tab_id = self.remote_tab_id();
+        promise::spawn::spawn(async move {
+            if let Err(err) = client.client.close_tab(CloseTab { tab_id }).await {
+                log::error!("failed to close tmux window for tab {tab_id}: {err:#}");
+            }
+        })
+        .detach();
+    }
+
+    pub fn request_tmux_reconnect(&self) {
+        let client = Arc::clone(&self.client);
+        promise::spawn::spawn(async move {
+            if let Err(err) = client.client.reconnect_tmux(ReconnectTmux {}).await {
+                log::error!("failed to request tmux reconnect: {err:#}");
+            }
+        })
+        .detach();
+    }
+
     pub fn new(
         client: &Arc<ClientInner>,
         remote_tab_id: TabId,
@@ -192,6 +237,7 @@ impl ClientPane {
             remote_pane_id,
             local_pane_id,
             remote_tab_id: AtomicUsize::new(remote_tab_id),
+            tmux_connection_state: AtomicU8::new(0),
             application_palette: Mutex::new(false),
             renderable: Mutex::new(render),
             writer: Mutex::new(writer),
@@ -590,7 +636,8 @@ impl ClientPane {
             );
         }
 
-        let result = resize_remote_panes(Arc::clone(&self.client), self.remote_tab_id(), panes).await;
+        let result =
+            resize_remote_panes(Arc::clone(&self.client), self.remote_tab_id(), panes).await;
         if pane_font_trace_enabled() {
             match &result {
                 Ok(()) => log::info!(

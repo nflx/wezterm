@@ -616,6 +616,7 @@ impl ClientDomain {
                             Some(pane) => {
                                 if let Some(pane) = pane.downcast_ref::<ClientPane>() {
                                     pane.set_remote_tab_id(entry.tab_id);
+                                    pane.set_tmux_connection_state(entry.tmux_connection_state);
                                     pane.set_local_font_scale_from_mux(entry.font_scale);
                                 }
                                 pane
@@ -633,6 +634,9 @@ impl ClientDomain {
                                     &entry.title,
                                     entry.font_scale,
                                 ));
+                                pane.downcast_ref::<ClientPane>()
+                                    .expect("new ClientPane changed type")
+                                    .set_tmux_connection_state(entry.tmux_connection_state);
                                 mux.add_pane(&pane).expect("failed to add pane to mux");
                                 pane
                             }
@@ -646,6 +650,9 @@ impl ClientDomain {
                             &entry.title,
                             entry.font_scale,
                         ));
+                        pane.downcast_ref::<ClientPane>()
+                            .expect("new ClientPane changed type")
+                            .set_tmux_connection_state(entry.tmux_connection_state);
                         log::debug!(
                             "domain: {} attaching to remote pane {:?} -> local pane_id {}",
                             inner.local_domain_id,

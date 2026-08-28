@@ -3,7 +3,8 @@ use crate::domain::{alloc_domain_id, Domain, DomainId, DomainState, SplitSource}
 use crate::pane::{Pane, PaneId};
 use crate::tab::{SplitRequest, Tab, TabId};
 use crate::tmux_commands::{
-    ListAllPanes, ListAllWindows, ListCommands, NewWindow, SplitPane, TmuxCommand,
+    JoinPane, KillWindow, ListAllPanes, ListAllWindows, ListCommands, NewWindow, RenameWindow,
+    SplitPane, TmuxCommand,
 };
 use crate::window::WindowId;
 use crate::{Mux, MuxWindowBuilder};
@@ -13,7 +14,9 @@ use parking_lot::{Condvar, Mutex};
 use portable_pty::CommandBuilder;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Write;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use termwiz::tmux_cc::*;
 use wezterm_term::TerminalSize;
 
@@ -59,14 +62,20 @@ pub(crate) struct TmuxTab {
     pub tab_id: TabId, // local tab ID
     pub tmux_window_id: TmuxWindowId,
     pub layout_csum: String,
+    pub layout_tree: LayoutNode,
     pub panes: HashSet<TmuxPaneId>, // tmux panes within tmux window
 }
 
 pub(crate) type TmuxCmdQueue = VecDeque<Box<dyn TmuxCommand>>;
 pub(crate) struct TmuxDomainState {
-    pub pane_id: PaneId,     // ID of the original pane
-    pub domain_id: DomainId, // ID of TmuxDomain
+    pub pane_id: Mutex<PaneId>, // ID of the control transport pane
+    pub domain_id: DomainId,    // ID of TmuxDomain
+    managed: bool,
     state: Mutex<State>,
+    pub(crate) connection_state: Mutex<crate::tab::TmuxConnectionState>,
+    next_operation_id: AtomicU64,
+    in_flight_operation_id: AtomicU64,
+    retry_requested: AtomicBool,
     pub cmd_queue: Arc<Mutex<TmuxCmdQueue>>,
     pub gui_window: Mutex<Option<MuxWindowBuilder>>,
     pub gui_tabs: Mutex<HashMap<TmuxWindowId, TmuxTab>>,
@@ -74,7 +83,9 @@ pub(crate) struct TmuxDomainState {
     pub tmux_session: Mutex<Option<TmuxSessionId>>,
     pub support_commands: Mutex<HashMap<String, String>>,
     pub attach_state: Mutex<AttachState>,
-    pending_splits: Mutex<VecDeque<promise::Promise<TmuxPaneId>>>,
+    pub(crate) pending_splits: Mutex<VecDeque<promise::Promise<TmuxPaneId>>>,
+    pub(crate) pending_new_tabs: Mutex<VecDeque<promise::Promise<Arc<Tab>>>>,
+    pending_reposition_windows: Mutex<HashSet<TmuxWindowId>>,
     pub backlog: Mutex<HashMap<TmuxPaneId, Vec<u8>>>,
 }
 
@@ -92,8 +103,10 @@ impl TmuxDomainState {
                 Event::Guarded(response) => match state {
                     State::WaitForInitialGuard => {
                         *self.state.lock() = State::Idle;
+                        *self.connection_state.lock() = crate::tab::TmuxConnectionState::Syncing;
                     }
                     State::WaitingForResponse => {
+                        self.in_flight_operation_id.store(0, Ordering::Release);
                         let mut cmd_queue = self.cmd_queue.as_ref().lock();
                         if let Some(cmd) = cmd_queue.pop_front() {
                             let domain_id = self.domain_id;
@@ -118,19 +131,22 @@ impl TmuxDomainState {
                 }
                 Event::Exit { reason: _ } => {
                     *self.state.lock() = State::Exit;
-                    let mut pane_map = self.remote_panes.lock();
-                    for (_, v) in pane_map.iter_mut() {
-                        let remote_pane = v.lock();
-                        let (lock, condvar) = &*remote_pane.active_lock;
-                        let mut released = lock.lock();
-                        *released = true;
-                        condvar.notify_all();
+                    *self.connection_state.lock() = crate::tab::TmuxConnectionState::Disconnected;
+                    if !self.managed {
+                        let mut pane_map = self.remote_panes.lock();
+                        for (_, v) in pane_map.iter_mut() {
+                            let remote_pane = v.lock();
+                            let (lock, condvar) = &*remote_pane.active_lock;
+                            let mut released = lock.lock();
+                            *released = true;
+                            condvar.notify_all();
+                        }
                     }
                     let mut cmd_queue = self.cmd_queue.as_ref().lock();
                     cmd_queue.clear();
 
                     // Force to quit the tmux mode
-                    let pane_id = self.pane_id;
+                    let pane_id = *self.pane_id.lock();
                     promise::spawn::spawn_into_main_thread_with_low_priority(async move {
                         if let Some(x) = Mux::get().get_pane(pane_id) {
                             let _ = write!(x.writer(), "\n\n");
@@ -193,6 +209,9 @@ impl TmuxDomainState {
                     }
                 }
                 Event::WindowClose { window } => {
+                    if self.pending_reposition_windows.lock().contains(window) {
+                        continue;
+                    }
                     let _ = self.remove_detached_window(*window);
                 }
                 Event::WindowPaneChanged { window, pane } => {
@@ -221,6 +240,9 @@ impl TmuxDomainState {
                     }
                 }
                 Event::UnlinkedWindowClose { window } => {
+                    if self.pending_reposition_windows.lock().contains(window) {
+                        continue;
+                    }
                     let _ = self.remove_detached_window(*window);
                 }
                 _ => {}
@@ -249,13 +271,52 @@ impl TmuxDomainState {
             }
             log::debug!("sending cmd {:?}", cmd);
             let mux = Mux::get();
-            if let Some(pane) = mux.get_pane(self.pane_id) {
+            if let Some(pane) = mux.get_pane(*self.pane_id.lock()) {
                 let mut writer = pane.writer();
                 let _ = write!(writer, "{}", cmd);
             }
             *self.state.lock() = State::WaitingForResponse;
+            let operation_id = self.next_operation_id.fetch_add(1, Ordering::Relaxed) + 1;
+            self.in_flight_operation_id
+                .store(operation_id, Ordering::Release);
+            let domain_id = self.domain_id;
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_secs(10));
+                promise::spawn::spawn_into_main_thread(async move {
+                    let mux = Mux::get();
+                    let Some(domain) = mux.get_domain(domain_id) else {
+                        return;
+                    };
+                    let Some(tmux) = domain.downcast_ref::<TmuxDomain>() else {
+                        return;
+                    };
+                    tmux.inner.command_timed_out(operation_id);
+                })
+                .detach();
+            });
             break;
         }
+    }
+
+    fn command_timed_out(&self, operation_id: u64) {
+        if self
+            .in_flight_operation_id
+            .compare_exchange(operation_id, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        if *self.state.lock() != State::WaitingForResponse {
+            return;
+        }
+        *self.state.lock() = State::Exit;
+        *self.connection_state.lock() = crate::tab::TmuxConnectionState::Disconnected;
+        if let Some(command) = self.cmd_queue.lock().pop_front() {
+            if let Err(err) = command.process_timeout(self.domain_id) {
+                log::error!("{err:#}");
+            }
+        }
+        self.cmd_queue.lock().clear();
     }
 
     /// schedule a `send_next_command` into main thread
@@ -275,19 +336,30 @@ impl TmuxDomainState {
     pub fn create_gui_window(&self) {
         if self.gui_window.lock().is_none() {
             let mux = Mux::get();
-            let window_builder =
-                if let Some((_domain, window_id, _tab)) = mux.resolve_pane_id(self.pane_id) {
-                    MuxWindowBuilder {
-                        window_id,
-                        activity: Some(Activity::new()),
-                        notified: false,
-                    }
-                } else {
-                    mux.new_empty_window(
-                        None, /* TODO: pass session here */
-                        None, /* position */
-                    )
-                };
+            let window_builder = if let Some((_domain, window_id, control_tab_id)) =
+                mux.resolve_pane_id(*self.pane_id.lock())
+            {
+                // The pane that carries the tmux -CC protocol is transport,
+                // not a user-facing terminal. Keep its tab and pane registered
+                // in the mux so that the child and reader remain alive, but
+                // detach the tab from the visible window. The Activity held by
+                // the builder prevents the temporarily empty window from being
+                // pruned before the tmux windows are reconstructed below.
+                let activity = Activity::new();
+                if let Some(mut window) = mux.get_window_mut(window_id) {
+                    window.remove_by_id(control_tab_id);
+                }
+                MuxWindowBuilder {
+                    window_id,
+                    activity: Some(activity),
+                    notified: false,
+                }
+            } else {
+                mux.new_empty_window(
+                    None, /* TODO: pass session here */
+                    None, /* position */
+                )
+            };
 
             log::info!("Tmux create window id {}", window_builder.window_id);
             {
@@ -330,6 +402,92 @@ impl TmuxDomainState {
             anyhow::bail!("Could not find the tmux pane peer for local pane: {pane_id}");
         }
     }
+
+    pub fn reposition_tmux_pane(
+        &self,
+        pane_id: PaneId,
+        target_pane_id: PaneId,
+        request: SplitRequest,
+    ) -> anyhow::Result<()> {
+        let pane_map = self.remote_panes.lock();
+        let (source, source_window) = pane_map
+            .values()
+            .find(|pane| pane.lock().local_pane_id == pane_id)
+            .map(|pane| {
+                let pane = pane.lock();
+                (pane.pane_id, pane.window_id)
+            })
+            .ok_or_else(|| anyhow::anyhow!("no tmux pane for local pane {pane_id}"))?;
+        let target = pane_map
+            .values()
+            .find(|pane| pane.lock().local_pane_id == target_pane_id)
+            .map(|pane| pane.lock().pane_id)
+            .ok_or_else(|| anyhow::anyhow!("no tmux pane for local target {target_pane_id}"))?;
+        drop(pane_map);
+
+        self.pending_reposition_windows.lock().insert(source_window);
+        self.cmd_queue.lock().push_back(Box::new(JoinPane {
+            pane_id,
+            target_pane_id,
+            source,
+            source_window,
+            target,
+            request,
+        }));
+        TmuxDomainState::schedule_send_next_command(self.domain_id);
+        Ok(())
+    }
+
+    pub(crate) fn pane_repositioned(
+        &self,
+        pane_id: PaneId,
+        target_pane_id: PaneId,
+        request: SplitRequest,
+        source_window: TmuxWindowId,
+    ) -> anyhow::Result<()> {
+        self.pending_reposition_windows
+            .lock()
+            .remove(&source_window);
+        let mux = Mux::get();
+        mux.reposition_pane_locally(pane_id, target_pane_id, request)?;
+
+        let (_, _, target_tab_id) = mux
+            .resolve_pane_id(target_pane_id)
+            .ok_or_else(|| anyhow::anyhow!("target pane disappeared after tmux move"))?;
+        let target_window_id = self
+            .gui_tabs
+            .lock()
+            .values()
+            .find(|tab| tab.tab_id == target_tab_id)
+            .map(|tab| tab.tmux_window_id)
+            .ok_or_else(|| anyhow::anyhow!("target tmux window disappeared after move"))?;
+
+        let pane_map = self.remote_panes.lock();
+        let remote_pane_id = pane_map
+            .values()
+            .find(|pane| pane.lock().local_pane_id == pane_id)
+            .map(|pane| pane.lock().pane_id)
+            .ok_or_else(|| anyhow::anyhow!("moved tmux pane mapping disappeared"))?;
+        if let Some(pane) = pane_map.get(&remote_pane_id) {
+            pane.lock().window_id = target_window_id;
+        }
+        drop(pane_map);
+
+        let mut tabs = self.gui_tabs.lock();
+        for tab in tabs.values_mut() {
+            tab.panes.remove(&remote_pane_id);
+        }
+        if let Some(tab) = tabs.get_mut(&target_window_id) {
+            tab.panes.insert(remote_pane_id);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn pane_reposition_failed(&self, source_window: TmuxWindowId) {
+        self.pending_reposition_windows
+            .lock()
+            .remove(&source_window);
+    }
 }
 
 impl TmuxDomain {
@@ -338,9 +496,14 @@ impl TmuxDomain {
         let cmd_queue = VecDeque::new();
         let inner = Arc::new(TmuxDomainState {
             domain_id,
-            pane_id,
+            pane_id: Mutex::new(pane_id),
             // parser,
+            managed: config::configuration().tmux_control.is_some(),
             state: Mutex::new(State::WaitForInitialGuard),
+            connection_state: Mutex::new(crate::tab::TmuxConnectionState::Connecting),
+            next_operation_id: AtomicU64::new(0),
+            in_flight_operation_id: AtomicU64::new(0),
+            retry_requested: AtomicBool::new(false),
             cmd_queue: Arc::new(Mutex::new(cmd_queue)),
             gui_window: Mutex::new(None),
             gui_tabs: Mutex::new(HashMap::default()),
@@ -349,6 +512,8 @@ impl TmuxDomain {
             support_commands: Mutex::new(HashMap::default()),
             attach_state: Mutex::new(AttachState::Init),
             pending_splits: Mutex::new(VecDeque::default()),
+            pending_new_tabs: Mutex::new(VecDeque::default()),
+            pending_reposition_windows: Mutex::new(HashSet::default()),
             backlog: Mutex::new(HashMap::default()),
         });
 
@@ -357,6 +522,79 @@ impl TmuxDomain {
 
     fn send_next_command(&self) {
         self.inner.send_next_command();
+    }
+
+    pub fn connection_state(&self) -> crate::tab::TmuxConnectionState {
+        *self.inner.connection_state.lock()
+    }
+
+    pub fn is_managed(&self) -> bool {
+        self.inner.managed
+    }
+
+    pub(crate) fn reconnect_transport(&self, pane_id: PaneId) {
+        *self.inner.pane_id.lock() = pane_id;
+        *self.inner.state.lock() = State::WaitForInitialGuard;
+        *self.inner.connection_state.lock() = crate::tab::TmuxConnectionState::Reconnecting;
+        *self.inner.attach_state.lock() = AttachState::Init;
+        self.inner
+            .in_flight_operation_id
+            .store(0, Ordering::Release);
+        self.inner.cmd_queue.lock().clear();
+    }
+
+    pub(crate) fn transport_disconnected(&self) {
+        *self.inner.state.lock() = State::Exit;
+        *self.inner.connection_state.lock() = crate::tab::TmuxConnectionState::Disconnected;
+        self.inner
+            .in_flight_operation_id
+            .store(0, Ordering::Release);
+    }
+
+    pub fn mark_reconnecting(&self) {
+        *self.inner.connection_state.lock() = crate::tab::TmuxConnectionState::Reconnecting;
+    }
+
+    pub fn request_retry(&self) {
+        self.inner.retry_requested.store(true, Ordering::Release);
+    }
+
+    pub fn take_retry_request(&self) -> bool {
+        self.inner.retry_requested.swap(false, Ordering::AcqRel)
+    }
+
+    pub fn rename_tab(&self, tab_id: TabId, title: String) -> anyhow::Result<()> {
+        let window_id = self
+            .inner
+            .gui_tabs
+            .lock()
+            .values()
+            .find(|tab| tab.tab_id == tab_id)
+            .map(|tab| tab.tmux_window_id)
+            .ok_or_else(|| anyhow::anyhow!("no tmux window for tab {tab_id}"))?;
+        self.inner
+            .cmd_queue
+            .lock()
+            .push_back(Box::new(RenameWindow { window_id, title }));
+        TmuxDomainState::schedule_send_next_command(self.inner.domain_id);
+        Ok(())
+    }
+
+    pub fn close_tab(&self, tab_id: TabId) -> anyhow::Result<()> {
+        let window_id = self
+            .inner
+            .gui_tabs
+            .lock()
+            .values()
+            .find(|tab| tab.tab_id == tab_id)
+            .map(|tab| tab.tmux_window_id)
+            .ok_or_else(|| anyhow::anyhow!("no tmux window for tab {tab_id}"))?;
+        self.inner
+            .cmd_queue
+            .lock()
+            .push_back(Box::new(KillWindow { window_id }));
+        TmuxDomainState::schedule_send_next_command(self.inner.domain_id);
+        Ok(())
     }
 }
 
@@ -369,11 +607,13 @@ impl Domain for TmuxDomain {
         _command_dir: Option<String>,
         _window: WindowId,
     ) -> anyhow::Result<Arc<Tab>> {
+        let mut completion = promise::Promise::new();
+        let future = completion
+            .get_future()
+            .ok_or_else(|| anyhow::anyhow!("failed to create tmux new-window completion"))?;
+        self.inner.pending_new_tabs.lock().push_back(completion);
         self.inner.create_tmux_window();
-        // This is intention, we would not return a Tab, since we don't have now!
-        // We use create_tmux_window to create back end tmux window, then the
-        // Tmux WindowAdd event will triage us to do the rest things.
-        anyhow::bail!("Intention: we use tmux command to do so");
+        future.await
     }
 
     async fn split_pane(

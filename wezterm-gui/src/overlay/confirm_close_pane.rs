@@ -40,6 +40,18 @@ pub fn confirm_close_tab(
     )? {
         promise::spawn::spawn_into_main_thread(async move {
             let mux = Mux::get();
+            if let Some(tab) = mux.get_tab(tab_id) {
+                if let Some(pane) = tab.get_active_pane() {
+                    if let Some(client_pane) =
+                        pane.downcast_ref::<wezterm_client::pane::ClientPane>()
+                    {
+                        if client_pane.tmux_connection_state().is_some() {
+                            client_pane.request_close_remote_tab();
+                            return;
+                        }
+                    }
+                }
+            }
             mux.remove_tab(tab_id);
         })
         .detach();

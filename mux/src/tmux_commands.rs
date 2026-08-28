@@ -1,18 +1,18 @@
 use crate::domain::{DomainId, WriterWrapper};
 use crate::localpane::LocalPane;
-use crate::pane::{alloc_pane_id, PaneId};
+use crate::pane::{PaneId, alloc_pane_id};
 use crate::tab::{SplitDirection, SplitRequest, SplitSize, Tab, TabId};
 use crate::tmux::{AttachState, TmuxDomain, TmuxDomainState, TmuxRemotePane, TmuxTab};
 use crate::tmux_pty::{TmuxChild, TmuxPty};
 use crate::{Mux, MuxNotification, Pane};
-use anyhow::{anyhow, Context};
+use anyhow::{Context, anyhow};
 use parking_lot::{Condvar, Mutex};
 use portable_pty::{MasterPty, PtySize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Write};
 use std::io::Write as _;
 use std::sync::Arc;
-use termwiz::escape::csi::{Cursor, CSI};
+use termwiz::escape::csi::{CSI, Cursor};
 use termwiz::escape::{Action, OneBased};
 use termwiz::tmux_cc::*;
 use wezterm_term::TerminalSize;
@@ -20,6 +20,10 @@ use wezterm_term::TerminalSize;
 pub(crate) trait TmuxCommand: Send + Debug {
     fn get_command(&self, domain_id: DomainId) -> String;
     fn process_result(&self, domain_id: DomainId, result: &Guarded) -> anyhow::Result<()>;
+
+    fn process_timeout(&self, domain_id: DomainId) -> anyhow::Result<()> {
+        anyhow::bail!("tmux command timed out in domain {domain_id}: {self:?}")
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -46,8 +50,95 @@ struct WindowItem {
     window_active: bool,
     window_name: String,
     layout: Vec<WindowLayout>,
+    layout_tree: LayoutNode,
     layout_csum: String,
     history_limit: isize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct PaneOwnership {
+    pane_id: TmuxPaneId,
+    window_id: TmuxWindowId,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct TopologyReconciliationPlan {
+    retained: HashSet<PaneOwnership>,
+    created: HashSet<PaneOwnership>,
+    removed: HashSet<PaneOwnership>,
+    moved: HashSet<(PaneOwnership, PaneOwnership)>,
+    unchanged_windows: HashSet<TmuxWindowId>,
+}
+
+fn pane_ownership(
+    windows: &HashMap<TmuxWindowId, LayoutNode>,
+) -> anyhow::Result<HashMap<TmuxPaneId, TmuxWindowId>> {
+    let mut ownership = HashMap::new();
+    for (window_id, layout) in windows {
+        let mut pane_ids = vec![];
+        layout.pane_ids(&mut pane_ids);
+        for pane_id in pane_ids {
+            if let Some(other_window) = ownership.insert(pane_id, *window_id) {
+                anyhow::bail!(
+                    "tmux pane %{pane_id} appears in both @{other_window} and @{window_id}"
+                );
+            }
+        }
+    }
+    Ok(ownership)
+}
+
+fn plan_topology_reconciliation(
+    current: &HashMap<TmuxWindowId, LayoutNode>,
+    snapshot: &HashMap<TmuxWindowId, LayoutNode>,
+) -> anyhow::Result<TopologyReconciliationPlan> {
+    let current_ownership = pane_ownership(current)?;
+    let snapshot_ownership = pane_ownership(snapshot)?;
+    let mut plan = TopologyReconciliationPlan::default();
+
+    for (pane_id, current_window) in &current_ownership {
+        let current = PaneOwnership {
+            pane_id: *pane_id,
+            window_id: *current_window,
+        };
+        match snapshot_ownership.get(pane_id) {
+            Some(snapshot_window) if snapshot_window == current_window => {
+                plan.retained.insert(current);
+            }
+            Some(snapshot_window) => {
+                plan.moved.insert((
+                    current,
+                    PaneOwnership {
+                        pane_id: *pane_id,
+                        window_id: *snapshot_window,
+                    },
+                ));
+            }
+            None => {
+                plan.removed.insert(current);
+            }
+        }
+    }
+
+    for (pane_id, snapshot_window) in &snapshot_ownership {
+        if !current_ownership.contains_key(pane_id) {
+            plan.created.insert(PaneOwnership {
+                pane_id: *pane_id,
+                window_id: *snapshot_window,
+            });
+        }
+    }
+
+    for (window_id, snapshot_layout) in snapshot {
+        if current
+            .get(window_id)
+            .is_some_and(|layout| layout.same_topology(snapshot_layout))
+        {
+            plan.unchanged_windows.insert(*window_id);
+        }
+    }
+
+    Ok(plan)
 }
 
 impl TmuxDomainState {
@@ -100,6 +191,7 @@ impl TmuxDomainState {
                     tab_id: *tab_id,
                     tmux_window_id: target.window_id,
                     layout_csum: target.layout_csum.clone(),
+                    layout_tree: target.layout_tree.clone(),
                     panes: HashSet::new(),
                 },
             );
@@ -128,8 +220,18 @@ impl TmuxDomainState {
             let Some(pane) = pane_map.get(&p) else {
                 continue;
             };
-            let local_pane_id = pane.lock().local_pane_id;
+            let pane = pane.lock();
+            let local_pane_id = pane.local_pane_id;
+            let (active, condvar) = &*pane.active_lock;
+            *active.lock() = true;
+            condvar.notify_all();
+            drop(pane);
+            drop(pane_map);
+            if let Some(tab) = mux.get_tab(tab_id) {
+                tab.remove_pane(local_pane_id);
+            }
             mux.remove_pane(local_pane_id);
+            self.remote_panes.lock().remove(&p);
             panes.remove(&p);
         }
 
@@ -209,6 +311,9 @@ impl TmuxDomainState {
 
         let child = TmuxChild {
             active_lock: active_lock.clone(),
+            domain_id: self.domain_id,
+            pane_id: pane.pane_id,
+            cmd_queue: self.cmd_queue.clone(),
         };
 
         let terminal = wezterm_term::Terminal::new(
@@ -361,6 +466,20 @@ impl TmuxDomainState {
         };
         let mux = Mux::get();
 
+        let current_layouts = self
+            .gui_tabs
+            .lock()
+            .iter()
+            .map(|(window_id, tab)| (*window_id, tab.layout_tree.clone()))
+            .collect();
+        let snapshot_layouts = windows
+            .iter()
+            .filter(|window| window.session_id == current_session)
+            .map(|window| (window.window_id, window.layout_tree.clone()))
+            .collect();
+        let topology_plan = plan_topology_reconciliation(&current_layouts, &snapshot_layouts)?;
+        log::debug!("tmux topology reconciliation plan: {topology_plan:#?}");
+
         self.create_gui_window();
         let mut gui_window = self.gui_window.lock();
         let gui_window_id = match gui_window.as_mut() {
@@ -372,6 +491,24 @@ impl TmuxDomainState {
 
         for window in windows.iter() {
             if window.session_id != current_session {
+                continue;
+            }
+
+            if let Some(existing) = self.gui_tabs.lock().get(&window.window_id) {
+                if !existing.layout_tree.same_topology(&window.layout_tree) {
+                    log::debug!(
+                        "tmux window {} snapshot topology changed; scheduling pane synchronization",
+                        window.window_id
+                    );
+                }
+                if let Some(tab) = mux.get_tab(existing.tab_id) {
+                    tab.set_title(&window.window_name);
+                }
+                self.cmd_queue.lock().push_back(Box::new(ListAllPanes {
+                    window_id: window.window_id,
+                    prune: false,
+                    layout_csum: window.layout_csum.clone(),
+                }));
                 continue;
             }
 
@@ -411,6 +548,7 @@ impl TmuxDomainState {
                         };
                         let local_pane = self.create_pane(&p).context("failed to create pane")?;
                         tab.assign_pane(&local_pane);
+                        local_pane.resize(size)?;
                         self.add_attached_pane(p.window_id, p.pane_id)?;
                         let _ = mux.add_pane(&local_pane);
                         break;
@@ -448,16 +586,18 @@ impl TmuxDomainState {
                         let _ = mux.add_pane(&local_pane);
                         if let None = tab.get_active_pane() {
                             tab.assign_pane(&local_pane);
+                            local_pane.resize(size)?;
                             split_pane_index = tab.get_active_idx();
                             continue;
                         }
 
+                        let pane_count = tab.iter_panes_ignoring_zoom().len();
                         split_pane_index = tab.split_and_insert(
                             split_pane_index,
                             SplitRequest {
                                 direction: split_direction,
                                 target_is_second: false,
-                                top_level: false,
+                                top_level: pane_count == 1,
                                 size: SplitSize::Cells(
                                     if split_direction == SplitDirection::Horizontal {
                                         p.pane_width as usize
@@ -467,7 +607,13 @@ impl TmuxDomainState {
                                 ),
                             },
                             local_pane.clone(),
-                        )? + 1;
+                        )
+                        .with_context(|| {
+                            format!(
+                                "reconstructing tmux window {} pane {} at local index {} with {} existing panes",
+                                p.window_id, p.pane_id, split_pane_index, pane_count
+                            )
+                        })? + 1;
                     } else {
                         let pane_map = self.remote_panes.lock();
                         let local_pane_id = match pane_map.get(&p.pane_id) {
@@ -493,6 +639,12 @@ impl TmuxDomainState {
 
             mux.add_tab_to_window(&tab, **gui_window_id)?;
             gui_window_id.notify();
+
+            if new_window {
+                if let Some(mut pending) = self.pending_new_tabs.lock().pop_front() {
+                    pending.ok(Arc::clone(&tab));
+                }
+            }
 
             let gui_tabs = self.gui_tabs.lock();
             let local_tab = match gui_tabs.get(&window.window_id) {
@@ -665,9 +817,9 @@ impl TmuxCommand for ListAllPanes {
         }
 
         format!(
-            "list-panes -F '#{{session_id}} #{{window_id}} #{{pane_id}} \
-            #{{pane_index}} #{{cursor_x}} #{{cursor_y}} #{{pane_width}} #{{pane_height}} \
-            #{{pane_left}} #{{pane_top}} #{{pane_active}}' -t @{}\n",
+            "list-panes -F '#{{session_id}}\x1f#{{window_id}}\x1f#{{pane_id}}\x1f\
+            #{{pane_index}}\x1f#{{cursor_x}}\x1f#{{cursor_y}}\x1f#{{pane_width}}\x1f#{{pane_height}}\x1f\
+            #{{pane_left}}\x1f#{{pane_top}}\x1f#{{pane_active}}' -t @{}\n",
             self.window_id
         )
     }
@@ -684,7 +836,7 @@ impl TmuxCommand for ListAllPanes {
             if line.is_empty() {
                 continue;
             }
-            let mut fields = line.split(' ');
+            let mut fields = line.split('\x1f');
             // These ids all have various sigils such as `$`, `%`, `@`,
             // so skip those prior to parsing them
             let session_id =
@@ -772,11 +924,11 @@ impl TmuxCommand for ListAllWindows {
     fn get_command(&self, _domain_id: DomainId) -> String {
         format!(
             "list-windows -F \
-                '#{{session_id}} #{{window_id}} \
-                #{{window_width}} #{{window_height}} \
-                #{{window_active}} \
-                #{{window_name}} \
-                #{{window_layout}} \
+                '#{{session_id}}\x1f#{{window_id}}\x1f\
+                #{{window_width}}\x1f#{{window_height}}\x1f\
+                #{{window_active}}\x1f\
+                #{{window_name}}\x1f\
+                #{{window_layout}}\x1f\
                 #{{history_limit}}' -t ${}\n",
             self.session_id
         )
@@ -794,7 +946,7 @@ impl TmuxCommand for ListAllWindows {
             if line.is_empty() {
                 continue;
             }
-            let mut fields = line.split(' ');
+            let mut fields = line.split('\x1f');
             let session_id =
                 parse_sigil_number(fields.next().ok_or_else(|| anyhow!("missing session_id"))?)?;
             let window_id =
@@ -841,6 +993,7 @@ impl TmuxCommand for ListAllWindows {
                 .ok_or_else(|| anyhow!("missing window_layout"))?;
 
             let layout = parse_layout(window_layout)?;
+            let layout_tree = parse_layout_tree(window_layout)?;
 
             items.push(WindowItem {
                 session_id,
@@ -850,6 +1003,7 @@ impl TmuxCommand for ListAllWindows {
                 window_active,
                 window_name: window_name.to_string(),
                 layout,
+                layout_tree,
                 layout_csum: layout_csum.to_string(),
                 history_limit,
             });
@@ -1046,11 +1200,29 @@ impl TmuxCommand for NewWindow {
 
     fn process_result(&self, domain_id: DomainId, result: &Guarded) -> anyhow::Result<()> {
         if result.error {
+            if let Some(domain) = Mux::get().get_domain(domain_id) {
+                if let Some(tmux) = domain.downcast_ref::<TmuxDomain>() {
+                    if let Some(mut pending) = tmux.inner.pending_new_tabs.lock().pop_front() {
+                        pending.err(anyhow!("tmux rejected new-window"));
+                    }
+                }
+            }
             let error = format!("new-window in domain={domain_id} failed: {result:#?}");
             log::error!("{error}");
             anyhow::bail!("{error}");
         }
         Ok(())
+    }
+
+    fn process_timeout(&self, domain_id: DomainId) -> anyhow::Result<()> {
+        if let Some(domain) = Mux::get().get_domain(domain_id) {
+            if let Some(tmux) = domain.downcast_ref::<TmuxDomain>() {
+                if let Some(mut pending) = tmux.inner.pending_new_tabs.lock().pop_front() {
+                    pending.err(anyhow!("tmux new-window timed out"));
+                }
+            }
+        }
+        anyhow::bail!("new-window timed out in domain {domain_id}")
     }
 }
 
@@ -1106,6 +1278,99 @@ pub(crate) struct SplitPane {
     pub direction: SplitDirection,
 }
 
+#[derive(Debug)]
+pub(crate) struct KillPane {
+    pub pane_id: TmuxPaneId,
+}
+
+#[derive(Debug)]
+pub(crate) struct KillWindow {
+    pub window_id: TmuxWindowId,
+}
+
+impl TmuxCommand for KillWindow {
+    fn get_command(&self, _domain_id: DomainId) -> String {
+        format!("kill-window -t @{}\n", self.window_id)
+    }
+
+    fn process_result(&self, domain_id: DomainId, result: &Guarded) -> anyhow::Result<()> {
+        if result.error {
+            anyhow::bail!("kill-window in domain={domain_id} failed: {result:#?}");
+        }
+        Ok(())
+    }
+}
+
+impl TmuxCommand for KillPane {
+    fn get_command(&self, _domain_id: DomainId) -> String {
+        format!("kill-pane -t %{}\n", self.pane_id)
+    }
+
+    fn process_result(&self, domain_id: DomainId, result: &Guarded) -> anyhow::Result<()> {
+        if result.error {
+            anyhow::bail!("kill-pane in domain={domain_id} failed: {result:#?}");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct JoinPane {
+    pub pane_id: PaneId,
+    pub target_pane_id: PaneId,
+    pub source: TmuxPaneId,
+    pub source_window: TmuxWindowId,
+    pub target: TmuxPaneId,
+    pub request: SplitRequest,
+}
+
+impl TmuxCommand for JoinPane {
+    fn get_command(&self, _domain_id: DomainId) -> String {
+        let orientation = match self.request.direction {
+            SplitDirection::Horizontal => "-h",
+            SplitDirection::Vertical => "-v",
+        };
+        let before = if self.request.target_is_second {
+            ""
+        } else {
+            "-b "
+        };
+        format!(
+            "join-pane {orientation} {before}-p 50 -s %{} -t %{}\n",
+            self.source, self.target
+        )
+    }
+
+    fn process_result(&self, domain_id: DomainId, result: &Guarded) -> anyhow::Result<()> {
+        let mux = Mux::get();
+        let domain = mux
+            .get_domain(domain_id)
+            .ok_or_else(|| anyhow!("tmux domain lost"))?;
+        let tmux = domain
+            .downcast_ref::<TmuxDomain>()
+            .ok_or_else(|| anyhow!("tmux domain lost"))?;
+        if result.error {
+            tmux.inner.pane_reposition_failed(self.source_window);
+            anyhow::bail!("join-pane in domain={domain_id} failed: {result:#?}");
+        }
+        tmux.inner.pane_repositioned(
+            self.pane_id,
+            self.target_pane_id,
+            self.request,
+            self.source_window,
+        )
+    }
+
+    fn process_timeout(&self, domain_id: DomainId) -> anyhow::Result<()> {
+        if let Some(domain) = Mux::get().get_domain(domain_id) {
+            if let Some(tmux) = domain.downcast_ref::<TmuxDomain>() {
+                tmux.inner.pane_reposition_failed(self.source_window);
+            }
+        }
+        anyhow::bail!("join-pane timed out in domain {domain_id}")
+    }
+}
+
 impl TmuxCommand for SplitPane {
     fn get_command(&self, _domain_id: DomainId) -> String {
         if self.direction == SplitDirection::Horizontal {
@@ -1117,17 +1382,59 @@ impl TmuxCommand for SplitPane {
 
     fn process_result(&self, domain_id: DomainId, result: &Guarded) -> anyhow::Result<()> {
         if result.error {
+            if let Some(domain) = Mux::get().get_domain(domain_id) {
+                if let Some(tmux) = domain.downcast_ref::<TmuxDomain>() {
+                    if let Some(mut pending) = tmux.inner.pending_splits.lock().pop_front() {
+                        pending.err(anyhow!("tmux rejected split-window"));
+                    }
+                }
+            }
             let error = format!("split-window in domain={domain_id} failed: {result:#?}");
             log::error!("{error}");
             anyhow::bail!("{error}");
         }
         Ok(())
     }
+
+    fn process_timeout(&self, domain_id: DomainId) -> anyhow::Result<()> {
+        if let Some(domain) = Mux::get().get_domain(domain_id) {
+            if let Some(tmux) = domain.downcast_ref::<TmuxDomain>() {
+                if let Some(mut pending) = tmux.inner.pending_splits.lock().pop_front() {
+                    pending.err(anyhow!("tmux split-window timed out"));
+                }
+            }
+        }
+        anyhow::bail!("split-window timed out in domain {domain_id}")
+    }
 }
 
 #[derive(Debug)]
 pub(crate) struct SelectWindow {
     pub window_id: TmuxWindowId,
+}
+
+#[derive(Debug)]
+pub(crate) struct RenameWindow {
+    pub window_id: TmuxWindowId,
+    pub title: String,
+}
+
+impl TmuxCommand for RenameWindow {
+    fn get_command(&self, _domain_id: DomainId) -> String {
+        let title = self.title.replace(['\r', '\n'], " ");
+        format!(
+            "rename-window -t @{} {}\n",
+            self.window_id,
+            shell_words::quote(&title)
+        )
+    }
+
+    fn process_result(&self, domain_id: DomainId, result: &Guarded) -> anyhow::Result<()> {
+        if result.error {
+            anyhow::bail!("rename-window in domain={domain_id} failed: {result:#?}");
+        }
+        Ok(())
+    }
 }
 
 impl TmuxCommand for SelectWindow {
@@ -1193,6 +1500,164 @@ impl TmuxCommand for AttachDone {
 
         // Do nothing, just change the state.
         *tmux_domain.inner.attach_state.lock() = AttachState::Done;
+        *tmux_domain.inner.connection_state.lock() = crate::tab::TmuxConnectionState::Connected;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn join_pane_encodes_drop_edge() {
+        let cases = [
+            (
+                SplitDirection::Horizontal,
+                false,
+                "join-pane -h -b -p 50 -s %11 -t %22\n",
+            ),
+            (
+                SplitDirection::Horizontal,
+                true,
+                "join-pane -h -p 50 -s %11 -t %22\n",
+            ),
+            (
+                SplitDirection::Vertical,
+                false,
+                "join-pane -v -b -p 50 -s %11 -t %22\n",
+            ),
+            (
+                SplitDirection::Vertical,
+                true,
+                "join-pane -v -p 50 -s %11 -t %22\n",
+            ),
+        ];
+
+        for (direction, target_is_second, expected) in cases {
+            let command = JoinPane {
+                pane_id: 1,
+                target_pane_id: 2,
+                source: 11,
+                source_window: 3,
+                target: 22,
+                request: SplitRequest {
+                    direction,
+                    target_is_second,
+                    top_level: false,
+                    size: SplitSize::Percent(50),
+                },
+            };
+            assert_eq!(command.get_command(0), expected);
+        }
+    }
+
+    #[test]
+    fn topology_plan_classifies_stable_pane_ownership() -> anyhow::Result<()> {
+        let current = HashMap::from([
+            (
+                1,
+                parse_layout_tree("80x24,0,0{39x24,0,0,10,40x24,40,0,11}")?,
+            ),
+            (2, parse_layout_tree("80x24,0,0,20")?),
+            (3, parse_layout_tree("80x24,0,0,30")?),
+        ]);
+        let snapshot = HashMap::from([
+            (
+                1,
+                parse_layout_tree("120x40,0,0{59x40,0,0,10,60x40,60,0,12}")?,
+            ),
+            (2, parse_layout_tree("80x24,0,0,30")?),
+            (4, parse_layout_tree("80x24,0,0,40")?),
+        ]);
+
+        let plan = plan_topology_reconciliation(&current, &snapshot)?;
+        assert_eq!(
+            plan.retained,
+            HashSet::from([PaneOwnership {
+                pane_id: 10,
+                window_id: 1,
+            }])
+        );
+        assert_eq!(
+            plan.created,
+            HashSet::from([
+                PaneOwnership {
+                    pane_id: 12,
+                    window_id: 1,
+                },
+                PaneOwnership {
+                    pane_id: 40,
+                    window_id: 4,
+                },
+            ])
+        );
+        assert_eq!(
+            plan.removed,
+            HashSet::from([
+                PaneOwnership {
+                    pane_id: 11,
+                    window_id: 1,
+                },
+                PaneOwnership {
+                    pane_id: 20,
+                    window_id: 2,
+                },
+            ])
+        );
+        assert_eq!(
+            plan.moved,
+            HashSet::from([(
+                PaneOwnership {
+                    pane_id: 30,
+                    window_id: 3,
+                },
+                PaneOwnership {
+                    pane_id: 30,
+                    window_id: 2,
+                },
+            )])
+        );
+        assert!(plan.unchanged_windows.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn topology_plan_preserves_cell_resized_window() -> anyhow::Result<()> {
+        let current = HashMap::from([(
+            1,
+            parse_layout_tree("80x24,0,0{39x24,0,0,10,40x24,40,0,11}")?,
+        )]);
+        let snapshot = HashMap::from([(
+            1,
+            parse_layout_tree("120x40,0,0{59x40,0,0,10,60x40,60,0,11}")?,
+        )]);
+        let plan = plan_topology_reconciliation(&current, &snapshot)?;
+        assert_eq!(plan.retained.len(), 2);
+        assert_eq!(plan.unchanged_windows, HashSet::from([1]));
+        Ok(())
+    }
+
+    #[test]
+    fn topology_plan_rejects_duplicate_stable_pane_ids() -> anyhow::Result<()> {
+        let snapshot = HashMap::from([
+            (1, parse_layout_tree("80x24,0,0,10")?),
+            (2, parse_layout_tree("80x24,0,0,10")?),
+        ]);
+        let error = plan_topology_reconciliation(&HashMap::new(), &snapshot).unwrap_err();
+        assert!(error.to_string().contains("appears in both"));
+        Ok(())
+    }
+
+    #[test]
+    fn rename_window_quotes_title() {
+        let command = RenameWindow {
+            window_id: 7,
+            title: "work's\nqueue".to_string(),
+        };
+        assert_eq!(
+            command.get_command(0),
+            "rename-window -t @7 'work'\\''s queue'\n"
+        );
     }
 }

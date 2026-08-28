@@ -585,6 +585,56 @@ impl SessionHandler {
                 })
                 .detach();
             }
+            Pdu::CloseTab(CloseTab { tab_id }) => {
+                spawn_into_main_thread(async move {
+                    catch(
+                        move || {
+                            let mux = Mux::get();
+                            let tab = mux
+                                .get_tab(tab_id)
+                                .ok_or_else(|| anyhow!("no such tab {tab_id}"))?;
+                            let pane = tab
+                                .get_active_pane()
+                                .ok_or_else(|| anyhow!("tab {tab_id} has no active pane"))?;
+                            let domain = mux
+                                .get_domain(pane.domain_id())
+                                .ok_or_else(|| anyhow!("domain for tab {tab_id} disappeared"))?;
+                            let tmux = domain
+                                .downcast_ref::<mux::tmux::TmuxDomain>()
+                                .ok_or_else(|| anyhow!("tab {tab_id} is not backed by tmux"))?;
+                            tmux.close_tab(tab_id)?;
+                            Ok(Pdu::UnitResponse(UnitResponse {}))
+                        },
+                        send_response,
+                    );
+                })
+                .detach();
+            }
+            Pdu::ReconnectTmux(_) => {
+                spawn_into_main_thread(async move {
+                    catch(
+                        move || {
+                            let mux = Mux::get();
+                            let tmux = mux
+                                .iter_domains()
+                                .into_iter()
+                                .find(|domain| {
+                                    domain
+                                        .downcast_ref::<mux::tmux::TmuxDomain>()
+                                        .is_some_and(|tmux| tmux.is_managed())
+                                })
+                                .ok_or_else(|| anyhow!("no managed tmux domain"))?;
+                            let tmux = tmux
+                                .downcast_ref::<mux::tmux::TmuxDomain>()
+                                .expect("filtered to tmux domain");
+                            tmux.request_retry();
+                            Ok(Pdu::UnitResponse(UnitResponse {}))
+                        },
+                        send_response,
+                    );
+                })
+                .detach();
+            }
             Pdu::SendPaste(SendPaste { pane_id, data }) => {
                 let sender = self.to_write_tx.clone();
                 let per_pane = self.per_pane(pane_id);
@@ -1297,6 +1347,15 @@ impl SessionHandler {
                                 .ok_or_else(|| anyhow!("no such tab {tab_id}"))?;
 
                             tab.set_title(&title);
+                            if let Some(pane) = tab.get_active_pane() {
+                                if let Some(domain) = mux.get_domain(pane.domain_id()) {
+                                    if let Some(tmux) =
+                                        domain.downcast_ref::<mux::tmux::TmuxDomain>()
+                                    {
+                                        tmux.rename_tab(tab_id, title)?;
+                                    }
+                                }
+                            }
 
                             Ok(Pdu::UnitResponse(UnitResponse {}))
                         },

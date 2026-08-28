@@ -48,6 +48,25 @@ use wezterm_input_types::{
 };
 use wezterm_term::TerminalSize;
 
+/// Opt-in configuration for a tmux control-mode session managed by the
+/// standalone mux server.  The mux appends the control-mode and session
+/// arguments to `command`.
+#[derive(Debug, Clone, FromDynamic, ToDynamic, ConfigMeta)]
+pub struct TmuxControlConfig {
+    #[dynamic(default = "default_tmux_session_name")]
+    pub session_name: String,
+    #[dynamic(default = "default_tmux_command")]
+    pub command: Vec<String>,
+}
+
+fn default_tmux_session_name() -> String {
+    "wezterm".to_string()
+}
+
+fn default_tmux_command() -> Vec<String> {
+    vec!["tmux".to_string()]
+}
+
 #[derive(Debug, Clone, FromDynamic, ToDynamic, ConfigMeta)]
 pub struct Config {
     /// The font size, measured in points
@@ -360,6 +379,11 @@ pub struct Config {
 
     #[dynamic(default)]
     pub exec_domains: Vec<ExecDomain>,
+
+    /// When set, the standalone mux server starts and supervises a hidden
+    /// tmux control client for this session.
+    #[dynamic(default)]
+    pub tmux_control: Option<TmuxControlConfig>,
 
     #[dynamic(default)]
     pub serial_ports: Vec<SerialDomain>,

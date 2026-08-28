@@ -7210,6 +7210,7 @@ dependencies = [
  "openssl",
  "portable-pty",
  "promise",
+ "smol",
  "umask",
  "wezterm-blob-leases",
  "wezterm-gui-subcommands",

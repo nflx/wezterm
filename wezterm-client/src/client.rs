@@ -1584,6 +1584,8 @@ impl Client {
         SearchScrollbackResponse
     );
     rpc!(kill_pane, KillPane, UnitResponse);
+    rpc!(close_tab, CloseTab, UnitResponse);
+    rpc!(reconnect_tmux, ReconnectTmux, UnitResponse);
     rpc!(set_client_id, SetClientId, UnitResponse);
     rpc!(list_clients, GetClientList = (), GetClientListResponse);
     rpc!(set_window_workspace, SetWindowWorkspace, UnitResponse);

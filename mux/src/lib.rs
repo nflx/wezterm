@@ -1340,10 +1340,10 @@ impl Mux {
         target_pane_id: PaneId,
         request: crate::tab::SplitRequest,
     ) -> anyhow::Result<()> {
-        let (source_domain, source_window, source_tab_id) = self
+        let (source_domain, source_window, _) = self
             .resolve_pane_id(pane_id)
             .ok_or_else(|| anyhow!("pane {pane_id} not found"))?;
-        let (target_domain, target_window, target_tab_id) = self
+        let (target_domain, target_window, _) = self
             .resolve_pane_id(target_pane_id)
             .ok_or_else(|| anyhow!("target pane {target_pane_id} not found"))?;
         if source_window != target_window {
@@ -1352,6 +1352,30 @@ impl Mux {
         if source_domain != target_domain {
             anyhow::bail!("cannot reposition panes across mux domains");
         }
+
+        if let Some(domain) = self.get_domain(source_domain) {
+            if let Some(tmux) = domain.downcast_ref::<crate::tmux::TmuxDomain>() {
+                return tmux
+                    .inner
+                    .reposition_tmux_pane(pane_id, target_pane_id, request);
+            }
+        }
+
+        self.reposition_pane_locally(pane_id, target_pane_id, request)
+    }
+
+    pub(crate) fn reposition_pane_locally(
+        &self,
+        pane_id: PaneId,
+        target_pane_id: PaneId,
+        request: crate::tab::SplitRequest,
+    ) -> anyhow::Result<()> {
+        let (_, _, source_tab_id) = self
+            .resolve_pane_id(pane_id)
+            .ok_or_else(|| anyhow!("pane {pane_id} not found"))?;
+        let (_, _, target_tab_id) = self
+            .resolve_pane_id(target_pane_id)
+            .ok_or_else(|| anyhow!("target pane {target_pane_id} not found"))?;
 
         let source_tab = self
             .get_tab(source_tab_id)

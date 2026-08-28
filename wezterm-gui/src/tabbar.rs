@@ -438,8 +438,25 @@ impl TabBarState {
         let new_tab_hover_attrs = colors.new_tab_hover().as_cell_attributes();
         let new_tab_attrs = colors.new_tab().as_cell_attributes();
 
+        let tmux_state = pane_info.iter().find_map(|pane| pane.tmux_connection_state);
+        let new_tab_text = match tmux_state {
+            Some(mux::tab::TmuxConnectionState::Connected) => "\x1b[32m●\x1b[0m",
+            Some(mux::tab::TmuxConnectionState::Connecting)
+            | Some(mux::tab::TmuxConnectionState::Syncing)
+            | Some(mux::tab::TmuxConnectionState::Reconnecting) => "\x1b[33m●\x1b[0m",
+            Some(mux::tab::TmuxConnectionState::Disconnected) => "\x1b[31m●\x1b[0m",
+            None => &config.tab_bar_style.new_tab,
+        };
+        let new_tab_hover_text = match tmux_state {
+            Some(mux::tab::TmuxConnectionState::Connected) => "\x1b[92m●\x1b[0m",
+            Some(mux::tab::TmuxConnectionState::Connecting)
+            | Some(mux::tab::TmuxConnectionState::Syncing)
+            | Some(mux::tab::TmuxConnectionState::Reconnecting) => "\x1b[93m●\x1b[0m",
+            Some(mux::tab::TmuxConnectionState::Disconnected) => "\x1b[91m●\x1b[0m",
+            None => &config.tab_bar_style.new_tab_hover,
+        };
         let new_tab = parse_status_text(
-            &config.tab_bar_style.new_tab,
+            new_tab_text,
             if config.use_fancy_tab_bar {
                 CellAttributes::default()
             } else {
@@ -447,7 +464,7 @@ impl TabBarState {
             },
         );
         let new_tab_hover = parse_status_text(
-            &config.tab_bar_style.new_tab_hover,
+            new_tab_hover_text,
             if config.use_fancy_tab_bar {
                 CellAttributes::default()
             } else {

@@ -441,7 +441,7 @@ macro_rules! pdu {
 /// The overall version of the codec.
 /// This must be bumped when backwards incompatible changes
 /// are made to the types and protocol.
-pub const CODEC_VERSION: usize = 50;
+pub const CODEC_VERSION: usize = 51;
 
 // Defines the Pdu enum.
 // Each struct has an explicit identifying number.
@@ -508,6 +508,8 @@ pdu! {
     SetLeftSidebarHidden: 66,
     SetRightSidebarHidden: 67,
     RepositionPane: 68,
+    ReconnectTmux: 69,
+    CloseTab: 70,
 }
 
 impl Pdu {
@@ -705,6 +707,14 @@ pub struct PaneRemoved {
 #[derive(Deserialize, Serialize, PartialEq, Debug)]
 pub struct KillPane {
     pub pane_id: PaneId,
+}
+
+#[derive(Deserialize, Serialize, PartialEq, Debug)]
+pub struct ReconnectTmux {}
+
+#[derive(Deserialize, Serialize, PartialEq, Debug)]
+pub struct CloseTab {
+    pub tab_id: TabId,
 }
 
 #[derive(Deserialize, Serialize, PartialEq, Debug)]

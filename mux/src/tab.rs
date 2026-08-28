@@ -426,6 +426,13 @@ fn pane_tree(
                 top_px,
                 font_scale: pane.font_scale(),
                 tty_name: pane.tty_name(),
+                tmux_connection_state: Mux::try_get()
+                    .and_then(|mux| mux.get_domain(pane.domain_id()))
+                    .and_then(|domain| {
+                        domain
+                            .downcast_ref::<crate::tmux::TmuxDomain>()
+                            .map(|tmux| tmux.connection_state())
+                    }),
             })
         }
     }
@@ -2727,8 +2734,16 @@ impl TabInner {
         self.set_zoomed(false);
 
         self.iter_panes().iter().nth(pane_index).and_then(|pos| {
-            let layout_width = (pos.pixel_width / cell_dims.pixel_width.max(1)).max(1);
-            let layout_height = (pos.pixel_height / cell_dims.pixel_height.max(1)).max(1);
+            let layout_width = if cell_dims.pixel_width == 0 {
+                pos.width
+            } else {
+                (pos.pixel_width / cell_dims.pixel_width).max(1)
+            };
+            let layout_height = if cell_dims.pixel_height == 0 {
+                pos.height
+            } else {
+                (pos.pixel_height / cell_dims.pixel_height).max(1)
+            };
             let ((width1, width2), (height1, height2)) = match request.direction {
                 SplitDirection::Horizontal => (
                     split_dimensions(layout_width, request)?,
@@ -3006,6 +3021,17 @@ pub struct PaneEntry {
     pub left_px: usize,
     pub font_scale: Option<f64>,
     pub tty_name: Option<String>,
+    #[serde(default)]
+    pub tmux_connection_state: Option<TmuxConnectionState>,
+}
+
+#[derive(Deserialize, Clone, Copy, Serialize, PartialEq, Eq, Debug)]
+pub enum TmuxConnectionState {
+    Connecting,
+    Syncing,
+    Connected,
+    Reconnecting,
+    Disconnected,
 }
 
 #[derive(Deserialize, Clone, Serialize, PartialEq, Debug)]
@@ -3204,6 +3230,7 @@ mod test {
             left_px: 0,
             font_scale: Some(0.75),
             tty_name: None,
+            tmux_connection_state: None,
         });
 
         tab.sync_with_pane_tree_preserving_pane_sizes(remote_size, root, move |_| {
@@ -3239,16 +3266,15 @@ mod test {
         assert_eq!(80, panes[0].width);
         assert_eq!(24, panes[0].height);
 
-        assert!(
-            tab.compute_split_size(
+        assert!(tab
+            .compute_split_size(
                 1,
                 SplitRequest {
                     direction: SplitDirection::Horizontal,
                     ..Default::default()
                 }
             )
-            .is_none()
-        );
+            .is_none());
 
         let horz_size = tab
             .compute_split_size(
@@ -3425,6 +3451,33 @@ mod test {
         assert_eq!(24, panes[2].height);
         assert_eq!(400, panes[2].pixel_width);
         assert_eq!(600, panes[2].pixel_height);
+    }
+
+    #[test]
+    fn split_size_works_without_pixel_dimensions() {
+        let size = TerminalSize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+            dpi: 0,
+        };
+        let tab = Tab::new(&size);
+        tab.assign_pane(&FakePane::new(1, size));
+
+        let split = tab
+            .compute_split_size(
+                0,
+                SplitRequest {
+                    direction: SplitDirection::Horizontal,
+                    size: SplitSize::Cells(39),
+                    ..Default::default()
+                },
+            )
+            .expect("headless/tmux panes must be splittable without pixel dimensions");
+        assert_eq!(split.first.cols + split.second.cols + 1, size.cols);
+        assert_eq!(split.first.rows, size.rows);
+        assert_eq!(split.second.rows, size.rows);
     }
 
     #[test]

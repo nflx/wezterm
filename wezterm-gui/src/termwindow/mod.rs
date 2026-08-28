@@ -5,9 +5,9 @@ use crate::colorease::ColorEase;
 use crate::frontend::{front_end, try_front_end};
 use crate::inputmap::InputMap;
 use crate::overlay::{
-    CopyModeParams, CopyOverlay, LauncherArgs, LauncherFlags, QuickSelectOverlay,
     confirm_close_pane, confirm_close_tab, confirm_close_window, confirm_quit_program, launcher,
-    start_overlay, start_overlay_pane,
+    start_overlay, start_overlay_pane, CopyModeParams, CopyOverlay, LauncherArgs, LauncherFlags,
+    QuickSelectOverlay,
 };
 use crate::resize_increment_calculator::ResizeIncrementCalculator;
 use crate::scripting::guiwin::GuiWin;
@@ -16,7 +16,7 @@ use crate::selection::Selection;
 use crate::shapecache::*;
 use crate::tabbar::{TabBarItem, TabBarState};
 use crate::termwindow::background::{
-    LoadedBackgroundLayer, load_background_image, reload_background_image,
+    load_background_image, reload_background_image, LoadedBackgroundLayer,
 };
 use crate::termwindow::keyevent::{KeyTableArgs, KeyTableState};
 use crate::termwindow::modal::Modal;
@@ -28,15 +28,15 @@ use crate::termwindow::render::{
 use crate::termwindow::webgpu::WebGpuState;
 use ::wezterm_term::input::{ClickPosition, MouseButton as TMB};
 use ::window::*;
-use anyhow::{Context, anyhow, ensure};
+use anyhow::{anyhow, ensure, Context};
 use config::keyassignment::{
     Confirmation, KeyAssignment, LauncherActionArgs, PaneDirection, Pattern, PromptInputLine,
     QuickSelectArguments, RotationDirection, SpawnCommand, SplitSize,
 };
 use config::window::WindowLevel;
 use config::{
-    AudibleBell, ConfigHandle, Dimension, DimensionContext, FrontEndSelection, GeometryOrigin,
-    GuiPosition, TermConfig, WindowCloseConfirmation, configuration,
+    configuration, AudibleBell, ConfigHandle, Dimension, DimensionContext, FrontEndSelection,
+    GeometryOrigin, GuiPosition, TermConfig, WindowCloseConfirmation,
 };
 use lfucache::*;
 use mlua::{FromLua, LuaSerdeExt, UserData, UserDataFields};
@@ -52,8 +52,8 @@ use mux::window::WindowId as MuxWindowId;
 use mux::{Mux, MuxNotification};
 use mux_lua::MuxPane;
 use ordered_float::NotNan;
-use smol::Timer;
 use smol::channel::Sender;
+use smol::Timer;
 use std::cell::{RefCell, RefMut};
 use std::collections::{HashMap, HashSet, LinkedList};
 use std::ops::Add;
@@ -289,6 +289,7 @@ pub struct PaneInformation {
     pub title: String,
     pub user_vars: HashMap<String, String>,
     pub progress: Progress,
+    pub tmux_connection_state: Option<mux::tab::TmuxConnectionState>,
 }
 
 impl UserData for PaneInformation {
@@ -307,6 +308,15 @@ impl UserData for PaneInformation {
         fields.add_field_method_get("progress", |lua, this| lua.to_value(&this.progress));
         fields.add_field_method_get("title", |_, this| Ok(this.title.clone()));
         fields.add_field_method_get("user_vars", |_, this| Ok(this.user_vars.clone()));
+        fields.add_field_method_get("tmux_connection_state", |_, this| {
+            Ok(this.tmux_connection_state.map(|state| match state {
+                mux::tab::TmuxConnectionState::Connecting => "connecting",
+                mux::tab::TmuxConnectionState::Syncing => "syncing",
+                mux::tab::TmuxConnectionState::Connected => "connected",
+                mux::tab::TmuxConnectionState::Reconnecting => "reconnecting",
+                mux::tab::TmuxConnectionState::Disconnected => "disconnected",
+            }))
+        });
         fields.add_field_method_get("foreground_process_name", |_, this| {
             let mut name = None;
             if let Some(mux) = Mux::try_get() {
@@ -3475,6 +3485,14 @@ impl TermWindow {
             self.assign_overlay(tab_id, overlay);
             promise::spawn::spawn(future).detach();
         } else {
+            if let Some(pane) = tab.get_active_pane() {
+                if let Some(client_pane) = pane.downcast_ref::<wezterm_client::pane::ClientPane>() {
+                    if client_pane.tmux_connection_state().is_some() {
+                        client_pane.request_close_remote_tab();
+                        return;
+                    }
+                }
+            }
             mux.remove_tab(tab_id);
         }
     }
@@ -3495,6 +3513,14 @@ impl TermWindow {
             self.assign_overlay(tab_id, overlay);
             promise::spawn::spawn(future).detach();
         } else {
+            if let Some(pane) = tab.get_active_pane() {
+                if let Some(client_pane) = pane.downcast_ref::<wezterm_client::pane::ClientPane>() {
+                    if client_pane.tmux_connection_state().is_some() {
+                        client_pane.request_close_remote_tab();
+                        return;
+                    }
+                }
+            }
             mux.remove_tab(tab_id);
         }
     }
@@ -3753,6 +3779,10 @@ impl TermWindow {
             pixel_height: pos.pixel_height,
             title: pos.pane.get_title(),
             user_vars: pos.pane.copy_user_vars(),
+            tmux_connection_state: pos
+                .pane
+                .downcast_ref::<wezterm_client::pane::ClientPane>()
+                .and_then(|pane| pane.tmux_connection_state()),
             progress: pos.pane.get_progress(),
         }
     }

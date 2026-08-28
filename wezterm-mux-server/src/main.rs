@@ -9,6 +9,7 @@ use std::process::Command;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::thread;
+use std::time::{Duration, Instant};
 use wezterm_gui_subcommands::*;
 use wezterm_mux_server_impl::update_mux_domains_for_server;
 
@@ -258,6 +259,26 @@ async fn trigger_mux_startup(lua: Option<Rc<mlua::Lua>>) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn managed_tmux_command(tmux: &config::TmuxControlConfig) -> anyhow::Result<CommandBuilder> {
+    if tmux.command.is_empty() {
+        anyhow::bail!("tmux_control.command must contain an executable");
+    }
+    if tmux.session_name.is_empty() {
+        anyhow::bail!("tmux_control.session_name must not be empty");
+    }
+    let mut argv = tmux.command.clone();
+    argv.extend([
+        "-CC".to_string(),
+        "new-session".to_string(),
+        "-A".to_string(),
+        "-s".to_string(),
+        tmux.session_name.clone(),
+    ]);
+    Ok(CommandBuilder::from_argv(
+        argv.into_iter().map(Into::into).collect(),
+    ))
+}
+
 async fn async_run(cmd: Option<CommandBuilder>) -> anyhow::Result<()> {
     let mux = Mux::get();
     let config = config::configuration();
@@ -287,17 +308,135 @@ async fn async_run(cmd: Option<CommandBuilder>) -> anyhow::Result<()> {
         .any(|p| p.domain_id() == domain.domain_id());
 
     if !have_panes_in_domain {
+        let managed_tmux = config.tmux_control.is_some() && cmd.is_none();
+        let cmd = match (&config.tmux_control, cmd) {
+            (Some(tmux), None) => Some(managed_tmux_command(tmux)?),
+            (_, command) => command,
+        };
         let workspace = None;
         let position = None;
         let window_id = mux.new_empty_window(workspace, position);
         domain.attach(Some(*window_id)).await?;
 
-        let _tab = mux
+        let tab = mux
             .default_domain()
             .spawn(config.initial_size(0, None), cmd, None, *window_id)
             .await?;
+        if managed_tmux {
+            let mut transport = tab
+                .get_active_pane()
+                .ok_or_else(|| anyhow::anyhow!("managed tmux transport pane was not created"))?;
+            let tmux = config
+                .tmux_control
+                .as_ref()
+                .expect("managed_tmux implies tmux_control")
+                .clone();
+            let mut retry_delay = Duration::from_millis(250);
+            loop {
+                while !transport.is_dead() {
+                    smol::Timer::after(Duration::from_millis(100)).await;
+                }
+
+                let old_pane_id = transport.pane_id();
+                for domain in mux.iter_domains() {
+                    if let Some(tmux_domain) = domain.downcast_ref::<mux::tmux::TmuxDomain>() {
+                        if tmux_domain.is_managed() {
+                            tmux_domain.mark_reconnecting();
+                        }
+                    }
+                }
+                let retry_at = Instant::now() + retry_delay;
+                loop {
+                    let retry_now = mux.iter_domains().into_iter().any(|domain| {
+                        domain
+                            .downcast_ref::<mux::tmux::TmuxDomain>()
+                            .is_some_and(|tmux| tmux.is_managed() && tmux.take_retry_request())
+                    });
+                    if retry_now || Instant::now() >= retry_at {
+                        break;
+                    }
+                    smol::Timer::after(Duration::from_millis(100)).await;
+                }
+                retry_delay = (retry_delay * 2).min(Duration::from_secs(10));
+
+                mux.remove_pane(old_pane_id);
+                match mux
+                    .default_domain()
+                    .spawn(
+                        config.initial_size(0, None),
+                        Some(managed_tmux_command(&tmux)?),
+                        None,
+                        *window_id,
+                    )
+                    .await
+                {
+                    Ok(tab) => {
+                        transport = tab.get_active_pane().ok_or_else(|| {
+                            anyhow::anyhow!("reconnected tmux transport pane was not created")
+                        })?;
+                        if let Some(mut window) = mux.get_window_mut(*window_id) {
+                            window.remove_by_id(tab.tab_id());
+                        }
+                        retry_delay = Duration::from_millis(250);
+                    }
+                    Err(err) => {
+                        log::error!("failed to restart managed tmux control client: {err:#}");
+                    }
+                }
+            }
+        }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn managed_tmux_command_preserves_prefix_and_appends_control_args() {
+        let command = managed_tmux_command(&config::TmuxControlConfig {
+            session_name: "name with spaces".to_string(),
+            command: vec![
+                "/snap/bin/tmux".to_string(),
+                "-L".to_string(),
+                "test".to_string(),
+            ],
+        })
+        .unwrap();
+        let argv: Vec<_> = command
+            .get_argv()
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            argv,
+            [
+                "/snap/bin/tmux",
+                "-L",
+                "test",
+                "-CC",
+                "new-session",
+                "-A",
+                "-s",
+                "name with spaces"
+            ]
+        );
+    }
+
+    #[test]
+    fn managed_tmux_command_rejects_invalid_config() {
+        assert!(managed_tmux_command(&config::TmuxControlConfig {
+            session_name: "wezterm".to_string(),
+            command: vec![],
+        })
+        .is_err());
+        assert!(managed_tmux_command(&config::TmuxControlConfig {
+            session_name: String::new(),
+            command: vec!["tmux".to_string()],
+        })
+        .is_err());
+    }
 }
 
 fn terminate_with_error(err: anyhow::Error) -> ! {

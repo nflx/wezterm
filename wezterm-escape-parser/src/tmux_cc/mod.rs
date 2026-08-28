@@ -129,13 +129,69 @@ pub enum Event {
     },
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PaneLayout {
     pub pane_id: TmuxPaneId,
     pub pane_width: u64,
     pub pane_height: u64,
     pub pane_left: u64,
     pub pane_top: u64,
+}
+
+/// The bounding cell geometry reported by tmux for a layout subtree.
+///
+/// Geometry is intentionally stored separately from topology so that graphical
+/// clients can compare a layout's shape without treating cell dimensions as
+/// authority for their pixel split ratios.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LayoutGeometry {
+    pub width: u64,
+    pub height: u64,
+    pub left: u64,
+    pub top: u64,
+}
+
+/// A lossless representation of tmux's nested window layout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LayoutNode {
+    Pane(PaneLayout),
+    SplitHorizontal {
+        geometry: LayoutGeometry,
+        children: Vec<LayoutNode>,
+    },
+    SplitVertical {
+        geometry: LayoutGeometry,
+        children: Vec<LayoutNode>,
+    },
+}
+
+impl LayoutNode {
+    /// Return pane ids in tmux layout order.
+    pub fn pane_ids(&self, pane_ids: &mut Vec<TmuxPaneId>) {
+        match self {
+            Self::Pane(pane) => pane_ids.push(pane.pane_id),
+            Self::SplitHorizontal { children, .. } | Self::SplitVertical { children, .. } => {
+                for child in children {
+                    child.pane_ids(pane_ids);
+                }
+            }
+        }
+    }
+
+    /// Compare topology and stable pane ownership while ignoring cell geometry.
+    pub fn same_topology(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Pane(a), Self::Pane(b)) => a.pane_id == b.pane_id,
+            (
+                Self::SplitHorizontal { children: a, .. },
+                Self::SplitHorizontal { children: b, .. },
+            )
+            | (Self::SplitVertical { children: a, .. }, Self::SplitVertical { children: b, .. }) => {
+                a.len() == b.len() && a.iter().zip(b.iter()).all(|(a, b)| a.same_topology(b))
+            }
+            _ => false,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -727,6 +783,50 @@ fn parse_layout_pane(pair: Pair<Rule>) -> Result<PaneLayout> {
     });
 }
 
+fn parse_layout_geometry(pair: Pair<Rule>) -> Result<LayoutGeometry> {
+    let pane = parse_layout_pane(pair)?;
+    Ok(LayoutGeometry {
+        width: pane.pane_width,
+        height: pane.pane_height,
+        left: pane.pane_left,
+        top: pane.pane_top,
+    })
+}
+
+fn parse_layout_node(pair: Pair<Rule>) -> Result<LayoutNode> {
+    let rule = pair.as_rule();
+    match rule {
+        Rule::layout_pane => Ok(LayoutNode::Pane(parse_layout_pane(pair)?)),
+        Rule::layout_split_horizontal | Rule::layout_split_vertical => {
+            let mut pairs = pair.into_inner();
+            let geometry = parse_layout_geometry(
+                pairs
+                    .next()
+                    .ok_or_else(|| format_err!("missing split geometry"))?,
+            )?;
+            let children = pairs.map(parse_layout_node).collect::<Result<Vec<_>>>()?;
+            if children.len() < 2 {
+                bail!("tmux split layout must contain at least two children");
+            }
+            if rule == Rule::layout_split_horizontal {
+                Ok(LayoutNode::SplitHorizontal { geometry, children })
+            } else {
+                Ok(LayoutNode::SplitVertical { geometry, children })
+            }
+        }
+        _ => bail!("expected tmux layout node, got {:?}", rule),
+    }
+}
+
+/// Parse tmux's nested window layout without flattening its split tree.
+pub fn parse_layout_tree(layout: &str) -> Result<LayoutNode> {
+    let mut pairs = parser::TmuxParser::parse(Rule::layout_window, layout)?;
+    let root = pairs
+        .next()
+        .ok_or_else(|| format_err!("missing tmux window layout"))?;
+    parse_layout_node(root)
+}
+
 fn parse_layout_inner(
     mut pairs: Pairs<Rule>,
     result: &mut Vec<WindowLayout>,
@@ -1172,5 +1272,33 @@ here
         assert!(matches!(&layout[0], WindowLayout::SplitHorizontal(_x)));
         assert!(matches!(&layout[1], WindowLayout::SplitVertical(_x)));
         assert!(matches!(&layout[2], WindowLayout::SplitHorizontal(_x)));
+    }
+
+    #[test]
+    fn parse_layout_tree_preserves_nested_topology() {
+        let layout = "158x40,0,0[158x20,0,0,69,158x19,0,21{79x19,0,21,70,78x19,80,21[78x9,80,21,71,78x9,80,31,73]}]";
+        let tree = parse_layout_tree(layout).unwrap();
+        let mut pane_ids = vec![];
+        tree.pane_ids(&mut pane_ids);
+        assert_eq!(pane_ids, vec![69, 70, 71, 73]);
+
+        let LayoutNode::SplitVertical { children, .. } = tree else {
+            panic!("expected vertical root split");
+        };
+        assert!(matches!(children[0], LayoutNode::Pane(_)));
+        let LayoutNode::SplitHorizontal { children, .. } = &children[1] else {
+            panic!("expected nested horizontal split");
+        };
+        assert!(matches!(children[0], LayoutNode::Pane(_)));
+        assert!(matches!(children[1], LayoutNode::SplitVertical { .. }));
+    }
+
+    #[test]
+    fn layout_topology_ignores_cell_geometry() {
+        let before = parse_layout_tree("80x24,0,0{39x24,0,0,1,40x24,40,0,2}").unwrap();
+        let resized = parse_layout_tree("120x40,0,0{59x40,0,0,1,60x40,60,0,2}").unwrap();
+        let reordered = parse_layout_tree("120x40,0,0{59x40,0,0,2,60x40,60,0,1}").unwrap();
+        assert!(before.same_topology(&resized));
+        assert!(!before.same_topology(&reordered));
     }
 }

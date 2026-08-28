@@ -884,13 +884,30 @@ impl wezterm_term::DeviceControlHandler for LocalPaneDCSHandler {
                 {
                     log::info!("tmux -CC mode requested");
 
-                    // Create a new domain to host these tmux tabs
-                    let domain = TmuxDomain::new(self.pane_id);
-                    let tmux_domain = Arc::clone(&domain.inner);
-
-                    let domain: Arc<dyn Domain> = Arc::new(domain);
                     let mux = Mux::get();
-                    mux.add_domain(&domain);
+                    let existing_tmux_domain = mux.iter_domains().into_iter().find_map(|domain| {
+                        let tmux = domain.downcast_ref::<TmuxDomain>()?;
+                        let state = tmux.connection_state();
+                        let reusable = tmux.is_managed()
+                            && matches!(
+                                state,
+                                crate::tab::TmuxConnectionState::Disconnected
+                                    | crate::tab::TmuxConnectionState::Reconnecting
+                            );
+                        if reusable {
+                            tmux.reconnect_transport(self.pane_id);
+                            Some(Arc::clone(&tmux.inner))
+                        } else {
+                            None
+                        }
+                    });
+                    let tmux_domain = existing_tmux_domain.unwrap_or_else(|| {
+                        let domain = TmuxDomain::new(self.pane_id);
+                        let tmux_domain = Arc::clone(&domain.inner);
+                        let domain: Arc<dyn Domain> = Arc::new(domain);
+                        mux.add_domain(&domain);
+                        tmux_domain
+                    });
 
                     if let Some(pane) = mux.get_pane(self.pane_id) {
                         let pane = pane.downcast_ref::<LocalPane>().unwrap();
@@ -918,7 +935,23 @@ impl wezterm_term::DeviceControlHandler for LocalPaneDCSHandler {
                         let pane = pane.downcast_ref::<LocalPane>().unwrap();
                         pane.tmux_domain.lock().take();
                     }
-                    mux.domain_was_detached(tmux.domain_id);
+                    let managed = mux
+                        .get_domain(tmux.domain_id)
+                        .and_then(|domain| {
+                            domain
+                                .downcast_ref::<TmuxDomain>()
+                                .map(|tmux| tmux.is_managed())
+                        })
+                        .unwrap_or(false);
+                    if managed {
+                        if let Some(domain) = mux.get_domain(tmux.domain_id) {
+                            if let Some(tmux) = domain.downcast_ref::<TmuxDomain>() {
+                                tmux.transport_disconnected();
+                            }
+                        }
+                    } else {
+                        mux.domain_was_detached(tmux.domain_id);
+                    }
                 }
             }
             DeviceControlMode::Data(c) => {

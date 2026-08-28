@@ -1,16 +1,16 @@
 use crate::tabbar::TabBarItem;
 use crate::termwindow::{
-    GuiWin, MouseCapture, PositionedSplit, ScrollHit, TMB, TermWindowNotif, UIItem, UIItemType,
+    GuiWin, MouseCapture, PositionedSplit, ScrollHit, TermWindowNotif, UIItem, UIItemType, TMB,
 };
 use ::window::{
     MouseButtons as WMB, MouseCursor, MouseEvent, MouseEventKind as WMEK, MousePress,
     WindowDecorations, WindowOps, WindowState,
 };
-use config::MouseEventAltScreen;
 use config::keyassignment::{KeyAssignment, MouseEventTrigger, SpawnTabDomain};
-use mux::Mux;
+use config::MouseEventAltScreen;
 use mux::pane::{Pane, WithPaneLines};
 use mux::tab::{PositionedPane, SplitDirection};
+use mux::Mux;
 use mux_lua::MuxPane;
 use std::convert::TryInto;
 use std::ops::Sub;
@@ -211,10 +211,12 @@ impl super::TermWindow {
     }
 
     fn update_pane_drag_hover(&mut self, event: &MouseEvent) -> bool {
-        let hovered_tab = self.resolve_ui_item(event).and_then(|item| match item.item_type {
-            UIItemType::TabBar(TabBarItem::Tab { tab_idx, .. }) => Some(tab_idx),
-            _ => None,
-        });
+        let hovered_tab = self
+            .resolve_ui_item(event)
+            .and_then(|item| match item.item_type {
+                UIItemType::TabBar(TabBarItem::Tab { tab_idx, .. }) => Some(tab_idx),
+                _ => None,
+            });
 
         let drag = match self.pane_drag.as_mut() {
             Some(drag) => drag,
@@ -711,6 +713,20 @@ impl super::TermWindow {
             Some(pane) => pane,
             None => return,
         };
+        if button == MousePress::Left {
+            if let Some(client_pane) = pane.downcast_ref::<wezterm_client::pane::ClientPane>() {
+                if matches!(
+                    client_pane.tmux_connection_state(),
+                    Some(mux::tab::TmuxConnectionState::Connecting)
+                        | Some(mux::tab::TmuxConnectionState::Syncing)
+                        | Some(mux::tab::TmuxConnectionState::Reconnecting)
+                        | Some(mux::tab::TmuxConnectionState::Disconnected)
+                ) {
+                    client_pane.request_tmux_reconnect();
+                    return;
+                }
+            }
+        }
         let action = match button {
             MousePress::Left => Some(KeyAssignment::SpawnTab(SpawnTabDomain::CurrentPaneDomain)),
             MousePress::Right => Some(KeyAssignment::ShowLauncher),
