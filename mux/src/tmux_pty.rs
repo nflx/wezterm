@@ -1,5 +1,5 @@
 use crate::tmux::{RefTmuxRemotePane, TmuxCmdQueue, TmuxDomainState};
-use crate::tmux_commands::{KillPane, Resize, SendKeys};
+use crate::tmux_commands::{Resize, SendKeys};
 use crate::{DomainId, Mux};
 use filedescriptor::FileDescriptor;
 use parking_lot::{Condvar, Mutex};
@@ -90,9 +90,6 @@ impl Write for TmuxPty {
 #[derive(Clone, Debug)]
 pub(crate) struct TmuxChild {
     pub active_lock: Arc<(Mutex<bool>, Condvar)>,
-    pub domain_id: DomainId,
-    pub pane_id: termwiz::tmux_cc::TmuxPaneId,
-    pub cmd_queue: Arc<Mutex<TmuxCmdQueue>>,
 }
 
 impl Child for TmuxChild {
@@ -126,17 +123,9 @@ impl Child for TmuxChild {
 #[derive(Clone, Debug)]
 struct TmuxChildKiller {
     active_lock: Arc<(Mutex<bool>, Condvar)>,
-    domain_id: DomainId,
-    pane_id: termwiz::tmux_cc::TmuxPaneId,
-    cmd_queue: Arc<Mutex<TmuxCmdQueue>>,
 }
 
-fn kill_tmux_pane(
-    active_lock: &Arc<(Mutex<bool>, Condvar)>,
-    domain_id: DomainId,
-    pane_id: termwiz::tmux_cc::TmuxPaneId,
-    cmd_queue: &Arc<Mutex<TmuxCmdQueue>>,
-) {
+fn release_tmux_pane(active_lock: &Arc<(Mutex<bool>, Condvar)>) {
     let (lock, var) = &**active_lock;
     let mut exited = lock.lock();
     if *exited {
@@ -144,21 +133,11 @@ fn kill_tmux_pane(
     }
     *exited = true;
     var.notify_all();
-    drop(exited);
-    cmd_queue.lock().push_back(Box::new(KillPane { pane_id }));
-    if Mux::try_get().is_some() {
-        TmuxDomainState::schedule_send_next_command(domain_id);
-    }
 }
 
 impl ChildKiller for TmuxChildKiller {
     fn kill(&mut self) -> std::io::Result<()> {
-        kill_tmux_pane(
-            &self.active_lock,
-            self.domain_id,
-            self.pane_id,
-            &self.cmd_queue,
-        );
+        release_tmux_pane(&self.active_lock);
         Ok(())
     }
 
@@ -169,21 +148,13 @@ impl ChildKiller for TmuxChildKiller {
 
 impl ChildKiller for TmuxChild {
     fn kill(&mut self) -> std::io::Result<()> {
-        kill_tmux_pane(
-            &self.active_lock,
-            self.domain_id,
-            self.pane_id,
-            &self.cmd_queue,
-        );
+        release_tmux_pane(&self.active_lock);
         Ok(())
     }
 
     fn clone_killer(&self) -> Box<dyn ChildKiller + Send + Sync> {
         Box::new(TmuxChildKiller {
             active_lock: Arc::clone(&self.active_lock),
-            domain_id: self.domain_id,
-            pane_id: self.pane_id,
-            cmd_queue: Arc::clone(&self.cmd_queue),
         })
     }
 }
@@ -195,9 +166,29 @@ impl MasterPty for TmuxPty {
             | Some(crate::tab::TmuxConnectionState::Connected) => {}
             _ => ensure_connected(self.domain_id)?,
         }
-        let mut cmd_queue = self.cmd_queue.lock();
         let pane_id = self.master_pane.lock().pane_id;
-        cmd_queue.retain(|command| command.resize_pane_id() != Some(pane_id));
+        if Mux::try_get()
+            .and_then(|mux| mux.get_domain(self.domain_id))
+            .and_then(|domain| {
+                domain
+                    .downcast_ref::<crate::tmux::TmuxDomain>()
+                    .map(|tmux| tmux.inner.pending_kills.lock().contains_key(&pane_id))
+            })
+            .unwrap_or(false)
+        {
+            return Ok(());
+        }
+        if let Some(domain) = Mux::try_get()
+            .and_then(|mux| mux.get_domain(self.domain_id))
+            .and_then(|domain| {
+                domain
+                    .downcast_ref::<crate::tmux::TmuxDomain>()
+                    .map(|tmux| Arc::clone(&tmux.inner))
+            })
+        {
+            domain.retain_pending_commands(|command| command.resize_pane_id() != Some(pane_id));
+        }
+        let mut cmd_queue = self.cmd_queue.lock();
         cmd_queue.push_back(Box::new(Resize { size, pane_id }));
         TmuxDomainState::schedule_send_next_command(self.domain_id);
         Ok(())
@@ -250,9 +241,6 @@ mod tests {
         let active_lock = Arc::new((Mutex::new(false), Condvar::new()));
         let mut child = TmuxChild {
             active_lock: Arc::clone(&active_lock),
-            domain_id: 1,
-            pane_id: 1,
-            cmd_queue: Arc::new(Mutex::new(Default::default())),
         };
 
         assert!(child.try_wait().unwrap().is_none());

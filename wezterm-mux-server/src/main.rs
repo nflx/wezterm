@@ -359,7 +359,7 @@ async fn async_run(cmd: Option<CommandBuilder>) -> anyhow::Result<()> {
                 }
                 retry_delay = (retry_delay * 2).min(Duration::from_secs(10));
 
-                mux.remove_pane(old_pane_id);
+                mux.remove_pane_without_pruning(old_pane_id);
                 match mux
                     .default_domain()
                     .spawn(

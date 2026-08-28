@@ -23,6 +23,10 @@ pub(crate) trait TmuxCommand: Send + Debug {
     fn get_command(&self, domain_id: DomainId) -> String;
     fn process_result(&self, domain_id: DomainId, result: &Guarded) -> anyhow::Result<()>;
 
+    fn guarded_response_count(&self) -> usize {
+        1
+    }
+
     fn process_timeout(&self, domain_id: DomainId) -> anyhow::Result<()> {
         anyhow::bail!("tmux command timed out in domain {domain_id}: {self:?}")
     }
@@ -33,6 +37,14 @@ pub(crate) trait TmuxCommand: Send + Debug {
 
     fn is_full_window_snapshot(&self) -> bool {
         false
+    }
+
+    fn is_stale_for_killed_pane(&self, _pane_id: TmuxPaneId) -> bool {
+        false
+    }
+
+    fn select_pane_id(&self) -> Option<TmuxPaneId> {
+        None
     }
 }
 
@@ -583,7 +595,7 @@ impl TmuxDomainState {
             if let Some(tab) = mux.get_tab(tab_id) {
                 tab.remove_pane(local_pane_id);
             }
-            mux.remove_pane(local_pane_id);
+            mux.remove_pane_without_pruning(local_pane_id);
             self.remote_panes.lock().remove(&p);
             panes.remove(&p);
         }
@@ -666,9 +678,6 @@ impl TmuxDomainState {
 
         let child = TmuxChild {
             active_lock: active_lock.clone(),
-            domain_id: self.domain_id,
-            pane_id: pane.pane_id,
-            cmd_queue: self.cmd_queue.clone(),
         };
 
         let terminal = wezterm_term::Terminal::new(
@@ -1021,7 +1030,11 @@ impl TmuxDomainState {
                     *released.lock() = true;
                     condvar.notify_all();
                     drop(remote);
-                    mux.remove_pane(local_pane_id);
+                    mux.remove_pane_without_pruning(local_pane_id);
+                }
+                let completion = self.pending_kills.lock().remove(&removed.pane_id);
+                if let Some(mut completion) = completion {
+                    completion.ok(());
                 }
             }
             for (_, tab, _, active_local, _, _, _) in candidates {
@@ -1191,7 +1204,8 @@ impl TmuxDomainState {
             gui_window_id.notify();
 
             if new_window {
-                if let Some(mut pending) = self.pending_new_tabs.lock().pop_front() {
+                let pending = self.pending_new_tabs.lock().pop_front();
+                if let Some(mut pending) = pending {
                     pending.ok(Arc::clone(&tab));
                 }
             }
@@ -1259,7 +1273,8 @@ impl TmuxDomainState {
                 break;
             }
             self.pending_split_pane_ids.lock().pop_front();
-            if let Some(mut completion) = self.pending_splits.lock().pop_front() {
+            let completion = self.pending_splits.lock().pop_front();
+            if let Some(mut completion) = completion {
                 completion.ok(remote_id);
             }
         }
@@ -1302,11 +1317,20 @@ impl TmuxDomainState {
                         };
 
                         if let Some(pane_id) = tmux_pane_id {
-                            tmux_domain
+                            if tmux_domain
                                 .inner
-                                .cmd_queue
+                                .pending_kills
                                 .lock()
-                                .push_back(Box::new(SelectPane { pane_id: pane_id }));
+                                .contains_key(&pane_id)
+                            {
+                                return;
+                            }
+                            tmux_domain.inner.retain_pending_commands(|command| {
+                                command.select_pane_id() != Some(pane_id)
+                            });
+                            let mut queue = tmux_domain.inner.cmd_queue.lock();
+                            queue.push_back(Box::new(SelectPane { pane_id }));
+                            drop(queue);
                             TmuxDomainState::schedule_send_next_command(domain_id);
                         }
                     }
@@ -1605,9 +1629,24 @@ pub(crate) struct Resize {
     pub size: PtySize,
 }
 
+fn resize_command(window_command: String, pane_id: TmuxPaneId, size: PtySize) -> String {
+    format!(
+        "{window_command} ; resize-pane -x {} -y {} -t %{pane_id}\n",
+        size.cols, size.rows
+    )
+}
+
 impl TmuxCommand for Resize {
+    fn guarded_response_count(&self) -> usize {
+        2
+    }
+
     fn resize_pane_id(&self) -> Option<TmuxPaneId> {
         Some(self.pane_id)
+    }
+
+    fn is_stale_for_killed_pane(&self, pane_id: TmuxPaneId) -> bool {
+        self.pane_id == pane_id
     }
 
     fn get_command(&self, domain_id: DomainId) -> String {
@@ -1662,20 +1701,26 @@ impl TmuxCommand for Resize {
         let support_commands = tmux_domain.inner.support_commands.lock();
 
         if let Some(_x) = support_commands.get("resize-window") {
-            format!(
-                "resize-window -x {} -y {} -t @{}\nresize-pane -x {} -y {} -t %{}\n",
-                size.cols, size.rows, tmux_window_id, self.size.cols, self.size.rows, self.pane_id
+            resize_command(
+                format!(
+                    "resize-window -x {} -y {} -t @{}",
+                    size.cols, size.rows, tmux_window_id
+                ),
+                self.pane_id,
+                self.size,
             )
         } else if let Some(x) = support_commands.get("refresh-client") {
             if x.contains("-C XxY") {
-                format!(
-                    "refresh-client -C {}x{}\nresize-pane -x {} -y {} -t %{}\n",
-                    size.cols, size.rows, self.size.cols, self.size.rows, self.pane_id
+                resize_command(
+                    format!("refresh-client -C {}x{}", size.cols, size.rows),
+                    self.pane_id,
+                    self.size,
                 )
             } else {
-                format!(
-                    "refresh-client -C {},{}\nresize-pane -x {} -y {} -t %{}\n",
-                    size.cols, size.rows, self.size.cols, self.size.rows, self.pane_id
+                resize_command(
+                    format!("refresh-client -C {},{}", size.cols, size.rows),
+                    self.pane_id,
+                    self.size,
                 )
             }
         } else {
@@ -1780,7 +1825,8 @@ impl TmuxCommand for NewWindow {
         if result.error {
             if let Some(domain) = Mux::get().get_domain(domain_id) {
                 if let Some(tmux) = domain.downcast_ref::<TmuxDomain>() {
-                    if let Some(mut pending) = tmux.inner.pending_new_tabs.lock().pop_front() {
+                    let pending = tmux.inner.pending_new_tabs.lock().pop_front();
+                    if let Some(mut pending) = pending {
                         pending.err(anyhow!("tmux rejected new-window"));
                     }
                 }
@@ -1795,7 +1841,8 @@ impl TmuxCommand for NewWindow {
     fn process_timeout(&self, domain_id: DomainId) -> anyhow::Result<()> {
         if let Some(domain) = Mux::get().get_domain(domain_id) {
             if let Some(tmux) = domain.downcast_ref::<TmuxDomain>() {
-                if let Some(mut pending) = tmux.inner.pending_new_tabs.lock().pop_front() {
+                let pending = tmux.inner.pending_new_tabs.lock().pop_front();
+                if let Some(mut pending) = pending {
                     pending.err(anyhow!("tmux new-window timed out"));
                 }
             }
@@ -1885,10 +1932,47 @@ impl TmuxCommand for KillPane {
     }
 
     fn process_result(&self, domain_id: DomainId, result: &Guarded) -> anyhow::Result<()> {
-        if result.error {
+        let already_absent = result.error
+            && (result.output.contains("can't find pane")
+                || result.output.contains("no such pane"));
+        if result.error && !already_absent {
+            if let Some(domain) = Mux::get().get_domain(domain_id) {
+                if let Some(tmux) = domain.downcast_ref::<TmuxDomain>() {
+                    let completion = tmux.inner.pending_kills.lock().remove(&self.pane_id);
+                    if let Some(mut completion) = completion {
+                        completion.err(anyhow!("tmux rejected kill-pane"));
+                    }
+                }
+            }
             anyhow::bail!("kill-pane in domain={domain_id} failed: {result:#?}");
         }
+        if let Some(domain) = Mux::get().get_domain(domain_id) {
+            if let Some(tmux) = domain.downcast_ref::<TmuxDomain>() {
+                if let Some(session_id) = *tmux.inner.tmux_session.lock() {
+                    tmux.inner
+                        .cmd_queue
+                        .lock()
+                        .push_back(Box::new(ListAllWindows {
+                            session_id,
+                            window_id: None,
+                        }));
+                    TmuxDomainState::schedule_send_next_command(domain_id);
+                }
+            }
+        }
         Ok(())
+    }
+
+    fn process_timeout(&self, domain_id: DomainId) -> anyhow::Result<()> {
+        if let Some(domain) = Mux::get().get_domain(domain_id) {
+            if let Some(tmux) = domain.downcast_ref::<TmuxDomain>() {
+                let completion = tmux.inner.pending_kills.lock().remove(&self.pane_id);
+                if let Some(mut completion) = completion {
+                    completion.err(anyhow!("tmux kill-pane timed out"));
+                }
+            }
+        }
+        anyhow::bail!("kill-pane timed out in domain {domain_id}")
     }
 }
 
@@ -1952,9 +2036,15 @@ impl TmuxCommand for JoinPane {
 impl TmuxCommand for SplitPane {
     fn get_command(&self, _domain_id: DomainId) -> String {
         if self.direction == SplitDirection::Horizontal {
-            format!("split-window -h -t %{}\n", self.pane_id)
+            format!(
+                "split-window -h -P -F '#{{pane_id}}' -t %{}\n",
+                self.pane_id
+            )
         } else {
-            format!("split-window -v -t %{}\n", self.pane_id)
+            format!(
+                "split-window -v -P -F '#{{pane_id}}' -t %{}\n",
+                self.pane_id
+            )
         }
     }
 
@@ -1962,7 +2052,8 @@ impl TmuxCommand for SplitPane {
         if result.error {
             if let Some(domain) = Mux::get().get_domain(domain_id) {
                 if let Some(tmux) = domain.downcast_ref::<TmuxDomain>() {
-                    if let Some(mut pending) = tmux.inner.pending_splits.lock().pop_front() {
+                    let pending = tmux.inner.pending_splits.lock().pop_front();
+                    if let Some(mut pending) = pending {
                         pending.err(anyhow!("tmux rejected split-window"));
                     }
                     tmux.inner.pending_split_pane_ids.lock().pop_front();
@@ -1972,13 +2063,39 @@ impl TmuxCommand for SplitPane {
             log::error!("{error}");
             anyhow::bail!("{error}");
         }
+        let remote_id = parse_sigil_number(result.output.trim())
+            .context("split-window did not return the new pane id")?;
+        if let Some(domain) = Mux::get().get_domain(domain_id) {
+            if let Some(tmux) = domain.downcast_ref::<TmuxDomain>() {
+                let mut pending_ids = tmux.inner.pending_split_pane_ids.lock();
+                if !pending_ids.contains(&remote_id) {
+                    pending_ids.push_back(remote_id);
+                }
+                drop(pending_ids);
+                if let Some(session_id) = *tmux.inner.tmux_session.lock() {
+                    let mut queue = tmux.inner.cmd_queue.lock();
+                    if !queue
+                        .iter()
+                        .any(|command| command.is_full_window_snapshot())
+                    {
+                        queue.push_back(Box::new(ListAllWindows {
+                            session_id,
+                            window_id: None,
+                        }));
+                    }
+                    drop(queue);
+                    TmuxDomainState::schedule_send_next_command(domain_id);
+                }
+            }
+        }
         Ok(())
     }
 
     fn process_timeout(&self, domain_id: DomainId) -> anyhow::Result<()> {
         if let Some(domain) = Mux::get().get_domain(domain_id) {
             if let Some(tmux) = domain.downcast_ref::<TmuxDomain>() {
-                if let Some(mut pending) = tmux.inner.pending_splits.lock().pop_front() {
+                let pending = tmux.inner.pending_splits.lock().pop_front();
+                if let Some(mut pending) = pending {
                     pending.err(anyhow!("tmux split-window timed out"));
                 }
                 tmux.inner.pending_split_pane_ids.lock().pop_front();
@@ -2038,6 +2155,14 @@ pub(crate) struct SelectPane {
 }
 
 impl TmuxCommand for SelectPane {
+    fn select_pane_id(&self) -> Option<TmuxPaneId> {
+        Some(self.pane_id)
+    }
+
+    fn is_stale_for_killed_pane(&self, pane_id: TmuxPaneId) -> bool {
+        self.pane_id == pane_id
+    }
+
     fn get_command(&self, _domain_id: DomainId) -> String {
         format!("select-pane -t %{}\n", self.pane_id)
     }
@@ -2088,6 +2213,45 @@ impl TmuxCommand for AttachDone {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn resize_is_one_transport_write_with_two_guarded_responses() {
+        let command = resize_command(
+            "resize-window -x 80 -y 24 -t @3".to_string(),
+            7,
+            PtySize {
+                rows: 12,
+                cols: 39,
+                pixel_width: 0,
+                pixel_height: 0,
+            },
+        );
+        assert_eq!(
+            "resize-window -x 80 -y 24 -t @3 ; resize-pane -x 39 -y 12 -t %7\n",
+            command
+        );
+        assert_eq!(1, command.lines().count());
+        let resize = Resize {
+            pane_id: 7,
+            size: PtySize {
+                rows: 12,
+                cols: 39,
+                pixel_width: 0,
+                pixel_height: 0,
+            },
+        };
+        assert_eq!(2, resize.guarded_response_count());
+    }
+
+    #[test]
+    fn split_requests_stable_remote_pane_id() {
+        let command = SplitPane {
+            pane_id: 7,
+            direction: SplitDirection::Horizontal,
+        }
+        .get_command(0);
+        assert_eq!("split-window -h -P -F '#{pane_id}' -t %7\n", command);
+    }
 
     #[test]
     fn join_pane_encodes_drop_edge() {

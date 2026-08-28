@@ -14,7 +14,7 @@ use parking_lot::{Condvar, Mutex};
 use portable_pty::CommandBuilder;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use termwiz::tmux_cc::*;
@@ -67,6 +67,19 @@ pub(crate) struct TmuxTab {
 }
 
 pub(crate) type TmuxCmdQueue = VecDeque<Box<dyn TmuxCommand>>;
+
+fn retain_unsent_commands(
+    queue: &mut TmuxCmdQueue,
+    command_in_flight: bool,
+    mut retain: impl FnMut(&Box<dyn TmuxCommand>) -> bool,
+) {
+    let in_flight = command_in_flight.then(|| queue.pop_front()).flatten();
+    queue.retain(|command| retain(command));
+    if let Some(command) = in_flight {
+        queue.push_front(command);
+    }
+}
+
 pub(crate) struct TmuxDomainState {
     pub pane_id: Mutex<PaneId>, // ID of the control transport pane
     pub domain_id: DomainId,    // ID of TmuxDomain
@@ -75,6 +88,7 @@ pub(crate) struct TmuxDomainState {
     pub(crate) connection_state: Mutex<crate::tab::TmuxConnectionState>,
     next_operation_id: AtomicU64,
     in_flight_operation_id: AtomicU64,
+    in_flight_responses_remaining: AtomicUsize,
     retry_requested: AtomicBool,
     pub cmd_queue: Arc<Mutex<TmuxCmdQueue>>,
     pub gui_window: Mutex<Option<MuxWindowBuilder>>,
@@ -86,6 +100,7 @@ pub(crate) struct TmuxDomainState {
     pub(crate) pending_splits: Mutex<VecDeque<promise::Promise<TmuxPaneId>>>,
     pub(crate) pending_split_pane_ids: Mutex<VecDeque<TmuxPaneId>>,
     pub(crate) pending_new_tabs: Mutex<VecDeque<promise::Promise<Arc<Tab>>>>,
+    pub(crate) pending_kills: Mutex<HashMap<TmuxPaneId, promise::Promise<()>>>,
     pending_reposition_windows: Mutex<HashSet<TmuxWindowId>>,
     pub backlog: Mutex<HashMap<TmuxPaneId, Vec<u8>>>,
 }
@@ -95,6 +110,15 @@ pub struct TmuxDomain {
 }
 
 impl TmuxDomainState {
+    pub(crate) fn retain_pending_commands(
+        &self,
+        mut retain: impl FnMut(&Box<dyn TmuxCommand>) -> bool,
+    ) {
+        let waiting = self.in_flight_operation_id.load(Ordering::Acquire) != 0;
+        let mut queue = self.cmd_queue.lock();
+        retain_unsent_commands(&mut queue, waiting, |command| retain(command));
+    }
+
     pub fn advance(&self, events: Box<Vec<Event>>) {
         for event in events.iter() {
             let state = *self.state.lock();
@@ -107,16 +131,24 @@ impl TmuxDomainState {
                         *self.connection_state.lock() = crate::tab::TmuxConnectionState::Syncing;
                     }
                     State::WaitingForResponse => {
+                        if self
+                            .in_flight_responses_remaining
+                            .fetch_sub(1, Ordering::AcqRel)
+                            > 1
+                        {
+                            continue;
+                        }
                         self.in_flight_operation_id.store(0, Ordering::Release);
-                        let mut cmd_queue = self.cmd_queue.as_ref().lock();
-                        if let Some(cmd) = cmd_queue.pop_front() {
+                        let cmd = self.cmd_queue.as_ref().lock().pop_front();
+                        *self.state.lock() = State::Idle;
+                        if let Some(cmd) = cmd {
                             let domain_id = self.domain_id;
-                            *self.state.lock() = State::Idle;
-                            let resp = response.clone();
+                            let response = response.clone();
                             promise::spawn::spawn_into_main_thread(async move {
-                                if let Err(err) = cmd.process_result(domain_id, &resp) {
+                                if let Err(err) = cmd.process_result(domain_id, &response) {
                                     log::error!("Tmux processing command result error: {}", err);
                                 }
+                                TmuxDomainState::schedule_send_next_command(domain_id);
                             })
                             .detach();
                         }
@@ -133,6 +165,8 @@ impl TmuxDomainState {
                 Event::Exit { reason: _ } => {
                     *self.state.lock() = State::Exit;
                     *self.connection_state.lock() = crate::tab::TmuxConnectionState::Disconnected;
+                    self.in_flight_responses_remaining
+                        .store(0, Ordering::Release);
                     if !self.managed {
                         let mut pane_map = self.remote_panes.lock();
                         for (_, v) in pane_map.iter_mut() {
@@ -145,6 +179,11 @@ impl TmuxDomainState {
                     }
                     let mut cmd_queue = self.cmd_queue.as_ref().lock();
                     cmd_queue.clear();
+                    drop(cmd_queue);
+                    let pending: Vec<_> = self.pending_kills.lock().drain().collect();
+                    for (_, mut completion) in pending {
+                        completion.err(anyhow::anyhow!("tmux control transport disconnected"));
+                    }
 
                     // Force to quit the tmux mode
                     let pane_id = *self.pane_id.lock();
@@ -227,11 +266,6 @@ impl TmuxDomainState {
                     // Split pane
                     if !self.check_pane_attached(*window, *pane) {
                         if !self.pending_splits.lock().is_empty() {
-                            let mut pending_ids = self.pending_split_pane_ids.lock();
-                            if !pending_ids.contains(pane) {
-                                pending_ids.push_back(*pane);
-                            }
-                            drop(pending_ids);
                             if let Some(session_id) = *self.tmux_session.lock() {
                                 let mut cmd_queue = self.cmd_queue.lock();
                                 if !cmd_queue
@@ -268,8 +302,9 @@ impl TmuxDomainState {
         }
 
         // send pending commands to tmux
-        let cmd_queue = self.cmd_queue.as_ref().lock();
-        if *self.state.lock() == State::Idle && !cmd_queue.is_empty() {
+        let idle = *self.state.lock() == State::Idle;
+        let has_pending_commands = !self.cmd_queue.lock().is_empty();
+        if idle && has_pending_commands {
             TmuxDomainState::schedule_send_next_command(self.domain_id);
         }
     }
@@ -288,6 +323,8 @@ impl TmuxDomainState {
                 continue;
             }
             log::debug!("sending cmd {:?}", cmd);
+            self.in_flight_responses_remaining
+                .store(first.guarded_response_count(), Ordering::Release);
             let mux = Mux::get();
             if let Some(pane) = mux.get_pane(*self.pane_id.lock()) {
                 let mut writer = pane.writer();
@@ -329,12 +366,22 @@ impl TmuxDomainState {
         }
         *self.state.lock() = State::Exit;
         *self.connection_state.lock() = crate::tab::TmuxConnectionState::Disconnected;
+        self.in_flight_responses_remaining
+            .store(0, Ordering::Release);
         if let Some(command) = self.cmd_queue.lock().pop_front() {
+            log::error!("tmux operation {operation_id} timed out: {command:?}");
             if let Err(err) = command.process_timeout(self.domain_id) {
                 log::error!("{err:#}");
             }
         }
         self.cmd_queue.lock().clear();
+        let pending: Vec<_> = self.pending_kills.lock().drain().collect();
+        for (_, mut completion) in pending {
+            completion.err(anyhow::anyhow!("tmux command actor timed out"));
+        }
+        if let Some(transport) = Mux::get().get_pane(*self.pane_id.lock()) {
+            transport.kill();
+        }
     }
 
     /// schedule a `send_next_command` into main thread
@@ -508,6 +555,48 @@ impl TmuxDomainState {
     }
 }
 
+#[cfg(test)]
+mod command_queue_tests {
+    use super::*;
+    use termwiz::tmux_cc::Guarded;
+
+    #[derive(Debug)]
+    struct TestCommand(u64);
+
+    impl TmuxCommand for TestCommand {
+        fn get_command(&self, _domain_id: DomainId) -> String {
+            self.0.to_string()
+        }
+
+        fn process_result(&self, _domain_id: DomainId, _result: &Guarded) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn resize_pane_id(&self) -> Option<TmuxPaneId> {
+            Some(self.0)
+        }
+    }
+
+    #[test]
+    fn coalescing_never_removes_the_in_flight_command() {
+        let mut queue: TmuxCmdQueue = VecDeque::from([
+            Box::new(TestCommand(1)) as Box<dyn TmuxCommand>,
+            Box::new(TestCommand(1)),
+            Box::new(TestCommand(2)),
+        ]);
+
+        retain_unsent_commands(&mut queue, true, |command| {
+            command.resize_pane_id() != Some(1)
+        });
+
+        let pane_ids: Vec<_> = queue
+            .iter()
+            .map(|command| command.resize_pane_id().unwrap())
+            .collect();
+        assert_eq!(pane_ids, vec![1, 2]);
+    }
+}
+
 impl TmuxDomain {
     pub fn new(pane_id: PaneId) -> Self {
         let domain_id = alloc_domain_id();
@@ -521,6 +610,7 @@ impl TmuxDomain {
             connection_state: Mutex::new(crate::tab::TmuxConnectionState::Connecting),
             next_operation_id: AtomicU64::new(0),
             in_flight_operation_id: AtomicU64::new(0),
+            in_flight_responses_remaining: AtomicUsize::new(0),
             retry_requested: AtomicBool::new(false),
             cmd_queue: Arc::new(Mutex::new(cmd_queue)),
             gui_window: Mutex::new(None),
@@ -532,6 +622,7 @@ impl TmuxDomain {
             pending_splits: Mutex::new(VecDeque::default()),
             pending_split_pane_ids: Mutex::new(VecDeque::default()),
             pending_new_tabs: Mutex::new(VecDeque::default()),
+            pending_kills: Mutex::new(HashMap::default()),
             pending_reposition_windows: Mutex::new(HashSet::default()),
             backlog: Mutex::new(HashMap::default()),
         });
@@ -559,7 +650,14 @@ impl TmuxDomain {
         self.inner
             .in_flight_operation_id
             .store(0, Ordering::Release);
+        self.inner
+            .in_flight_responses_remaining
+            .store(0, Ordering::Release);
         self.inner.cmd_queue.lock().clear();
+        let pending: Vec<_> = self.inner.pending_kills.lock().drain().collect();
+        for (_, mut completion) in pending {
+            completion.err(anyhow::anyhow!("tmux control transport reconnected"));
+        }
     }
 
     pub(crate) fn transport_disconnected(&self) {
@@ -567,6 +665,9 @@ impl TmuxDomain {
         *self.inner.connection_state.lock() = crate::tab::TmuxConnectionState::Disconnected;
         self.inner
             .in_flight_operation_id
+            .store(0, Ordering::Release);
+        self.inner
+            .in_flight_responses_remaining
             .store(0, Ordering::Release);
     }
 
@@ -614,6 +715,45 @@ impl TmuxDomain {
             .push_back(Box::new(KillWindow { window_id }));
         TmuxDomainState::schedule_send_next_command(self.inner.domain_id);
         Ok(())
+    }
+
+    pub async fn kill_pane(&self, local_pane_id: PaneId) -> anyhow::Result<()> {
+        log::info!("tmux transactional close requested for local pane {local_pane_id}");
+        if self.connection_state() != crate::tab::TmuxConnectionState::Connected {
+            anyhow::bail!("tmux control connection is not ready");
+        }
+        let remote_pane_id = {
+            self.inner
+                .remote_panes
+                .lock()
+                .iter()
+                .find_map(|(remote_id, pane)| {
+                    (pane.lock().local_pane_id == local_pane_id).then_some(*remote_id)
+                })
+                .ok_or_else(|| anyhow::anyhow!("no tmux pane for local pane {local_pane_id}"))?
+        };
+        log::info!(
+            "tmux transactional close mapped local pane {local_pane_id} to %{remote_pane_id}"
+        );
+        let mut completion = promise::Promise::new();
+        let future = completion
+            .get_future()
+            .ok_or_else(|| anyhow::anyhow!("failed to create tmux kill completion"))?;
+        self.inner
+            .pending_kills
+            .lock()
+            .insert(remote_pane_id, completion);
+        self.inner
+            .retain_pending_commands(|command| !command.is_stale_for_killed_pane(remote_pane_id));
+        {
+            let mut queue = self.inner.cmd_queue.lock();
+            queue.push_back(Box::new(crate::tmux_commands::KillPane {
+                pane_id: remote_pane_id,
+            }));
+        }
+        log::info!("tmux transactional close queued kill-pane %{remote_pane_id}");
+        TmuxDomainState::schedule_send_next_command(self.inner.domain_id);
+        future.await
     }
 }
 

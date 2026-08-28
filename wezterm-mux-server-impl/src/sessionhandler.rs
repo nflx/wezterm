@@ -569,19 +569,26 @@ impl SessionHandler {
                 let sender = self.to_write_tx.clone();
                 let per_pane = self.per_pane(pane_id);
                 spawn_into_main_thread(async move {
-                    catch(
-                        move || {
-                            let mux = Mux::get();
-                            let pane = mux
-                                .get_pane(pane_id)
-                                .ok_or_else(|| anyhow!("no such pane {}", pane_id))?;
+                    let result = async {
+                        let mux = Mux::get();
+                        let pane = mux
+                            .get_pane(pane_id)
+                            .ok_or_else(|| anyhow!("no such pane {}", pane_id))?;
+                        let domain = mux.get_domain(pane.domain_id());
+                        if let Some(tmux) = domain
+                            .as_ref()
+                            .and_then(|domain| domain.downcast_ref::<mux::tmux::TmuxDomain>())
+                        {
+                            tmux.kill_pane(pane_id).await?;
+                        } else {
                             pane.kill();
                             mux.remove_pane(pane_id);
                             maybe_push_pane_changes(&pane, sender, per_pane)?;
-                            Ok(Pdu::UnitResponse(UnitResponse {}))
-                        },
-                        send_response,
-                    );
+                        }
+                        Ok(Pdu::UnitResponse(UnitResponse {}))
+                    }
+                    .await;
+                    send_response(result);
                 })
                 .detach();
             }

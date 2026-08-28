@@ -903,6 +903,22 @@ impl Mux {
         self.prune_dead_windows();
     }
 
+    /// Deregister a domain-owned pane without ordinary dead-tab/window
+    /// pruning. The domain is responsible for reconciling its durable tabs and
+    /// windows explicitly.
+    pub fn remove_pane_without_pruning(&self, pane_id: PaneId) {
+        let transport_tab_id = self.resolve_pane_id(pane_id).map(|(_, _, tab_id)| tab_id);
+        self.remove_pane_internal(pane_id);
+        if let Some(tab_id) = transport_tab_id {
+            if self
+                .get_tab(tab_id)
+                .is_some_and(|tab| tab.iter_panes_ignoring_zoom().is_empty())
+            {
+                self.remove_tab_internal(tab_id);
+            }
+        }
+    }
+
     pub fn remove_tab(&self, tab_id: TabId) -> Option<Arc<Tab>> {
         let tab = self.remove_tab_internal(tab_id);
         self.prune_dead_windows();
