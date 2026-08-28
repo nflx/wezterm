@@ -121,7 +121,7 @@ fn retain_unsent_commands(
 pub(crate) struct TmuxDomainState {
     pub pane_id: Mutex<PaneId>, // ID of the control transport pane
     pub domain_id: DomainId,    // ID of TmuxDomain
-    managed: bool,
+    pub(crate) managed: bool,
     state: Mutex<State>,
     pub(crate) connection_state: Mutex<crate::tab::TmuxConnectionState>,
     next_operation_id: AtomicU64,

@@ -840,17 +840,38 @@ impl TmuxDomainState {
         };
         let mux = Mux::get();
 
-        let current_layouts = self
+        let current_layouts: HashMap<TmuxWindowId, LayoutNode> = self
             .gui_tabs
             .lock()
             .iter()
             .map(|(window_id, tab)| (*window_id, tab.layout_tree.clone()))
             .collect();
-        let snapshot_layouts = windows
+        let snapshot_layouts: HashMap<TmuxWindowId, LayoutNode> = windows
             .iter()
             .filter(|window| window.session_id == current_session)
             .map(|window| (window.window_id, window.layout_tree.clone()))
             .collect();
+        if should_ignore_empty_managed_snapshot(
+            self.managed,
+            current_layouts.len(),
+            snapshot_layouts.len(),
+        ) {
+            log::warn!(
+                "ignoring empty managed tmux snapshot for session ${current_session}; retaining {} attached windows and retrying",
+                current_layouts.len()
+            );
+            let mut queue = self.cmd_queue.lock();
+            if !queue
+                .iter()
+                .any(|command| command.is_full_window_snapshot())
+            {
+                queue.push_back(Box::new(ListAllWindows {
+                    session_id: current_session,
+                    window_id: None,
+                }));
+            }
+            return Ok(());
+        }
         let topology_plan = plan_topology_reconciliation(&current_layouts, &snapshot_layouts)?;
         log::debug!("tmux topology reconciliation plan: {topology_plan:#?}");
 
@@ -1571,6 +1592,14 @@ impl TmuxDomainState {
             true
         });
     }
+}
+
+fn should_ignore_empty_managed_snapshot(
+    managed: bool,
+    attached_windows: usize,
+    snapshot_windows: usize,
+) -> bool {
+    managed && attached_windows > 0 && snapshot_windows == 0
 }
 
 fn parse_sigil_number(text: &str) -> anyhow::Result<u64> {
@@ -2689,6 +2718,14 @@ impl TmuxCommand for AttachDone {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn managed_empty_snapshot_cannot_prune_attached_topology() {
+        assert!(should_ignore_empty_managed_snapshot(true, 1, 0));
+        assert!(!should_ignore_empty_managed_snapshot(false, 1, 0));
+        assert!(!should_ignore_empty_managed_snapshot(true, 0, 0));
+        assert!(!should_ignore_empty_managed_snapshot(true, 1, 1));
+    }
 
     #[test]
     fn resize_is_one_transport_write_with_two_guarded_responses() {
