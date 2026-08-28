@@ -360,7 +360,7 @@ async fn supervise_managed_tmux(
             }
             smol::Timer::after(Duration::from_millis(100)).await;
         }
-        retry_delay = (retry_delay * 2).min(Duration::from_secs(10));
+        retry_delay = next_tmux_retry_delay(retry_delay);
 
         mux.remove_pane_without_pruning(old_pane_id);
         match mux
@@ -390,6 +390,10 @@ async fn supervise_managed_tmux(
             }
         }
     }
+}
+
+fn next_tmux_retry_delay(current: Duration) -> Duration {
+    (current * 2).min(Duration::from_secs(10))
 }
 
 async fn async_run(cmd: Option<CommandBuilder>) -> anyhow::Result<()> {
@@ -476,6 +480,16 @@ async fn async_run(cmd: Option<CommandBuilder>) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn managed_tmux_retry_backoff_caps_at_ten_seconds() {
+        let mut delay = Duration::from_millis(250);
+        let expected = [500, 1_000, 2_000, 4_000, 8_000, 10_000, 10_000];
+        for expected_ms in expected {
+            delay = next_tmux_retry_delay(delay);
+            assert_eq!(delay, Duration::from_millis(expected_ms));
+        }
+    }
 
     #[test]
     fn managed_tmux_command_preserves_prefix_and_appends_control_args() {

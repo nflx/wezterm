@@ -370,7 +370,7 @@ In the table below, `DCS` can be either the 7-bit representation (`ESC P`) or th
 |DCS $ q r ST   | [DECRQSS](https://vt100.net/docs/vt510-rm/DECRQSS.html) for [DECSTBM](https://vt100.net/docs/vt510-rm/DECSTBM.html) | Request top and bottom margin report; Reports the margins |
 |DCS $ q s ST   | [DECRQSS](https://vt100.net/docs/vt510-rm/DECRQSS.html) for [DECSLRM](https://vt100.net/docs/vt510-rm/DECSLRM.html) | Request left and right margin report; Reports the margins |
 |DCS \[PARAMS\] q \[DATA\] ST | Sixel Graphic Data | Decodes [Sixel graphic data](https://vt100.net/docs/vt3xx-gp/chapter14.html) and apply the image to the terminal model. Support is preliminary and incomplete; see [this issue](https://github.com/wezterm/wezterm/issues/217) for status. |
-|DCS 1000 q | tmux control mode | Bridges tmux into the WezTerm multiplexer.  Currently incomplete, see [this issue](https://github.com/wezterm/wezterm/issues/336) for status. |
+|DCS 1000 q | tmux control mode | Bridges tmux into the WezTerm multiplexer. Manually launched control clients and [supervised persistent sessions](config/lua/config/tmux_control.md) are supported. |
 
 ### Operating System Command Sequences
 

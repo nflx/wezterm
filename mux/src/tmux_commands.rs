@@ -1749,6 +1749,63 @@ pub(crate) struct ListAllWindows {
     pub window_id: Option<TmuxWindowId>,
 }
 
+fn parse_window_snapshot(output: &str) -> anyhow::Result<Vec<WindowItem>> {
+    let mut items = vec![];
+    for line in output.split('\n') {
+        if line.is_empty() {
+            continue;
+        }
+        let mut fields = line.split('\x1f');
+        let session_id =
+            parse_sigil_number(fields.next().ok_or_else(|| anyhow!("missing session_id"))?)?;
+        let window_id =
+            parse_sigil_number(fields.next().ok_or_else(|| anyhow!("missing window_id"))?)?;
+        let window_width = fields
+            .next()
+            .ok_or_else(|| anyhow!("missing window_width"))?
+            .parse()?;
+        let window_height = fields
+            .next()
+            .ok_or_else(|| anyhow!("missing window_height"))?
+            .parse()?;
+        let window_active = fields
+            .next()
+            .ok_or_else(|| anyhow!("missing window_active"))?
+            .parse::<usize>()?
+            == 1;
+        let window_name = fields
+            .next()
+            .ok_or_else(|| anyhow!("missing window_name"))?;
+        let window_layout = fields
+            .next()
+            .ok_or_else(|| anyhow!("missing window_layout"))?;
+        let history_limit = fields
+            .next()
+            .ok_or_else(|| anyhow!("missing history_limit"))?
+            .parse::<isize>()?;
+        let layout_csum = window_layout
+            .get(0..4)
+            .ok_or_else(|| anyhow!("missing window_layout"))?;
+        let window_layout = window_layout
+            .get(5..)
+            .ok_or_else(|| anyhow!("missing window_layout"))?;
+
+        items.push(WindowItem {
+            session_id,
+            window_id,
+            window_width,
+            window_height,
+            window_active,
+            window_name: window_name.to_string(),
+            layout: parse_layout(window_layout)?,
+            layout_tree: parse_layout_tree(window_layout)?,
+            layout_csum: layout_csum.to_string(),
+            history_limit,
+        });
+    }
+    Ok(items)
+}
+
 impl TmuxCommand for ListAllWindows {
     fn is_full_window_snapshot(&self) -> bool {
         true
@@ -1773,68 +1830,7 @@ impl TmuxCommand for ListAllWindows {
             log::error!("{error}");
             anyhow::bail!("{error}");
         }
-        let mut items = vec![];
-
-        for line in result.output.split('\n') {
-            if line.is_empty() {
-                continue;
-            }
-            let mut fields = line.split('\x1f');
-            let session_id =
-                parse_sigil_number(fields.next().ok_or_else(|| anyhow!("missing session_id"))?)?;
-            let window_id =
-                parse_sigil_number(fields.next().ok_or_else(|| anyhow!("missing window_id"))?)?;
-            let window_width = fields
-                .next()
-                .ok_or_else(|| anyhow!("missing window_width"))?
-                .parse()?;
-            let window_height = fields
-                .next()
-                .ok_or_else(|| anyhow!("missing window_height"))?
-                .parse()?;
-            let window_active = fields
-                .next()
-                .ok_or_else(|| anyhow!("missing window_active"))?
-                .parse::<usize>()?;
-
-            let window_name = fields
-                .next()
-                .ok_or_else(|| anyhow!("missing window_name"))?;
-
-            let window_layout = fields
-                .next()
-                .ok_or_else(|| anyhow!("missing window_layout"))?;
-
-            let history_limit = fields
-                .next()
-                .ok_or_else(|| anyhow!("missing history_limit"))?
-                .parse::<isize>()?;
-
-            let window_active = window_active == 1;
-
-            let layout_csum = window_layout
-                .get(0..4)
-                .ok_or_else(|| anyhow!("missing window_layout"))?;
-            let window_layout = window_layout
-                .get(5..)
-                .ok_or_else(|| anyhow!("missing window_layout"))?;
-
-            let layout = parse_layout(window_layout)?;
-            let layout_tree = parse_layout_tree(window_layout)?;
-
-            items.push(WindowItem {
-                session_id,
-                window_id,
-                window_width,
-                window_height,
-                window_active,
-                window_name: window_name.to_string(),
-                layout,
-                layout_tree,
-                layout_csum: layout_csum.to_string(),
-                history_limit,
-            });
-        }
+        let items = parse_window_snapshot(&result.output)?;
 
         log::debug!("layout in domain_id {}: {:#?}", domain_id, items);
         let mux = Mux::get();
@@ -2761,6 +2757,22 @@ mod test {
         assert!(!should_ignore_empty_managed_snapshot(false, 1, 0));
         assert!(!should_ignore_empty_managed_snapshot(true, 0, 0));
         assert!(!should_ignore_empty_managed_snapshot(true, 1, 1));
+    }
+
+    #[test]
+    fn window_snapshot_delimiter_preserves_spaces_and_quotes_in_names() {
+        let items = parse_window_snapshot(
+            "$3\x1f@7\x1f80\x1f24\x1f1\x1fwork queue's \"snapshot\"\x1fabcd,80x24,0,0,11\x1f5000\n",
+        )
+        .unwrap();
+        assert_eq!(items.len(), 1);
+        let item = &items[0];
+        assert_eq!(item.session_id, 3);
+        assert_eq!(item.window_id, 7);
+        assert_eq!(item.window_name, "work queue's \"snapshot\"");
+        assert_eq!(item.layout_csum, "abcd");
+        assert!(item.window_active);
+        assert_eq!(item.history_limit, 5000);
     }
 
     #[test]
