@@ -244,6 +244,51 @@ fn collect_reusable_local_subtrees(
     Ok(topology)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct SplitPartition {
+    horizontal: bool,
+    left: Vec<TmuxPaneId>,
+    right: Vec<TmuxPaneId>,
+}
+
+fn collect_local_split_partitions(
+    tree: &Tree,
+    remote_by_local: &HashMap<PaneId, TmuxPaneId>,
+    partitions: &mut HashMap<SplitPartition, SplitDirectionAndSize>,
+) -> anyhow::Result<Vec<TmuxPaneId>> {
+    match tree {
+        Tree::Empty => Ok(vec![]),
+        Tree::Leaf(pane) => Ok(vec![*remote_by_local.get(&pane.pane_id()).ok_or_else(
+            || anyhow!("local tmux pane {} has no remote id", pane.pane_id()),
+        )?]),
+        Tree::Node { left, right, data } => {
+            let split = data.ok_or_else(|| anyhow!("local pane tree has unlabeled split"))?;
+            let mut left_ids = collect_local_split_partitions(left, remote_by_local, partitions)?;
+            let mut right_ids = collect_local_split_partitions(right, remote_by_local, partitions)?;
+            left_ids.sort_unstable();
+            right_ids.sort_unstable();
+            partitions.insert(
+                SplitPartition {
+                    horizontal: split.direction == SplitDirection::Horizontal,
+                    left: left_ids.clone(),
+                    right: right_ids.clone(),
+                },
+                split,
+            );
+            left_ids.extend(right_ids);
+            Ok(left_ids)
+        }
+    }
+}
+
+fn retained_layout_panes(layout: &LayoutNode, retained: &HashSet<TmuxPaneId>) -> Vec<TmuxPaneId> {
+    let mut panes = vec![];
+    layout.pane_ids(&mut panes);
+    panes.retain(|pane| retained.contains(pane));
+    panes.sort_unstable();
+    panes
+}
+
 fn project_local_tree(
     tree: &Tree,
     remote_by_local: &HashMap<PaneId, TmuxPaneId>,
@@ -349,6 +394,8 @@ fn build_snapshot_tree(
     layout: &LayoutNode,
     panes: &HashMap<TmuxPaneId, Arc<dyn Pane>>,
     reusable: &HashMap<LayoutTopology, Tree>,
+    partitions: &HashMap<SplitPartition, SplitDirectionAndSize>,
+    retained: &HashSet<TmuxPaneId>,
     size: TerminalSize,
 ) -> anyhow::Result<Tree> {
     let topology = layout.topology().normalized();
@@ -367,6 +414,8 @@ fn build_snapshot_tree(
             *geometry,
             panes,
             reusable,
+            partitions,
+            retained,
             size,
         ),
         LayoutNode::SplitVertical { geometry, children } => build_snapshot_split(
@@ -375,6 +424,8 @@ fn build_snapshot_tree(
             *geometry,
             panes,
             reusable,
+            partitions,
+            retained,
             size,
         ),
     }
@@ -386,6 +437,8 @@ fn build_snapshot_split(
     geometry: LayoutGeometry,
     panes: &HashMap<TmuxPaneId, Arc<dyn Pane>>,
     reusable: &HashMap<LayoutTopology, Tree>,
+    partitions: &HashMap<SplitPartition, SplitDirectionAndSize>,
+    retained: &HashSet<TmuxPaneId>,
     size: TerminalSize,
 ) -> anyhow::Result<Tree> {
     if children.len() < 2 {
@@ -395,9 +448,23 @@ fn build_snapshot_split(
     let remaining_geometry = union_layout_geometry(&children[1..])?;
     let first_size = terminal_size_for_geometry(first_geometry, geometry, size);
     let remaining_size = terminal_size_for_geometry(remaining_geometry, geometry, size);
-    let left = build_snapshot_tree(&children[0], panes, reusable, first_size)?;
+    let left = build_snapshot_tree(
+        &children[0],
+        panes,
+        reusable,
+        partitions,
+        retained,
+        first_size,
+    )?;
     let right = if children.len() == 2 {
-        build_snapshot_tree(&children[1], panes, reusable, remaining_size)?
+        build_snapshot_tree(
+            &children[1],
+            panes,
+            reusable,
+            partitions,
+            retained,
+            remaining_size,
+        )?
     } else {
         build_snapshot_split(
             &children[1..],
@@ -405,17 +472,25 @@ fn build_snapshot_split(
             remaining_geometry,
             panes,
             reusable,
+            partitions,
+            retained,
             remaining_size,
         )?
+    };
+    let partition = SplitPartition {
+        horizontal: direction == SplitDirection::Horizontal,
+        left: retained_layout_panes(&children[0], retained),
+        right: children[1..]
+            .iter()
+            .flat_map(|child| retained_layout_panes(child, retained))
+            .collect(),
     };
     Ok(Tree::Node {
         left: Box::new(left),
         right: Box::new(right),
-        data: Some(SplitDirectionAndSize::from_snapshot(
-            direction,
-            first_size,
-            remaining_size,
-        )),
+        data: Some(partitions.get(&partition).copied().unwrap_or_else(|| {
+            SplitDirectionAndSize::from_snapshot(direction, first_size, remaining_size)
+        })),
     })
 }
 
@@ -715,11 +790,19 @@ impl TmuxDomainState {
             .map(|(remote_id, pane)| (pane.lock().local_pane_id, *remote_id))
             .collect();
         let mut reusable_subtrees = HashMap::new();
+        let mut reusable_partitions = HashMap::new();
         for (window_id, attached) in self.gui_tabs.lock().iter() {
             let Some(tab) = mux.get_tab(attached.tab_id) else {
                 continue;
             };
             let mut local_subtrees = HashMap::new();
+            let mut local_partitions = HashMap::new();
+            collect_local_split_partitions(
+                &tab.snapshot_pane_tree(),
+                &remote_by_local,
+                &mut local_partitions,
+            )?;
+            reusable_partitions.insert(*window_id, local_partitions);
             collect_reusable_local_subtrees(
                 &tab.snapshot_pane_tree(),
                 &remote_by_local,
@@ -826,10 +909,17 @@ impl TmuxDomainState {
                             .then(|| (topology.clone(), clone_pane_tree(tree)))
                     })
                     .collect();
+                let partitions = reusable_partitions
+                    .get(&window.window_id)
+                    .cloned()
+                    .unwrap_or_default();
+                let retained: HashSet<_> = remote_by_local.values().copied().collect();
                 let tree = build_snapshot_tree(
                     &window.layout_tree,
                     &pane_objects,
                     &reusable,
+                    &partitions,
+                    &retained,
                     tab.get_size(),
                 )?;
                 let current_active = tab
