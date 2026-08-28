@@ -2043,10 +2043,28 @@ impl TmuxCommand for SendKeys {
 }
 
 #[derive(Debug)]
-pub(crate) struct NewWindow;
+pub(crate) struct NewWindow {
+    pub command: Option<Vec<String>>,
+    pub cwd: Option<String>,
+}
 impl TmuxCommand for NewWindow {
     fn get_command(&self, _domain_id: DomainId) -> String {
-        "new-window\n".to_owned()
+        let mut command = "new-window".to_owned();
+        if let Some(cwd) = &self.cwd {
+            write!(&mut command, " -c {}", shell_words::quote(cwd)).unwrap();
+        }
+        if let Some(argv) = &self.command {
+            if !argv.is_empty() {
+                let shell_command = argv
+                    .iter()
+                    .map(|arg| shell_words::quote(arg).into_owned())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                write!(&mut command, " {}", shell_words::quote(&shell_command)).unwrap();
+            }
+        }
+        command.push('\n');
+        command
     }
 
     fn process_result(&self, domain_id: DomainId, result: &Guarded) -> anyhow::Result<()> {
@@ -2725,6 +2743,28 @@ mod test {
         assert!(!should_ignore_empty_managed_snapshot(false, 1, 0));
         assert!(!should_ignore_empty_managed_snapshot(true, 0, 0));
         assert!(!should_ignore_empty_managed_snapshot(true, 1, 1));
+    }
+
+    #[test]
+    fn new_window_encodes_command_and_cwd_as_single_tmux_arguments() {
+        let encoded = NewWindow {
+            command: Some(vec![
+                "printf".to_string(),
+                "%s\\n".to_string(),
+                "hello world".to_string(),
+            ]),
+            cwd: Some("/tmp/work queue's".to_string()),
+        }
+        .get_command(0);
+        assert_eq!(
+            shell_words::split(encoded.trim()).unwrap(),
+            [
+                "new-window",
+                "-c",
+                "/tmp/work queue's",
+                "printf '%s\\n' 'hello world'"
+            ]
+        );
     }
 
     #[test]

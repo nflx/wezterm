@@ -408,11 +408,27 @@ impl TmuxDomainState {
                         }
                     }
                 }
-                Event::UnlinkedWindowClose { window } => {
-                    if self.pending_reposition_windows.lock().contains(window) {
-                        continue;
+                Event::UnlinkedWindowClose { window: _ } => {
+                    // Like WindowClose, this notification can arrive before we
+                    // have authoritative information about where the panes in
+                    // the unlinked window went.  In particular, killing the
+                    // final pane in a window emits this event; eagerly removing
+                    // the local tab here prevents the complete snapshot from
+                    // observing the removed pane and completing its pending
+                    // kill operation.  Always defer removal and ownership
+                    // changes to the atomic snapshot reconciler.
+                    if let Some(session_id) = *self.tmux_session.lock() {
+                        let mut queue = self.cmd_queue.lock();
+                        if !queue
+                            .iter()
+                            .any(|command| command.is_full_window_snapshot())
+                        {
+                            queue.push_front(Box::new(ListAllWindows {
+                                session_id,
+                                window_id: None,
+                            }));
+                        }
                     }
-                    let _ = self.remove_detached_window(*window);
                 }
                 _ => {}
             }
@@ -582,10 +598,48 @@ impl TmuxDomainState {
     }
 
     /// create a tmux window
-    pub fn create_tmux_window(&self) {
+    pub fn create_tmux_window(&self, command: Option<Vec<String>>, cwd: Option<String>) {
         let mut cmd_queue = self.cmd_queue.as_ref().lock();
-        cmd_queue.push_back(Box::new(NewWindow));
+        cmd_queue.push_back(Box::new(NewWindow { command, cwd }));
         TmuxDomainState::schedule_send_next_command(self.domain_id);
+    }
+
+    async fn spawn_tmux_window(
+        &self,
+        command: Option<CommandBuilder>,
+        command_dir: Option<String>,
+    ) -> anyhow::Result<Arc<Tab>> {
+        self.ensure_connected()?;
+        let builder_cwd = command
+            .as_ref()
+            .and_then(|command| command.get_cwd())
+            .map(|cwd| {
+                cwd.to_str()
+                    .map(ToOwned::to_owned)
+                    .ok_or_else(|| anyhow::anyhow!("tmux cwd contains non-UTF-8 data"))
+            })
+            .transpose()?;
+        let command = command
+            .map(|command| {
+                command
+                    .get_argv()
+                    .iter()
+                    .map(|arg| {
+                        arg.to_str()
+                            .map(ToOwned::to_owned)
+                            .ok_or_else(|| anyhow::anyhow!("tmux command contains non-UTF-8 data"))
+                    })
+                    .collect::<anyhow::Result<Vec<_>>>()
+            })
+            .transpose()?;
+        let cwd = command_dir.or(builder_cwd);
+        let mut completion = promise::Promise::new();
+        let future = completion
+            .get_future()
+            .ok_or_else(|| anyhow::anyhow!("failed to create tmux new-window completion"))?;
+        self.pending_new_tabs.lock().push_back(completion);
+        self.create_tmux_window(command, cwd);
+        future.await
     }
 
     /// split the tmux pane
@@ -1047,18 +1101,11 @@ impl Domain for TmuxDomain {
     async fn spawn(
         &self,
         _size: TerminalSize,
-        _command: Option<CommandBuilder>,
-        _command_dir: Option<String>,
+        command: Option<CommandBuilder>,
+        command_dir: Option<String>,
         _window: WindowId,
     ) -> anyhow::Result<Arc<Tab>> {
-        self.ensure_connected()?;
-        let mut completion = promise::Promise::new();
-        let future = completion
-            .get_future()
-            .ok_or_else(|| anyhow::anyhow!("failed to create tmux new-window completion"))?;
-        self.inner.pending_new_tabs.lock().push_back(completion);
-        self.inner.create_tmux_window();
-        future.await
+        self.inner.spawn_tmux_window(command, command_dir).await
     }
 
     async fn split_pane(
@@ -1108,10 +1155,14 @@ impl Domain for TmuxDomain {
     async fn spawn_pane(
         &self,
         _size: TerminalSize,
-        _command: Option<CommandBuilder>,
-        _command_dir: Option<String>,
+        command: Option<CommandBuilder>,
+        command_dir: Option<String>,
     ) -> anyhow::Result<Arc<dyn Pane>> {
-        anyhow::bail!("Spawn_pane not yet implemented for TmuxDomain");
+        self.inner
+            .spawn_tmux_window(command, command_dir)
+            .await?
+            .get_active_pane()
+            .ok_or_else(|| anyhow::anyhow!("reconciled tmux window has no active pane"))
     }
 
     async fn move_pane_to_new_tab(
