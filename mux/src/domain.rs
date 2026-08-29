@@ -71,6 +71,21 @@ pub trait Domain: Downcast + Send + Sync {
         Ok(tab)
     }
 
+    /// Spawn while preserving the selector and source-pane context that chose
+    /// this domain. Remote client domains need this to resolve
+    /// `CurrentPaneDomain` again on the server that owns the real pane.
+    async fn spawn_with_context(
+        &self,
+        size: TerminalSize,
+        command: Option<CommandBuilder>,
+        command_dir: Option<String>,
+        window: WindowId,
+        _requested_domain: config::keyassignment::SpawnTabDomain,
+        _current_pane_id: Option<PaneId>,
+    ) -> anyhow::Result<Arc<Tab>> {
+        self.spawn(size, command, command_dir, window).await
+    }
+
     async fn split_pane(
         &self,
         source: SplitSource,

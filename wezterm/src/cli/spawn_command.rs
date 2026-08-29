@@ -103,6 +103,7 @@ impl SpawnCommand {
                     .map_or(SpawnTabDomain::DefaultDomain, |name| {
                         SpawnTabDomain::DomainName(name)
                     }),
+                current_pane_id: None,
                 window_id,
                 command: if self.prog.is_empty() {
                     None

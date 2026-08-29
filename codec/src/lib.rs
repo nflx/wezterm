@@ -441,7 +441,7 @@ macro_rules! pdu {
 /// The overall version of the codec.
 /// This must be bumped when backwards incompatible changes
 /// are made to the types and protocol.
-pub const CODEC_VERSION: usize = 52;
+pub const CODEC_VERSION: usize = 53;
 
 // Defines the Pdu enum.
 // Each struct has an explicit identifying number.
@@ -691,6 +691,8 @@ pub struct MovePaneToNewTabResponse {
 #[derive(Deserialize, Serialize, PartialEq, Debug)]
 pub struct SpawnV2 {
     pub domain: config::keyassignment::SpawnTabDomain,
+    /// The active pane that supplied `CurrentPaneDomain`, when available.
+    pub current_pane_id: Option<PaneId>,
     /// If None, create a new window for this new tab
     pub window_id: Option<WindowId>,
     pub command: Option<CommandBuilder>,
@@ -1340,6 +1342,22 @@ mod test {
             assert_eq!(frame.ident, expected_ident);
             assert_eq!(Pdu::decode(encoded.as_slice()).unwrap().pdu, pdu);
         }
+    }
+
+    #[test]
+    fn spawn_v2_round_trips_current_pane_domain_context() {
+        let request = Pdu::SpawnV2(SpawnV2 {
+            domain: config::keyassignment::SpawnTabDomain::CurrentPaneDomain,
+            current_pane_id: Some(42),
+            window_id: Some(7),
+            command: None,
+            command_dir: None,
+            size: TerminalSize::default(),
+            workspace: "default".to_string(),
+        });
+        let mut encoded = vec![];
+        request.encode(&mut encoded, 12).unwrap();
+        assert_eq!(Pdu::decode(encoded.as_slice()).unwrap().pdu, request);
     }
 
     #[test]

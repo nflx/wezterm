@@ -876,16 +876,43 @@ impl Domain for ClientDomain {
         command_dir: Option<String>,
         window: WindowId,
     ) -> anyhow::Result<Arc<Tab>> {
+        self.spawn_with_context(
+            size,
+            command,
+            command_dir,
+            window,
+            SpawnTabDomain::DefaultDomain,
+            None,
+        )
+        .await
+    }
+
+    async fn spawn_with_context(
+        &self,
+        size: TerminalSize,
+        command: Option<CommandBuilder>,
+        command_dir: Option<String>,
+        window: WindowId,
+        requested_domain: SpawnTabDomain,
+        current_pane_id: Option<PaneId>,
+    ) -> anyhow::Result<Arc<Tab>> {
         let inner = self
             .inner()
             .ok_or_else(|| anyhow!("domain is not attached"))?;
 
         let workspace = Mux::get().active_workspace();
+        let current_pane_id = current_pane_id.and_then(|local_pane_id| {
+            Mux::get().get_pane(local_pane_id).and_then(|pane| {
+                pane.downcast_ref::<ClientPane>()
+                    .map(ClientPane::remote_pane_id)
+            })
+        });
 
         let result = inner
             .client
             .spawn_v2(SpawnV2 {
-                domain: SpawnTabDomain::DefaultDomain,
+                domain: requested_domain,
+                current_pane_id,
                 window_id: inner.local_to_remote_window(window),
                 size,
                 command,

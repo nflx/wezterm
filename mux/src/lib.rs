@@ -1459,6 +1459,7 @@ impl Mux {
         workspace_for_new_window: String,
         window_position: Option<GuiPosition>,
     ) -> anyhow::Result<(Arc<Tab>, Arc<dyn Pane>, WindowId)> {
+        let requested_domain = domain.clone();
         let domain = self
             .resolve_spawn_tab_domain(current_pane_id, &domain)
             .context("resolve_spawn_tab_domain")?;
@@ -1513,7 +1514,14 @@ impl Mux {
         );
 
         let tab = domain
-            .spawn(size, command.clone(), cwd.clone(), window_id)
+            .spawn_with_context(
+                size,
+                command.clone(),
+                cwd.clone(),
+                window_id,
+                requested_domain,
+                current_pane_id,
+            )
             .await
             .with_context(|| {
                 format!(

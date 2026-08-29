@@ -602,6 +602,7 @@ impl Publish {
                         client
                             .spawn_v2(codec::SpawnV2 {
                                 domain,
+                                current_pane_id: None,
                                 window_id,
                                 command,
                                 command_dir: None,
