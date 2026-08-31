@@ -1032,15 +1032,21 @@ impl Domain for ClientDomain {
 
         let domain_id = self.local_domain_id;
         let config = self.config.clone();
+        let silent_attach = matches!(&config, ClientDomainConfig::Unix(_));
 
         let activity = mux::activity::Activity::new();
-        let ui = ConnectionUI::with_params(ConnectionUIParams {
-            window_id,
-            ..Default::default()
-        });
-        ui.title("wezterm: Connecting...");
+        let ui = if silent_attach {
+            ConnectionUI::new_headless()
+        } else {
+            let ui = ConnectionUI::with_params(ConnectionUIParams {
+                window_id,
+                ..Default::default()
+            });
+            ui.title("wezterm: Connecting...");
+            ui
+        };
 
-        ui.async_run_and_log_error({
+        let attach_result = {
             let ui = ui.clone();
             async move {
                 let mut cloned_ui = ui.clone();
@@ -1072,14 +1078,23 @@ impl Domain for ClientDomain {
                 ));
                 ClientDomain::finish_attach(domain_id, client, panes, window_id)
             }
-        })
-        .await
-        .map_err(|e| {
-            ui.output_str(&format!("Error during attach: {:#}\n", e));
-            e
-        })?;
+        }
+        .await;
 
-        ui.output_str("Attached!\n");
+        if let Err(err) = attach_result {
+            if silent_attach {
+                let error_ui = ConnectionUI::with_params(ConnectionUIParams {
+                    window_id,
+                    ..Default::default()
+                });
+                error_ui.title("wezterm: Connection Failed");
+                error_ui.output_str(&format!("Error during attach: {:#}\n", err));
+            } else {
+                ui.output_str(&format!("Error during attach: {:#}\n", err));
+            }
+            return Err(err);
+        }
+
         drop(activity);
         ui.close();
         Ok(())
