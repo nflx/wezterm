@@ -1925,7 +1925,7 @@ impl TmuxCommand for Resize {
 
         let support_commands = tmux_domain.inner.support_commands.lock();
 
-        if let Some(_x) = support_commands.get("resize-window") {
+        let command = if let Some(_x) = support_commands.get("resize-window") {
             resize_command(
                 format!(
                     "resize-window -x {} -y {} -t @{}",
@@ -1951,16 +1951,61 @@ impl TmuxCommand for Resize {
         } else {
             log::info!("The tmux version is not supported");
             return "".to_string();
-        }
+        };
+        tmux_domain
+            .inner
+            .pending_capture_refresh
+            .lock()
+            .insert(self.pane_id);
+        command
     }
 
     fn process_result(&self, domain_id: DomainId, result: &Guarded) -> anyhow::Result<()> {
         if result.error {
+            if let Some(domain) = Mux::get().get_domain(domain_id) {
+                if let Some(tmux_domain) = domain.downcast_ref::<TmuxDomain>() {
+                    tmux_domain
+                        .inner
+                        .pending_capture_refresh
+                        .lock()
+                        .remove(&self.pane_id);
+                }
+            }
             let error = format!("resize-pane in domain={domain_id} failed: {result:#?}");
             log::error!("{error}");
             anyhow::bail!("{error}");
         }
+
+        // A resize can make tmux emit readline/application redraw output while
+        // the local mirror is changing dimensions.  Finish with a fresh
+        // authoritative capture so those relative redraws cannot leave the
+        // mirror different from tmux's screen.
+        if let Some(domain) = Mux::get().get_domain(domain_id) {
+            if let Some(tmux_domain) = domain.downcast_ref::<TmuxDomain>() {
+                tmux_domain
+                    .inner
+                    .cmd_queue
+                    .lock()
+                    .push_back(Box::new(CapturePane {
+                        pane_id: self.pane_id,
+                        history_limit: config::configuration().scrollback_lines as isize,
+                    }));
+            }
+        }
         Ok(())
+    }
+
+    fn process_timeout(&self, domain_id: DomainId) -> anyhow::Result<()> {
+        if let Some(domain) = Mux::get().get_domain(domain_id) {
+            if let Some(tmux_domain) = domain.downcast_ref::<TmuxDomain>() {
+                tmux_domain
+                    .inner
+                    .pending_capture_refresh
+                    .lock()
+                    .remove(&self.pane_id);
+            }
+        }
+        anyhow::bail!("tmux resize command timed out in domain {domain_id}")
     }
 }
 
@@ -1981,6 +2026,15 @@ impl TmuxCommand for CapturePane {
 
     fn process_result(&self, domain_id: DomainId, result: &Guarded) -> anyhow::Result<()> {
         if result.error {
+            if let Some(domain) = Mux::get().get_domain(domain_id) {
+                if let Some(tmux_domain) = domain.downcast_ref::<TmuxDomain>() {
+                    tmux_domain
+                        .inner
+                        .pending_capture_refresh
+                        .lock()
+                        .remove(&self.pane_id);
+                }
+            }
             let error = format!("capture-pane in domain={domain_id} failed: {result:#?}");
             log::error!("{error}");
             anyhow::bail!("{error}");
@@ -1999,6 +2053,15 @@ impl TmuxCommand for CapturePane {
         // capturep contents returned from guarded lines which always contain a tailing '\n'
         let unescaped = &unescaped[0..unescaped.len().saturating_sub(1)].replace("\n", "\r\n");
 
+        // Control events are processed serially, so removing the barrier here
+        // still keeps incremental output out until the replacement below has
+        // completed, while ensuring write failures cannot strand the pane.
+        tmux_domain
+            .inner
+            .pending_capture_refresh
+            .lock()
+            .remove(&self.pane_id);
+
         let pane_map = tmux_domain.inner.remote_panes.lock();
         if let Some(pane) = pane_map.get(&self.pane_id) {
             let mut pane = pane.lock();
@@ -2006,12 +2069,33 @@ impl TmuxCommand for CapturePane {
                 tmux_domain.inner.set_pane_cursor_position(&p, 0, 0);
             }
 
+            // This capture is an authoritative replacement for the terminal
+            // contents.  Merely homing the cursor and painting over the old
+            // screen leaves stale rows behind whenever reflow makes the new
+            // capture shorter (most visibly as duplicated shell prompts after
+            // changing an individual pane's font size).
+            pane.output_write
+                .write_all(b"\x1b[3J\x1b[2J\x1b[H")
+                .context("clearing pane before authoritative capture")?;
             pane.output_write
                 .write_all(unescaped.as_bytes())
                 .context("writing capture pane result to output")?;
         }
 
         Ok(())
+    }
+
+    fn process_timeout(&self, domain_id: DomainId) -> anyhow::Result<()> {
+        if let Some(domain) = Mux::get().get_domain(domain_id) {
+            if let Some(tmux_domain) = domain.downcast_ref::<TmuxDomain>() {
+                tmux_domain
+                    .inner
+                    .pending_capture_refresh
+                    .lock()
+                    .remove(&self.pane_id);
+            }
+        }
+        anyhow::bail!("tmux capture-pane command timed out in domain {domain_id}")
     }
 }
 

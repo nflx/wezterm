@@ -149,6 +149,7 @@ pub(crate) struct TmuxDomainState {
     pub(crate) pending_renames: Mutex<VecDeque<PendingRename>>,
     pub(crate) pending_focus: Mutex<VecDeque<PendingFocus>>,
     pub(crate) pending_reposition_windows: Mutex<HashSet<TmuxWindowId>>,
+    pub(crate) pending_capture_refresh: Mutex<HashSet<TmuxPaneId>>,
     pub backlog: Mutex<HashMap<TmuxPaneId, Vec<u8>>>,
 }
 
@@ -322,6 +323,9 @@ impl TmuxDomainState {
                     }
                 }
                 Event::Output { pane, text } => {
+                    if self.pending_capture_refresh.lock().contains(pane) {
+                        continue;
+                    }
                     let pane_map = self.remote_panes.lock();
                     if let Some(ref_pane) = pane_map.get(pane) {
                         let mut tmux_pane = ref_pane.lock();
@@ -913,6 +917,7 @@ impl TmuxDomain {
             pending_renames: Mutex::new(VecDeque::default()),
             pending_focus: Mutex::new(VecDeque::default()),
             pending_reposition_windows: Mutex::new(HashSet::default()),
+            pending_capture_refresh: Mutex::new(HashSet::default()),
             backlog: Mutex::new(HashMap::default()),
         });
 
@@ -965,6 +970,7 @@ impl TmuxDomain {
             .in_flight_responses_remaining
             .store(0, Ordering::Release);
         self.inner.cmd_queue.lock().clear();
+        self.inner.pending_capture_refresh.lock().clear();
         let pending: Vec<_> = self.inner.pending_kills.lock().drain().collect();
         for (_, mut completion) in pending {
             completion.err(anyhow::anyhow!("tmux control transport reconnected"));
@@ -990,6 +996,7 @@ impl TmuxDomain {
         self.inner
             .in_flight_responses_remaining
             .store(0, Ordering::Release);
+        self.inner.pending_capture_refresh.lock().clear();
         self.inner
             .fail_pending_repositions("tmux control transport disconnected");
         self.inner
