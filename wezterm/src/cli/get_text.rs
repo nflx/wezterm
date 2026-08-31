@@ -32,6 +32,12 @@ pub struct GetText {
     /// If omitted, unattributed text will be returned.
     #[arg(long)]
     escapes: bool,
+
+    /// Join terminal rows that are marked as continuations of a soft-wrapped
+    /// logical line. This is useful when validating or consuming reflowed
+    /// pane content independently of its current cell width.
+    #[arg(long)]
+    logical: bool,
 }
 
 impl GetText {
@@ -83,8 +89,18 @@ impl GetText {
             .map(|(_idx, line)| line)
             .collect();
 
-        if self.escapes {
+        if self.escapes && self.logical {
+            anyhow::bail!("--logical cannot currently be combined with --escapes");
+        } else if self.escapes {
             println!("{}", lines_to_escapes(lines)?);
+        } else if self.logical {
+            for line in lines {
+                if line.last_cell_was_wrapped() {
+                    print!("{}", line.as_str());
+                } else {
+                    println!("{}", line.as_str());
+                }
+            }
         } else {
             lines.iter().for_each(|line| println!("{}", line.as_str()));
         }

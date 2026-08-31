@@ -2018,7 +2018,11 @@ pub(crate) struct CapturePane {
 impl TmuxCommand for CapturePane {
     fn get_command(&self, _domain_id: DomainId) -> String {
         format!(
-            "capture-pane -p -t %{} -e -C -S {}\n",
+            // -J joins tmux's soft-wrapped physical rows back into logical
+            // lines.  The local terminal can then wrap those lines at its
+            // font-aware width instead of treating old tmux cell boundaries
+            // as hard newlines after an individual pane font resize.
+            "capture-pane -p -J -t %{} -e -C -S {}\n",
             self.pane_id,
             self.history_limit * -1
         )
@@ -2841,6 +2845,30 @@ mod test {
         assert!(!should_ignore_empty_managed_snapshot(false, 1, 0));
         assert!(!should_ignore_empty_managed_snapshot(true, 0, 0));
         assert!(!should_ignore_empty_managed_snapshot(true, 1, 1));
+    }
+
+    #[test]
+    fn capture_pane_joins_tmux_soft_wrapped_rows() {
+        let command = CapturePane {
+            pane_id: 17,
+            history_limit: 5000,
+        }
+        .get_command(0);
+
+        assert_eq!(
+            shell_words::split(command.trim()).unwrap(),
+            [
+                "capture-pane",
+                "-p",
+                "-J",
+                "-t",
+                "%17",
+                "-e",
+                "-C",
+                "-S",
+                "-5000"
+            ]
+        );
     }
 
     #[test]
