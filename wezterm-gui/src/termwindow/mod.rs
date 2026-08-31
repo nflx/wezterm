@@ -217,6 +217,17 @@ struct PendingSplitFontScale {
     font_scale: f64,
 }
 
+fn take_pending_pane_font_tab_resize(pending: &mut HashMap<TabId, usize>, tab_id: TabId) -> bool {
+    let Some(count) = pending.get_mut(&tab_id) else {
+        return false;
+    };
+    *count -= 1;
+    if *count == 0 {
+        pending.remove(&tab_id);
+    }
+    true
+}
+
 #[derive(Clone)]
 struct PaneFontMetrics {
     fonts: Rc<FontConfiguration>,
@@ -461,6 +472,7 @@ pub struct TermWindow {
     tab_state: RefCell<HashMap<TabId, TabState>>,
     pane_state: RefCell<HashMap<PaneId, PaneState>>,
     pending_split_font_scales: RefCell<Vec<PendingSplitFontScale>>,
+    pending_pane_font_tab_resizes: RefCell<HashMap<TabId, usize>>,
     pane_font_metrics: RefCell<HashMap<NotNan<f64>, PaneFontMetrics>>,
     semantic_zones: HashMap<PaneId, SemanticZoneCache>,
 
@@ -782,6 +794,7 @@ impl TermWindow {
             tab_state: RefCell::new(HashMap::new()),
             pane_state: RefCell::new(HashMap::new()),
             pending_split_font_scales: RefCell::new(Vec::new()),
+            pending_pane_font_tab_resizes: RefCell::new(HashMap::new()),
             pane_font_metrics: RefCell::new(HashMap::new()),
             current_mouse_buttons: vec![],
             current_mouse_capture: None,
@@ -1354,14 +1367,14 @@ impl TermWindow {
                     if let Some((_domain_id, _window_id, tab_id)) =
                         Mux::get().resolve_pane_id(pane_id)
                     {
+                        *self
+                            .pending_pane_font_tab_resizes
+                            .borrow_mut()
+                            .entry(tab_id)
+                            .or_default() += 1;
                         self.sync_tab_pane_font_scales_from_mux(tab_id);
                         self.resize_tab_id_panes_for_font_scale(tab_id);
                     }
-                    self.shape_generation += 1;
-                    self.shape_cache.borrow_mut().clear();
-                    self.line_to_ele_shape_cache.borrow_mut().clear();
-                    self.line_quad_cache.borrow_mut().clear();
-                    self.quad_generation += 1;
                     self.update_title_post_status();
                     window.invalidate();
                 }
@@ -1376,11 +1389,16 @@ impl TermWindow {
                         self.sync_tab_pane_font_scales_from_mux(tab_id);
                         self.apply_pending_split_font_scales(tab_id);
                         self.resize_tab_id_panes_for_font_scale(tab_id);
-                        self.shape_generation += 1;
-                        self.shape_cache.borrow_mut().clear();
-                        self.line_to_ele_shape_cache.borrow_mut().clear();
-                        self.quad_generation += 1;
-                        self.line_quad_cache.borrow_mut().clear();
+                        if !take_pending_pane_font_tab_resize(
+                            &mut self.pending_pane_font_tab_resizes.borrow_mut(),
+                            tab_id,
+                        ) {
+                            self.shape_generation += 1;
+                            self.shape_cache.borrow_mut().clear();
+                            self.line_to_ele_shape_cache.borrow_mut().clear();
+                            self.quad_generation += 1;
+                            self.line_quad_cache.borrow_mut().clear();
+                        }
                         self.update_title_post_status();
                         window.invalidate();
                     }
@@ -4006,5 +4024,24 @@ impl Drop for TermWindow {
                 fe.forget_known_window(&window);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod pane_font_resize_tests {
+    use super::take_pending_pane_font_tab_resize;
+    use std::collections::HashMap;
+
+    #[test]
+    fn paired_font_resize_notifications_are_counted_per_tab() {
+        let mut pending = HashMap::from([(7, 2), (9, 1)]);
+
+        assert!(take_pending_pane_font_tab_resize(&mut pending, 7));
+        assert_eq!(pending.get(&7), Some(&1));
+        assert!(take_pending_pane_font_tab_resize(&mut pending, 9));
+        assert!(!pending.contains_key(&9));
+        assert!(take_pending_pane_font_tab_resize(&mut pending, 7));
+        assert!(!pending.contains_key(&7));
+        assert!(!take_pending_pane_font_tab_resize(&mut pending, 7));
     }
 }

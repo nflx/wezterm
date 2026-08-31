@@ -982,7 +982,6 @@ impl super::TermWindow {
             return;
         };
 
-        let mut changed = false;
         for pos in tab.iter_panes_ignoring_zoom() {
             let pane_id = pos.pane.pane_id();
             let font_scale = match normalize_font_scale(pos.pane.font_scale()) {
@@ -1000,26 +999,14 @@ impl super::TermWindow {
 
             if prior != font_scale {
                 self.pane_state(pane_id).font_scale = font_scale;
-                changed = true;
             }
-        }
-
-        if changed {
-            self.shape_generation += 1;
-            self.shape_cache.borrow_mut().clear();
-            self.line_to_ele_shape_cache.borrow_mut().clear();
-            self.line_quad_cache.borrow_mut().clear();
-            self.quad_generation += 1;
         }
     }
 
     fn invalidate_pane_font_scale_outputs(&mut self) {
-        self.shape_generation += 1;
-        self.shape_cache.borrow_mut().clear();
-        self.line_to_ele_shape_cache.borrow_mut().clear();
-        self.line_quad_cache.borrow_mut().clear();
-        self.quad_generation += 1;
-
+        // Font scale and pane geometry are part of the shape/quad cache keys.
+        // Repaint the window, but retain entries for panes whose scale and
+        // pixel rectangle did not change.
         if let Some(window) = self.window.as_ref() {
             window.invalidate();
         }
