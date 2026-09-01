@@ -149,7 +149,10 @@ pub(crate) struct TmuxDomainState {
     pub(crate) pending_renames: Mutex<VecDeque<PendingRename>>,
     pub(crate) pending_focus: Mutex<VecDeque<PendingFocus>>,
     pub(crate) pending_reposition_windows: Mutex<HashSet<TmuxWindowId>>,
-    pub(crate) pending_capture_refresh: Mutex<HashSet<TmuxPaneId>>,
+    // Relative redraw output produced while tmux applies a resize cannot be
+    // replayed against the already-reflowed local terminal. Hold it behind a
+    // bounded per-window barrier; cold-start history capture is separate.
+    pub(crate) pending_resize_refresh: Mutex<HashMap<TmuxPaneId, u64>>,
     pub backlog: Mutex<HashMap<TmuxPaneId, Vec<u8>>>,
 }
 
@@ -160,6 +163,41 @@ pub struct TmuxDomain {
 }
 
 impl TmuxDomainState {
+    pub(crate) fn schedule_resize_refresh_release(domain_id: DomainId, pane_id: TmuxPaneId) {
+        let Some(domain) = Mux::get().get_domain(domain_id) else {
+            return;
+        };
+        let Some(tmux_domain) = domain.downcast_ref::<TmuxDomain>() else {
+            return;
+        };
+        let generation = {
+            let pending = tmux_domain.inner.pending_resize_refresh.lock();
+            let Some(generation) = pending.get(&pane_id) else {
+                return;
+            };
+            *generation
+        };
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            promise::spawn::spawn_into_main_thread(async move {
+                let Some(domain) = Mux::get().get_domain(domain_id) else {
+                    return;
+                };
+                let Some(tmux_domain) = domain.downcast_ref::<TmuxDomain>() else {
+                    return;
+                };
+                let mut pending = tmux_domain.inner.pending_resize_refresh.lock();
+                if pending.get(&pane_id) == Some(&generation) {
+                    log::debug!(
+                        "releasing resize output barrier pane=%{pane_id} generation={generation}"
+                    );
+                    pending.remove(&pane_id);
+                }
+            })
+            .detach();
+        });
+    }
+
     fn ensure_connected(&self) -> anyhow::Result<()> {
         if *self.connection_state.lock() == crate::tab::TmuxConnectionState::Connected {
             Ok(())
@@ -323,7 +361,12 @@ impl TmuxDomainState {
                     }
                 }
                 Event::Output { pane, text } => {
-                    if self.pending_capture_refresh.lock().contains(pane) {
+                    if self.pending_resize_refresh.lock().contains_key(pane) {
+                        log::debug!(
+                            "dropping resize-era output pane=%{} bytes={}",
+                            pane,
+                            text.len()
+                        );
                         continue;
                     }
                     let pane_map = self.remote_panes.lock();
@@ -917,7 +960,7 @@ impl TmuxDomain {
             pending_renames: Mutex::new(VecDeque::default()),
             pending_focus: Mutex::new(VecDeque::default()),
             pending_reposition_windows: Mutex::new(HashSet::default()),
-            pending_capture_refresh: Mutex::new(HashSet::default()),
+            pending_resize_refresh: Mutex::new(HashMap::default()),
             backlog: Mutex::new(HashMap::default()),
         });
 
@@ -970,7 +1013,7 @@ impl TmuxDomain {
             .in_flight_responses_remaining
             .store(0, Ordering::Release);
         self.inner.cmd_queue.lock().clear();
-        self.inner.pending_capture_refresh.lock().clear();
+        self.inner.pending_resize_refresh.lock().clear();
         let pending: Vec<_> = self.inner.pending_kills.lock().drain().collect();
         for (_, mut completion) in pending {
             completion.err(anyhow::anyhow!("tmux control transport reconnected"));
@@ -996,7 +1039,7 @@ impl TmuxDomain {
         self.inner
             .in_flight_responses_remaining
             .store(0, Ordering::Release);
-        self.inner.pending_capture_refresh.lock().clear();
+        self.inner.pending_resize_refresh.lock().clear();
         self.inner
             .fail_pending_repositions("tmux control transport disconnected");
         self.inner

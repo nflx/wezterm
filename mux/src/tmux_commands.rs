@@ -760,7 +760,10 @@ impl TmuxDomainState {
             let pane_map = self.remote_panes.lock();
             let local_pane = match pane_map.get(&pane.pane_id) {
                 Some(p) => {
-                    let local_pane_id = p.lock().local_pane_id;
+                    let mut remote = p.lock();
+                    remote.cursor_x = pane.cursor_x;
+                    remote.cursor_y = pane.cursor_y;
+                    let local_pane_id = remote.local_pane_id;
                     mux.get_pane(local_pane_id)
                 }
                 None => None,
@@ -781,13 +784,6 @@ impl TmuxDomainState {
                 } else {
                     // we have capture, so remove the backlog
                     let _ = self.backlog.lock().remove(&pane.pane_id);
-                    if (pane.cursor_x + pane.cursor_y) != 0 {
-                        self.set_pane_cursor_position(
-                            &local_pane,
-                            pane.cursor_x as usize,
-                            pane.cursor_y as usize,
-                        );
-                    }
                 }
                 if pane.pane_active {
                     let gui_tabs = self.gui_tabs.lock();
@@ -1277,6 +1273,7 @@ impl TmuxDomainState {
             };
 
             let tab = Arc::new(Tab::new(&size));
+            let mut panes_needing_capture = vec![];
             tab.set_title(&format!("{}", &window.window_name));
             mux.add_tab_no_panes(&tab);
 
@@ -1308,6 +1305,7 @@ impl TmuxDomainState {
                         self.add_attached_pane(p.window_id, p.pane_id)?;
                         if created {
                             let _ = mux.add_pane(&local_pane);
+                            panes_needing_capture.push(p.pane_id);
                         }
                         break;
                     }
@@ -1344,6 +1342,7 @@ impl TmuxDomainState {
                         self.add_attached_pane(p.window_id, p.pane_id)?;
                         if created {
                             let _ = mux.add_pane(&local_pane);
+                            panes_needing_capture.push(p.pane_id);
                         }
                         if let None = tab.get_active_pane() {
                             tab.assign_pane(&local_pane);
@@ -1408,23 +1407,15 @@ impl TmuxDomainState {
                 }
             }
 
-            let gui_tabs = self.gui_tabs.lock();
-            let local_tab = match gui_tabs.get(&window.window_id) {
-                Some(x) => x,
-                None => {
-                    log::info!(
-                        "cannot find the local tab for tmux window {}",
-                        window.window_id
-                    );
-                    continue;
-                }
-            };
-
-            // For new window, we wait for nature ouput instead of capturing
+            // Hydrate only genuinely new local pane objects.  A retained pane
+            // already owns authoritative terminal state; capturing it again
+            // after a layout snapshot destroys soft wraps and styled history.
+            // Prioritize hydration so it cannot arrive after user input.
+            // For a newly created tmux window, natural output initializes it.
             if !new_window {
-                for p in local_tab.panes.iter() {
-                    self.cmd_queue.lock().push_back(Box::new(CapturePane {
-                        pane_id: *p,
+                for pane_id in panes_needing_capture.into_iter().rev() {
+                    self.cmd_queue.lock().push_front(Box::new(CapturePane {
+                        pane_id,
                         history_limit: window.history_limit,
                     }));
                 }
@@ -1861,6 +1852,25 @@ fn resize_command(window_command: String, pane_id: TmuxPaneId, size: PtySize) ->
     )
 }
 
+fn resize_window_pane_ids(tmux_domain: &TmuxDomain, pane_id: TmuxPaneId) -> Vec<TmuxPaneId> {
+    let Some(window_id) = tmux_domain
+        .inner
+        .remote_panes
+        .lock()
+        .get(&pane_id)
+        .map(|pane| pane.lock().window_id)
+    else {
+        return vec![pane_id];
+    };
+    tmux_domain
+        .inner
+        .gui_tabs
+        .lock()
+        .get(&window_id)
+        .map(|tab| tab.panes.iter().copied().collect())
+        .unwrap_or_else(|| vec![pane_id])
+}
+
 impl TmuxCommand for Resize {
     fn guarded_response_count(&self) -> usize {
         2
@@ -1952,11 +1962,13 @@ impl TmuxCommand for Resize {
             log::info!("The tmux version is not supported");
             return "".to_string();
         };
-        tmux_domain
-            .inner
-            .pending_capture_refresh
-            .lock()
-            .insert(self.pane_id);
+        let affected_panes: Vec<_> = local_tab.panes.iter().copied().collect();
+        let mut pending = tmux_domain.inner.pending_resize_refresh.lock();
+        for pane_id in affected_panes {
+            let generation = pending.entry(pane_id).or_insert(0);
+            *generation += 1;
+            log::debug!("starting resize output barrier pane=%{pane_id} generation={generation}");
+        }
         command
     }
 
@@ -1964,11 +1976,11 @@ impl TmuxCommand for Resize {
         if result.error {
             if let Some(domain) = Mux::get().get_domain(domain_id) {
                 if let Some(tmux_domain) = domain.downcast_ref::<TmuxDomain>() {
-                    tmux_domain
-                        .inner
-                        .pending_capture_refresh
-                        .lock()
-                        .remove(&self.pane_id);
+                    let affected_panes = resize_window_pane_ids(tmux_domain, self.pane_id);
+                    let mut pending = tmux_domain.inner.pending_resize_refresh.lock();
+                    for pane_id in affected_panes {
+                        pending.remove(&pane_id);
+                    }
                 }
             }
             let error = format!("resize-pane in domain={domain_id} failed: {result:#?}");
@@ -1976,20 +1988,17 @@ impl TmuxCommand for Resize {
             anyhow::bail!("{error}");
         }
 
-        // A resize can make tmux emit readline/application redraw output while
-        // the local mirror is changing dimensions.  Finish with a fresh
-        // authoritative capture so those relative redraws cannot leave the
-        // mirror different from tmux's screen.
+        // tmux acknowledges its resize command before readline and some TUIs
+        // finish reacting to SIGWINCH. Keep discarding that relative redraw
+        // burst for a bounded interval; output must not extend the interval or
+        // normal command output could keep the barrier alive and be lost.
+        // A generation check prevents an older timer from opening the barrier
+        // for a newer coalesced resize.
         if let Some(domain) = Mux::get().get_domain(domain_id) {
             if let Some(tmux_domain) = domain.downcast_ref::<TmuxDomain>() {
-                tmux_domain
-                    .inner
-                    .cmd_queue
-                    .lock()
-                    .push_back(Box::new(CapturePane {
-                        pane_id: self.pane_id,
-                        history_limit: config::configuration().scrollback_lines as isize,
-                    }));
+                for pane_id in resize_window_pane_ids(tmux_domain, self.pane_id) {
+                    TmuxDomainState::schedule_resize_refresh_release(domain_id, pane_id);
+                }
             }
         }
         Ok(())
@@ -1998,11 +2007,11 @@ impl TmuxCommand for Resize {
     fn process_timeout(&self, domain_id: DomainId) -> anyhow::Result<()> {
         if let Some(domain) = Mux::get().get_domain(domain_id) {
             if let Some(tmux_domain) = domain.downcast_ref::<TmuxDomain>() {
-                tmux_domain
-                    .inner
-                    .pending_capture_refresh
-                    .lock()
-                    .remove(&self.pane_id);
+                let affected_panes = resize_window_pane_ids(tmux_domain, self.pane_id);
+                let mut pending = tmux_domain.inner.pending_resize_refresh.lock();
+                for pane_id in affected_panes {
+                    pending.remove(&pane_id);
+                }
             }
         }
         anyhow::bail!("tmux resize command timed out in domain {domain_id}")
@@ -2030,15 +2039,6 @@ impl TmuxCommand for CapturePane {
 
     fn process_result(&self, domain_id: DomainId, result: &Guarded) -> anyhow::Result<()> {
         if result.error {
-            if let Some(domain) = Mux::get().get_domain(domain_id) {
-                if let Some(tmux_domain) = domain.downcast_ref::<TmuxDomain>() {
-                    tmux_domain
-                        .inner
-                        .pending_capture_refresh
-                        .lock()
-                        .remove(&self.pane_id);
-                }
-            }
             let error = format!("capture-pane in domain={domain_id} failed: {result:#?}");
             log::error!("{error}");
             anyhow::bail!("{error}");
@@ -2056,15 +2056,6 @@ impl TmuxCommand for CapturePane {
         let unescaped = termwiz::tmux_cc::unvis(&result.output).context("unescape pane content")?;
         // capturep contents returned from guarded lines which always contain a tailing '\n'
         let unescaped = &unescaped[0..unescaped.len().saturating_sub(1)].replace("\n", "\r\n");
-
-        // Control events are processed serially, so removing the barrier here
-        // still keeps incremental output out until the replacement below has
-        // completed, while ensuring write failures cannot strand the pane.
-        tmux_domain
-            .inner
-            .pending_capture_refresh
-            .lock()
-            .remove(&self.pane_id);
 
         let pane_map = tmux_domain.inner.remote_panes.lock();
         if let Some(pane) = pane_map.get(&self.pane_id) {
@@ -2090,15 +2081,6 @@ impl TmuxCommand for CapturePane {
     }
 
     fn process_timeout(&self, domain_id: DomainId) -> anyhow::Result<()> {
-        if let Some(domain) = Mux::get().get_domain(domain_id) {
-            if let Some(tmux_domain) = domain.downcast_ref::<TmuxDomain>() {
-                tmux_domain
-                    .inner
-                    .pending_capture_refresh
-                    .lock()
-                    .remove(&self.pane_id);
-            }
-        }
         anyhow::bail!("tmux capture-pane command timed out in domain {domain_id}")
     }
 }
@@ -2109,7 +2091,19 @@ pub(crate) struct SendKeys {
     pub pane: TmuxPaneId,
 }
 impl TmuxCommand for SendKeys {
-    fn get_command(&self, _domain_id: DomainId) -> String {
+    fn get_command(&self, domain_id: DomainId) -> String {
+        // User input ends the resize redraw-suppression interval before tmux
+        // receives the key, so command output can never be mistaken for a
+        // resize-era redraw and discarded.
+        if let Some(domain) = Mux::get().get_domain(domain_id) {
+            if let Some(tmux_domain) = domain.downcast_ref::<TmuxDomain>() {
+                tmux_domain
+                    .inner
+                    .pending_resize_refresh
+                    .lock()
+                    .remove(&self.pane);
+            }
+        }
         let mut s = String::new();
         for &byte in self.keys.iter() {
             write!(&mut s, "0x{:X} ", byte).expect("unable to write key");
