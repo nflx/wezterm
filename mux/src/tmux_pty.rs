@@ -1,5 +1,5 @@
 use crate::tmux::{RefTmuxRemotePane, TmuxCmdQueue, TmuxDomainState};
-use crate::tmux_commands::{Resize, SendKeys};
+use crate::tmux_commands::{Resize, SendKeys, SetPaneZoom};
 use crate::{DomainId, Mux};
 use filedescriptor::FileDescriptor;
 use parking_lot::{Condvar, Mutex};
@@ -14,6 +14,16 @@ pub(crate) struct TmuxPty {
     pub master_pane: RefTmuxRemotePane,
     pub reader: FileDescriptor,
     pub cmd_queue: Arc<Mutex<TmuxCmdQueue>>,
+}
+
+impl TmuxPty {
+    pub(crate) fn set_zoomed(&self, zoomed: bool) {
+        let pane_id = self.master_pane.lock().pane_id;
+        self.cmd_queue
+            .lock()
+            .push_back(Box::new(SetPaneZoom { pane_id, zoomed }));
+        TmuxDomainState::schedule_send_next_command(self.domain_id);
+    }
 }
 
 struct TmuxPtyWriter {

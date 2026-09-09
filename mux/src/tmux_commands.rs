@@ -70,6 +70,8 @@ struct WindowItem {
     window_width: u64,
     window_height: u64,
     window_active: bool,
+    window_zoomed: bool,
+    active_pane_id: TmuxPaneId,
     window_name: String,
     layout: Vec<WindowLayout>,
     layout_tree: LayoutNode,
@@ -831,6 +833,54 @@ impl TmuxDomainState {
         Ok(())
     }
 
+    fn sync_window_zoom_state(&self, window: &WindowItem) -> anyhow::Result<()> {
+        let mux = Mux::get();
+        let Some(tab_id) = self
+            .gui_tabs
+            .lock()
+            .get(&window.window_id)
+            .map(|attached| attached.tab_id)
+        else {
+            return Ok(());
+        };
+        let Some(tab) = mux.get_tab(tab_id) else {
+            return Ok(());
+        };
+
+        let current_zoomed = tab.get_zoomed_pane().map(|pane| pane.pane_id());
+        if !window.window_zoomed {
+            if current_zoomed.is_some() {
+                tab.set_zoomed(false);
+            }
+            return Ok(());
+        }
+
+        let local_pane_id = self
+            .remote_panes
+            .lock()
+            .get(&window.active_pane_id)
+            .map(|pane| pane.lock().local_pane_id)
+            .ok_or_else(|| {
+                anyhow!(
+                    "zoomed tmux window @{} references unavailable pane %{}",
+                    window.window_id,
+                    window.active_pane_id
+                )
+            })?;
+        if current_zoomed == Some(local_pane_id) {
+            return Ok(());
+        }
+        if current_zoomed.is_some() {
+            tab.set_zoomed(false);
+        }
+        let pane = mux
+            .get_pane(local_pane_id)
+            .ok_or_else(|| anyhow!("zoomed local pane {local_pane_id} is unavailable"))?;
+        tab.set_active_pane(&pane);
+        tab.set_zoomed(true);
+        Ok(())
+    }
+
     fn sync_window_state(&self, windows: &[WindowItem], new_window: bool) -> anyhow::Result<()> {
         let Some(current_session) = *self.tmux_session.lock() else {
             return Ok(());
@@ -1246,16 +1296,23 @@ impl TmuxDomainState {
                 continue;
             }
 
-            if let Some(existing) = self.gui_tabs.lock().get(&window.window_id) {
-                if !existing.layout_tree.same_topology(&window.layout_tree) {
+            let existing = self.gui_tabs.lock().get(&window.window_id).map(|existing| {
+                (
+                    existing.tab_id,
+                    existing.layout_tree.same_topology(&window.layout_tree),
+                )
+            });
+            if let Some((tab_id, same_topology)) = existing {
+                if !same_topology {
                     log::debug!(
                         "tmux window {} snapshot topology changed; scheduling pane synchronization",
                         window.window_id
                     );
                 }
-                if let Some(tab) = mux.get_tab(existing.tab_id) {
+                if let Some(tab) = mux.get_tab(tab_id) {
                     tab.set_title(&window.window_name);
                 }
+                self.sync_window_zoom_state(window)?;
                 self.cmd_queue.lock().push_back(Box::new(ListAllPanes {
                     window_id: window.window_id,
                     prune: false,
@@ -1399,6 +1456,7 @@ impl TmuxDomainState {
 
             mux.add_tab_to_window(&tab, **gui_window_id)?;
             gui_window_id.notify();
+            self.sync_window_zoom_state(window)?;
 
             if new_window {
                 let pending = self.pending_new_tabs.lock().pop_front();
@@ -1764,6 +1822,13 @@ fn parse_window_snapshot(output: &str) -> anyhow::Result<Vec<WindowItem>> {
             .ok_or_else(|| anyhow!("missing window_active"))?
             .parse::<usize>()?
             == 1;
+        let window_zoomed = fields
+            .next()
+            .ok_or_else(|| anyhow!("missing window_zoomed_flag"))?
+            .parse::<usize>()?
+            == 1;
+        let active_pane_id =
+            parse_sigil_number(fields.next().ok_or_else(|| anyhow!("missing pane_id"))?)?;
         let window_name = fields
             .next()
             .ok_or_else(|| anyhow!("missing window_name"))?;
@@ -1787,6 +1852,8 @@ fn parse_window_snapshot(output: &str) -> anyhow::Result<Vec<WindowItem>> {
             window_width,
             window_height,
             window_active,
+            window_zoomed,
+            active_pane_id,
             window_name: window_name.to_string(),
             layout: parse_layout(window_layout)?,
             layout_tree: parse_layout_tree(window_layout)?,
@@ -1808,6 +1875,7 @@ impl TmuxCommand for ListAllWindows {
                 '#{{session_id}}\x1f#{{window_id}}\x1f\
                 #{{window_width}}\x1f#{{window_height}}\x1f\
                 #{{window_active}}\x1f\
+                #{{window_zoomed_flag}}\x1f#{{pane_id}}\x1f\
                 #{{window_name}}\x1f\
                 #{{window_layout}}\x1f\
                 #{{history_limit}}' -t ${}\n",
@@ -1845,10 +1913,21 @@ pub(crate) struct Resize {
     pub size: PtySize,
 }
 
-fn resize_command(window_command: String, pane_id: TmuxPaneId, size: PtySize) -> String {
+fn resize_command(
+    window_command: String,
+    zoomed_window_command: String,
+    pane_id: TmuxPaneId,
+    size: PtySize,
+) -> String {
     format!(
-        "{window_command} ; resize-pane -x {} -y {} -t %{pane_id}\n",
-        size.cols, size.rows
+        "if-shell -F -t %{pane_id} '#{{window_zoomed_flag}}' {} {} ; \
+         if-shell -F -t %{pane_id} '#{{window_zoomed_flag}}' '' {}\n",
+        shell_words::quote(&zoomed_window_command),
+        shell_words::quote(&window_command),
+        shell_words::quote(&format!(
+            "resize-pane -x {} -y {} -t %{pane_id}",
+            size.cols, size.rows
+        )),
     )
 }
 
@@ -1941,6 +2020,10 @@ impl TmuxCommand for Resize {
                     "resize-window -x {} -y {} -t @{}",
                     size.cols, size.rows, tmux_window_id
                 ),
+                format!(
+                    "resize-window -x {} -y {} -t @{}",
+                    self.size.cols, self.size.rows, tmux_window_id
+                ),
                 self.pane_id,
                 self.size,
             )
@@ -1948,12 +2031,14 @@ impl TmuxCommand for Resize {
             if x.contains("-C XxY") {
                 resize_command(
                     format!("refresh-client -C {}x{}", size.cols, size.rows),
+                    format!("refresh-client -C {}x{}", self.size.cols, self.size.rows),
                     self.pane_id,
                     self.size,
                 )
             } else {
                 resize_command(
                     format!("refresh-client -C {},{}", size.cols, size.rows),
+                    format!("refresh-client -C {},{}", self.size.cols, self.size.rows),
                     self.pane_id,
                     self.size,
                 )
@@ -2787,6 +2872,53 @@ impl TmuxCommand for SelectPane {
     }
 }
 
+fn set_pane_zoom_command(pane_id: TmuxPaneId, zoomed: bool) -> String {
+    let toggle = format!("resize-pane -Z -t %{pane_id}");
+    let (if_true, if_false) = if zoomed {
+        ("", toggle.as_str())
+    } else {
+        (toggle.as_str(), "")
+    };
+    format!(
+        "if-shell -F -t %{pane_id} '#{{window_zoomed_flag}}' {} {}\n",
+        shell_words::quote(if_true),
+        shell_words::quote(if_false),
+    )
+}
+
+/// Keep tmux's PTY geometry in step with WezTerm's pane zoom. A pane in a
+/// tiled tmux window cannot grow beyond its layout cell unless tmux itself is
+/// zoomed, so resizing alone does not deliver the enlarged TIOCGWINSZ/SIGWINCH
+/// to full-screen applications.
+#[derive(Debug)]
+pub(crate) struct SetPaneZoom {
+    pub pane_id: TmuxPaneId,
+    pub zoomed: bool,
+}
+
+impl TmuxCommand for SetPaneZoom {
+    fn get_command(&self, _domain_id: DomainId) -> String {
+        set_pane_zoom_command(self.pane_id, self.zoomed)
+    }
+
+    fn is_stale_for_killed_pane(&self, pane_id: TmuxPaneId) -> bool {
+        self.pane_id == pane_id
+    }
+
+    fn process_result(&self, domain_id: DomainId, result: &Guarded) -> anyhow::Result<()> {
+        if result.error {
+            let action = if self.zoomed { "zoom" } else { "unzoom" };
+            let error = format!(
+                "tmux {action} pane %{} in domain={domain_id} failed: {result:#?}",
+                self.pane_id
+            );
+            log::error!("{error}");
+            anyhow::bail!(error);
+        }
+        Ok(())
+    }
+}
+
 // This is a dummy command which indicates the attaching is done, it prevents the tmux output
 // the unexpected and unnecessary content when syncing with back end in attaching stage.
 #[derive(Debug)]
@@ -2868,7 +3000,7 @@ mod test {
     #[test]
     fn window_snapshot_delimiter_preserves_spaces_and_quotes_in_names() {
         let items = parse_window_snapshot(
-            "$3\x1f@7\x1f80\x1f24\x1f1\x1fwork queue's \"snapshot\"\x1fabcd,80x24,0,0,11\x1f5000\n",
+            "$3\x1f@7\x1f80\x1f24\x1f1\x1f1\x1f%11\x1fwork queue's \"snapshot\"\x1fabcd,80x24,0,0,11\x1f5000\n",
         )
         .unwrap();
         assert_eq!(items.len(), 1);
@@ -2878,6 +3010,8 @@ mod test {
         assert_eq!(item.window_name, "work queue's \"snapshot\"");
         assert_eq!(item.layout_csum, "abcd");
         assert!(item.window_active);
+        assert!(item.window_zoomed);
+        assert_eq!(item.active_pane_id, 11);
         assert_eq!(item.history_limit, 5000);
     }
 
@@ -2910,6 +3044,7 @@ mod test {
     fn resize_is_one_transport_write_with_two_guarded_responses() {
         let command = resize_command(
             "resize-window -x 80 -y 24 -t @3".to_string(),
+            "resize-window -x 39 -y 12 -t @3".to_string(),
             7,
             PtySize {
                 rows: 12,
@@ -2919,7 +3054,7 @@ mod test {
             },
         );
         assert_eq!(
-            "resize-window -x 80 -y 24 -t @3 ; resize-pane -x 39 -y 12 -t %7\n",
+            "if-shell -F -t %7 '#{window_zoomed_flag}' 'resize-window -x 39 -y 12 -t @3' 'resize-window -x 80 -y 24 -t @3' ; if-shell -F -t %7 '#{window_zoomed_flag}' '' 'resize-pane -x 39 -y 12 -t %7'\n",
             command
         );
         assert_eq!(1, command.lines().count());
@@ -2933,6 +3068,34 @@ mod test {
             },
         };
         assert_eq!(2, resize.guarded_response_count());
+    }
+
+    #[test]
+    fn pane_zoom_is_idempotently_encoded() {
+        assert_eq!(
+            shell_words::split(set_pane_zoom_command(7, true).trim()).unwrap(),
+            [
+                "if-shell",
+                "-F",
+                "-t",
+                "%7",
+                "#{window_zoomed_flag}",
+                "",
+                "resize-pane -Z -t %7",
+            ]
+        );
+        assert_eq!(
+            shell_words::split(set_pane_zoom_command(7, false).trim()).unwrap(),
+            [
+                "if-shell",
+                "-F",
+                "-t",
+                "%7",
+                "#{window_zoomed_flag}",
+                "resize-pane -Z -t %7",
+                "",
+            ]
+        );
     }
 
     #[test]

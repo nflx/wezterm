@@ -70,6 +70,13 @@ back into all connected WezTerm GUIs. Cell-only tmux resize notifications do
 not replace established GUI pixel ratios, which allows panes with different
 font sizes to retain their visual layout.
 
+GUI pane zoom uses tmux's native pane zoom as well as WezTerm's pixel zoom.
+This lets tmux enlarge the actual pane PTY and deliver `SIGWINCH` to full-screen
+applications such as Vim. Changing the zoomed pane's font size updates that
+PTY grid while leaving tmux zoom active. Zoom or unzoom performed by an
+ordinary tmux client is reflected in the GUI, and the full reconnect snapshot
+restores a zoomed window using its active stable pane ID.
+
 Current limitations:
 
 * half-edge pane relocation is supported; full-pane drop is not

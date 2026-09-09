@@ -229,6 +229,13 @@ impl Pane for LocalPane {
         Ok(())
     }
 
+    fn set_zoomed(&self, zoomed: bool) {
+        let pty = self.pty.lock();
+        if let Some(tmux_pty) = pty.downcast_ref::<crate::tmux_pty::TmuxPty>() {
+            tmux_pty.set_zoomed(zoomed);
+        }
+    }
+
     fn copy_user_vars(&self) -> HashMap<String, String> {
         self.terminal.lock().user_vars().clone()
     }
